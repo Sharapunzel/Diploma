@@ -1,31 +1,47 @@
-version: '3.8'
-
 services:
-  rabbitmq:
-    image: rabbitmq:3.12-management-alpine  # Фиксируем стабильную версию[reference:6]
-    container_name: diploma-rabbitmq
-    hostname: rabbitmq
+  kafka:
+    image: apache/kafka:4.2.0          # Стабильная версия на 2026 год
+    container_name: diploma-kafka
+    hostname: kafka
+    restart: unless-stopped
     ports:
-      - "5672:5672"   # AMQP порт для агентов и бэкенда
-      - "15672:15672" # Веб-интерфейс управления (http://localhost:15672)
+      - "9092:9092"                    # PLAINTEXT (клиенты: агенты, бэкенд)
+      - "9093:9093"                    # CONTROLLER (только внутри кластера)
     environment:
-      RABBITMQ_DEFAULT_USER: diploma_user
-      RABBITMQ_DEFAULT_PASS: diploma_password
-      RABBITMQ_DEFAULT_VHOST: diploma_vhost
+      # --- KRaft (без ZooKeeper) ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # --- Для одного брокера ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      # --- Хранение ---
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk   # Фиксированный ID, чтобы не генерировался заново
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 40s
     networks:
       - diploma-network
 
   postgres:
-    image: postgres:15-alpine  # Фиксируем стабильную версию[reference:7]
+    image: postgres:18
     container_name: diploma-postgres
     hostname: postgres
+    restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
@@ -33,17 +49,18 @@ services:
       POSTGRES_PASSWORD: diploma_password
       POSTGRES_DB: diploma_db
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U diploma_user -d diploma_db"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 30s
     networks:
       - diploma-network
 
 volumes:
-  rabbitmq_data:
+  kafka_data:
   postgres_data:
 
 networks:
