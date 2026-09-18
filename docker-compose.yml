@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine  # Фиксируем стабильную версию[reference:6]
+    container_name: diploma-rabbitmq
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"   # AMQP порт для агентов и бэкенда
+      - "15672:15672" # Веб-интерфейс управления (http://localhost:15672)
+    environment:
+      RABBITMQ_DEFAULT_USER: diploma_user
+      RABBITMQ_DEFAULT_PASS: diploma_password
+      RABBITMQ_DEFAULT_VHOST: diploma_vhost
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - diploma-network
+
+  postgres:
+    image: postgres:15-alpine  # Фиксируем стабильную версию[reference:7]
+    container_name: diploma-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: diploma_user
+      POSTGRES_PASSWORD: diploma_password
+      POSTGRES_DB: diploma_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U diploma_user -d diploma_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - diploma-network
+
+volumes:
+  rabbitmq_data:
+  postgres_data:
+
+networks:
+  diploma-network:
+    driver: bridge
