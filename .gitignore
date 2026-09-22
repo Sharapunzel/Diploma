@@ -1,0 +1,10 @@
+# Local agent workflow files
+/AGENTS.md
+/plan.md
+/tasks/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+backend/*.egg-info/
+.env
