@@ -1,7 +1,7 @@
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -25,6 +25,7 @@ ADMIN_PERMISSIONS = [
     "normalizers.read",
     "normalizers.write",
     "events.read",
+    "events.delete",
 ]
 GUEST_PERMISSIONS = [
     "users.read",
@@ -142,7 +143,7 @@ def insert_parsed_log(
     deduplication_key=None,
     **overrides,
 ):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values = {
         "source_id": source_id,
         "connection_id": connection_id,
@@ -432,8 +433,8 @@ def test_valid_parsed_log_and_required_indexes(db):
         {"kafka_offset": -1},
         {"ecs_data": []},
         {
-            "backend_received_at": datetime.now(timezone.utc),
-            "backend_processed_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+            "backend_received_at": datetime.now(UTC),
+            "backend_processed_at": datetime.now(UTC) - timedelta(seconds=1),
         },
     ],
 )

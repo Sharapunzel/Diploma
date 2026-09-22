@@ -7,10 +7,12 @@ from .app import (
     Source,
     User,
 )
+from .auth import AuthSession
 from .logs import ParsedLog
 
 __all__ = [
     "AppSetting",
+    "AuthSession",
     "KafkaConnection",
     "Normalizer",
     "OidcRoleMapping",
