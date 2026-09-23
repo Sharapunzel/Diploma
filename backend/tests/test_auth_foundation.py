@@ -2,7 +2,9 @@ import getpass
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -28,6 +30,7 @@ from app.core.errors import DomainError
 from app.core.security import hash_password, token_digest
 from app.db import Database
 from app.dependencies import (
+    get_kafka_client,
     get_mapping_admin,
     get_normalizer_admin,
     get_readiness_repository,
@@ -36,6 +39,7 @@ from app.dependencies import (
     get_user_admin,
     require_permission,
 )
+from app.kafka import KafkaMetadata, KafkaMetadataError, KafkaTopic
 from app.main import create_app
 from app.models import (
     AppSetting,
@@ -1223,8 +1227,8 @@ def test_administration_openapi_excludes_forbidden_future_routes(client):
     assert "/api/v1/roles" in paths
     assert "/api/v1/app-settings/{key}" in paths
     assert "/api/v1/normalizers" in paths
-    assert "/api/v1/kafka-connections" not in paths
-    assert "/api/v1/sources" not in paths
+    assert "/api/v1/kafka-connections" in paths
+    assert "/api/v1/sources" in paths
     assert "/api/v1/parsed-logs" not in paths
     assert "post" not in paths["/api/v1/roles"]
     assert "delete" not in paths["/api/v1/roles/{role_id}"]
@@ -1814,3 +1818,525 @@ def test_mapping_legacy_crud_and_normalizer_listing_contracts(client, auth_datab
     assert literal_backslash["version"] == 1
     for body in ({"name": " ", "rule": "opaque"}, {"name": "blank-rule", "rule": "  "}):
         assert client.post("/api/v1/normalizers", json=body, headers=headers).status_code == 422
+
+
+class FakeKafkaMetadataClient:
+    def __init__(self):
+        self.calls = 0
+        self.mode = "ok"
+        self.topic_names = ("events", "metrics", "__consumer_offsets")
+
+    def metadata(self, config, timeout):
+        self.calls += 1
+        if self.mode == "unexpected":
+            raise RuntimeError("adapter implementation defect")
+        if self.mode in {"unavailable", "timeout"}:
+            raise KafkaMetadataError(self.mode)
+        return KafkaMetadata(
+            broker_count=1,
+            topics=tuple(
+                KafkaTopic(name=name, partition_count=index + 1)
+                for index, name in enumerate(self.topic_names)
+            ),
+            latency_ms=1.5,
+        )
+
+
+class BlockingKafkaMetadataClient(FakeKafkaMetadataClient):
+    def __init__(self):
+        super().__init__()
+        self.block = False
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def metadata(self, config, timeout):
+        if self.block:
+            self.entered.set()
+            if not self.release.wait(5):
+                raise TimeoutError("test barrier timed out")
+        return super().metadata(config, timeout)
+
+
+class ContentionKafkaMetadataClient(FakeKafkaMetadataClient):
+    def __init__(self):
+        super().__init__()
+        self.block = False
+        self.barrier = threading.Barrier(3, timeout=5)
+
+    def metadata(self, config, timeout):
+        if self.block:
+            self.barrier.wait()
+        return super().metadata(config, timeout)
+
+
+def use_fake_kafka(client, fake):
+    client.app.dependency_overrides[get_kafka_client] = lambda: fake
+
+
+@pytest.mark.parametrize("mutation", ["topic", "connection", "normalizer", "bootstrap"])
+def test_source_enable_rejects_concurrent_configuration_change(
+    client, auth_database, mutation
+):
+    headers = admin_headers(client, auth_database)
+    fake = BlockingKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": f"race-{mutation}", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    alternate = None
+    if mutation == "connection":
+        alternate = client.post(
+            "/api/v1/kafka-connections",
+            json={"name": "race-alternate", "bootstrap_servers": ["localhost:9092"]},
+            headers=headers,
+        ).json()
+    normalizer = create_normalizer(client, headers, f"race-{mutation}")
+    source = client.post(
+        "/api/v1/sources",
+        json={
+            "name": f"race-{mutation}",
+            "connection_id": connection["id"],
+            "topic_name": "events",
+        },
+        headers=headers,
+    ).json()
+    client.put(
+        f"/api/v1/sources/{source['id']}/normalizer",
+        json={"normalizer_id": normalizer["id"]},
+        headers=headers,
+    )
+    fake.block = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            client.post, f"/api/v1/sources/{source['id']}/enable", headers=headers
+        )
+        assert fake.entered.wait(5)
+        with auth_database.engine.begin() as connection_handle:
+            if mutation == "topic":
+                connection_handle.execute(
+                    text("UPDATE app.sources SET topic_name='metrics' WHERE id=:id"),
+                    {"id": source["id"]},
+                )
+            elif mutation == "connection":
+                connection_handle.execute(
+                    text("UPDATE app.sources SET connection_id=:connection_id WHERE id=:id"),
+                    {"connection_id": alternate["id"], "id": source["id"]},
+                )
+            elif mutation == "normalizer":
+                connection_handle.execute(
+                    text("UPDATE app.sources SET normalizer_id=NULL WHERE id=:id"),
+                    {"id": source["id"]},
+                )
+            else:
+                connection_handle.execute(
+                    text("UPDATE app.kafka_connections SET bootstrap_servers=ARRAY['other:9092'] WHERE id=:id"),
+                    {"id": connection["id"]},
+                )
+        fake.release.set()
+        response = future.result(timeout=5)
+    assert response.status_code == 409
+    assert response.json()["code"] == "source_configuration_changed"
+    with auth_database.session_factory() as session:
+        persisted = session.get(Source, UUID(source["id"]))
+        assert persisted is not None and persisted.is_enabled is False
+
+
+def test_parallel_enable_and_source_update_contend_without_deadlock(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = ContentionKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "parallel-enable", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    normalizer = create_normalizer(client, headers, "parallel-enable")
+    source = client.post(
+        "/api/v1/sources",
+        json={"name": "parallel-enable", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    client.put(
+        f"/api/v1/sources/{source['id']}/normalizer",
+        json={"normalizer_id": normalizer["id"]},
+        headers=headers,
+    )
+    fake.block = True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        enable_future = pool.submit(
+            client.post, f"/api/v1/sources/{source['id']}/enable", headers=headers
+        )
+        update_future = pool.submit(
+            client.patch,
+            f"/api/v1/sources/{source['id']}",
+            json={"topic_name": "metrics"},
+            headers=headers,
+        )
+        fake.barrier.wait()
+        enabled = enable_future.result(timeout=5)
+        updated = update_future.result(timeout=5)
+    assert sorted([enabled.status_code, updated.status_code]) == [200, 409]
+    conflict = enabled if enabled.status_code == 409 else updated
+    assert conflict.json()["code"] == "source_configuration_changed"
+    persisted = client.get(f"/api/v1/sources/{source['id']}").json()
+    if enabled.status_code == 200:
+        assert persisted["is_enabled"] is True and persisted["topic_name"] == "events"
+    else:
+        assert persisted["is_enabled"] is False and persisted["topic_name"] == "metrics"
+
+
+def test_source_update_returns_conflict_when_source_deleted_during_kafka_check(
+    client, auth_database
+):
+    headers = admin_headers(client, auth_database)
+    fake = BlockingKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "deleted-update", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    source = client.post(
+        "/api/v1/sources",
+        json={"name": "deleted-update", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    fake.block = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            client.patch,
+            f"/api/v1/sources/{source['id']}",
+            json={"topic_name": "metrics"},
+            headers=headers,
+        )
+        assert fake.entered.wait(5)
+        with auth_database.engine.begin() as connection_handle:
+            connection_handle.execute(
+                text("DELETE FROM app.sources WHERE id=:id"), {"id": source["id"]}
+            )
+        fake.release.set()
+        response = future.result(timeout=5)
+    assert response.status_code == 409
+    assert response.json()["code"] == "source_configuration_changed"
+    assert client.get(f"/api/v1/sources/{source['id']}").status_code == 404
+
+
+def test_source_create_rejects_concurrent_connection_change(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = BlockingKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "create-race", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    fake.block = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            client.post,
+            "/api/v1/sources",
+            json={"name": "create-race", "connection_id": connection["id"], "topic_name": "events"},
+            headers=headers,
+        )
+        assert fake.entered.wait(5)
+        with auth_database.engine.begin() as connection_handle:
+            connection_handle.execute(
+                text("UPDATE app.kafka_connections SET bootstrap_servers=ARRAY['other:9092'] WHERE id=:id"),
+                {"id": connection["id"]},
+            )
+        fake.release.set()
+        response = future.result(timeout=5)
+    assert response.status_code == 409
+    assert response.json()["code"] == "source_configuration_changed"
+    assert client.get("/api/v1/sources", params={"connection_id": connection["id"]}).json()["total"] == 0
+
+
+def test_source_update_rejects_concurrent_target_connection_change(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = BlockingKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    original = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "update-race-old", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    target = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "update-race-new", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    source = client.post(
+        "/api/v1/sources",
+        json={"name": "update-race", "connection_id": original["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    fake.block = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            client.patch,
+            f"/api/v1/sources/{source['id']}",
+            json={"connection_id": target["id"], "topic_name": "metrics"},
+            headers=headers,
+        )
+        assert fake.entered.wait(5)
+        with auth_database.engine.begin() as connection_handle:
+            connection_handle.execute(
+                text("UPDATE app.kafka_connections SET bootstrap_servers=ARRAY['other:9092'] WHERE id=:id"),
+                {"id": target["id"]},
+            )
+        fake.release.set()
+        response = future.result(timeout=5)
+    assert response.status_code == 409
+    persisted = client.get(f"/api/v1/sources/{source['id']}").json()
+    assert persisted["connection_id"] == original["id"]
+    assert persisted["topic_name"] == "events"
+
+
+def test_kafka_connections_topics_and_source_lifecycle(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    created = client.post(
+        "/api/v1/kafka-connections",
+        json={
+            "id": "66666666-6666-4666-8666-666666666666",
+            "name": "local-kafka",
+            "bootstrap_servers": ["localhost:9092"],
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    connection = created.json()
+    assert connection["id"] == "66666666-6666-4666-8666-666666666666"
+    assert connection["security_protocol"] == "PLAINTEXT" and connection["extra_config"] == {}
+    connection_id = connection["id"]
+    assert client.get(f"/api/v1/kafka-connections/{connection_id}").status_code == 200
+    assert client.get("/api/v1/kafka-connections", params={"q": "local"}).json()["total"] == 1
+    patched_connection = client.patch(
+        f"/api/v1/kafka-connections/{connection_id}",
+        json={"name": "local-kafka-renamed"},
+        headers=headers,
+    )
+    assert patched_connection.status_code == 200
+    checked = client.post(f"/api/v1/kafka-connections/{connection_id}/test", headers=headers)
+    assert checked.status_code == 200
+    assert checked.json() == {
+        "status": "ok", "broker_count": 1, "topic_count": 3, "latency_ms": 1.5
+    }
+    topics = client.get(f"/api/v1/kafka-connections/{connection_id}/topics")
+    assert topics.json()["items"] == [
+        {"name": "events", "partition_count": 1},
+        {"name": "metrics", "partition_count": 2},
+    ]
+    assert topics.json()["total"] == 2
+    assert client.get(
+        f"/api/v1/kafka-connections/{connection_id}/topics?include_internal=true"
+    ).json()["total"] == 3
+    assert client.get("/api/v1/kafka-connections?limit=1").json()["total"] == 1
+    assert fake.calls == 3
+
+    normalizer = create_normalizer(client, headers, "source-normalizer")
+    source = client.post(
+        "/api/v1/sources",
+        json={
+            "id": "77777777-7777-4777-8777-777777777777",
+            "name": "events-source",
+            "connection_id": connection_id,
+            "topic_name": "events",
+        },
+        headers=headers,
+    )
+    assert source.status_code == 201
+    source_data = source.json()
+    assert source_data["is_enabled"] is False and source_data["normalizer_id"] is None
+    source_id = source_data["id"]
+    assert client.get(f"/api/v1/sources/{source_id}").status_code == 200
+    assert client.get("/api/v1/sources", params={"connection_id": connection_id}).json()["total"] == 1
+    duplicate = client.post(
+        "/api/v1/sources",
+        json={"name": "duplicate", "connection_id": connection_id, "topic_name": "events"},
+        headers=headers,
+    )
+    assert duplicate.status_code == 409 and duplicate.json()["code"] == "source_topic_conflict"
+    assert client.post(f"/api/v1/sources/{source_id}/enable", headers=headers).status_code == 409
+    assigned = client.put(
+        f"/api/v1/sources/{source_id}/normalizer",
+        json={"normalizer_id": normalizer["id"]},
+        headers=headers,
+    )
+    assert assigned.status_code == 200
+    enabled = client.post(f"/api/v1/sources/{source_id}/enable", headers=headers)
+    assert enabled.status_code == 200 and enabled.json()["is_enabled"] is True
+    blocked_connection = client.patch(
+        f"/api/v1/kafka-connections/{connection_id}",
+        json={"bootstrap_servers": ["other:9092"]},
+        headers=headers,
+    )
+    assert blocked_connection.status_code == 409
+    assert blocked_connection.json()["code"] == "source_enabled"
+    renamed = client.patch(
+        f"/api/v1/sources/{source_id}", json={"name": "renamed-source"}, headers=headers
+    )
+    assert renamed.status_code == 200
+    assert client.patch(
+        f"/api/v1/sources/{source_id}",
+        json={"topic_name": "metrics"},
+        headers=headers,
+    ).status_code == 409
+    calls_before_disable = fake.calls
+    disabled = client.post(f"/api/v1/sources/{source_id}/disable", headers=headers)
+    assert disabled.status_code == 200 and disabled.json()["is_enabled"] is False
+    assert fake.calls == calls_before_disable
+    assert client.put(
+        f"/api/v1/sources/{source_id}/normalizer", json={"normalizer_id": None}, headers=headers
+    ).status_code == 200
+    assert client.delete(f"/api/v1/sources/{source_id}", headers=headers).status_code == 204
+
+
+def test_kafka_source_validation_permissions_and_safe_failures(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    invalid_connection = {
+        "name": "invalid-kafka",
+        "bootstrap_servers": ["https://localhost:9092"],
+    }
+    for body in (
+        invalid_connection,
+        {"name": "invalid-port", "bootstrap_servers": ["localhost:0"]},
+        {"name": "duplicate-servers", "bootstrap_servers": ["localhost:9092", "localhost:9092"]},
+        {"name": "secure", "bootstrap_servers": ["localhost:9092"], "security_protocol": "SASL_SSL"},
+        {"name": "unknown", "bootstrap_servers": ["localhost:9092"], "extra_config": {}},
+    ):
+        assert client.post("/api/v1/kafka-connections", json=body, headers=headers).status_code == 422
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "error-kafka", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    assert client.patch(
+        f"/api/v1/kafka-connections/{connection['id']}", json={"name": "no-csrf"}
+    ).status_code == 403
+    assert client.post(
+        "/api/v1/sources",
+        json={"name": "no-csrf", "connection_id": connection["id"], "topic_name": "events"},
+    ).status_code == 403
+    fake.mode = "unavailable"
+    unavailable = client.post(
+        f"/api/v1/kafka-connections/{connection['id']}/test", headers=headers
+    )
+    assert unavailable.status_code == 503
+    assert unavailable.json()["code"] == "kafka_unavailable"
+    fake.mode = "timeout"
+    timeout = client.get(f"/api/v1/kafka-connections/{connection['id']}/topics")
+    assert timeout.status_code == 504 and timeout.json()["code"] == "kafka_timeout"
+    fake.mode = "ok"
+    unknown_topic = client.post(
+        "/api/v1/sources",
+        json={
+            "name": "unknown-topic-source",
+            "connection_id": connection["id"],
+            "topic_name": "missing",
+        },
+        headers=headers,
+    )
+    assert unknown_topic.status_code == 404 and unknown_topic.json()["code"] == "topic_not_found"
+    fake.mode = "unexpected"
+    safe_client = TestClient(
+        create_app(
+            Settings(
+                environment="test",
+                database_url=auth_database.engine.url.render_as_string(hide_password=False),
+            ),
+            database=auth_database,
+            kafka_client=fake,
+        ),
+        raise_server_exceptions=False,
+    )
+    try:
+        assert login(safe_client, "admin").status_code == 200
+        safe_headers = {
+            "X-CSRF-Token": safe_client.get("/api/v1/auth/session").json()["csrf_token"]
+        }
+        internal = safe_client.post(
+            f"/api/v1/kafka-connections/{connection['id']}/test", headers=safe_headers
+        )
+        assert internal.status_code == 500
+        assert internal.json()["code"] == "internal_error"
+        assert "request_id" in internal.json()
+    finally:
+        safe_client.close()
+    fake.mode = "ok"
+    add_local_user(auth_database)
+    guest = TestClient(create_app(Settings(
+        environment="test", database_url=auth_database.engine.url.render_as_string(hide_password=False)
+    ), database=auth_database, kafka_client=fake))
+    try:
+        assert login(guest).status_code == 200
+        guest_csrf = guest.get("/api/v1/auth/session").json()["csrf_token"]
+        guest_headers = {"X-CSRF-Token": guest_csrf}
+        assert guest.get("/api/v1/kafka-connections").status_code == 200
+        assert guest.post(
+            f"/api/v1/kafka-connections/{connection['id']}/test", headers=guest_headers
+        ).status_code == 200
+        assert guest.get(f"/api/v1/kafka-connections/{connection['id']}/topics").status_code == 200
+        assert guest.get("/api/v1/sources").status_code == 200
+        forbidden = guest.delete(
+            f"/api/v1/kafka-connections/{connection['id']}", headers=guest_headers
+        )
+        assert forbidden.status_code == 403 and forbidden.json()["code"] == "permission_denied"
+    finally:
+        guest.close()
+
+
+def test_task4_openapi_has_no_future_ingestion_routes(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/api/v1/kafka-connections" in paths and "/api/v1/sources" in paths
+    assert not any("consumer" in path or "parsed-log" in path for path in paths)
+
+
+def test_connection_delete_cascades_source_and_preserves_parsed_log(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "cascade-api", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    source = client.post(
+        "/api/v1/sources",
+        json={"name": "cascade-api", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    with auth_database.session_factory() as session:
+        timestamp = datetime.now(UTC)
+        parsed = ParsedLog(
+            source_id=UUID(source["id"]),
+            connection_id=UUID(connection["id"]),
+            normalizer_version=1,
+            source_name=source["name"],
+            connection_name=connection["name"],
+            kafka_topic=source["topic_name"],
+            kafka_partition=0,
+            kafka_offset=1,
+            deduplication_key=f"cascade-{uuid4()}",
+            fluent_bit_collected_at=timestamp,
+            backend_received_at=timestamp,
+            backend_processed_at=timestamp,
+            raw="raw",
+            ecs_data={},
+        )
+        session.add(parsed)
+        session.commit()
+        parsed_id = parsed.id
+    assert client.delete(
+        f"/api/v1/kafka-connections/{connection['id']}", headers=headers
+    ).status_code == 204
+    assert client.get(f"/api/v1/sources/{source['id']}").status_code == 404
+    with auth_database.session_factory() as session:
+        persisted = session.get(ParsedLog, parsed_id)
+        assert persisted is not None
+        assert persisted.source_id is None and persisted.connection_id is None

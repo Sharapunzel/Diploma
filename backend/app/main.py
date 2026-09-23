@@ -16,6 +16,7 @@ from .config import Settings, settings
 from .core.errors import DomainError
 from .db import Database
 from .dependencies import build_auth_service, get_settings
+from .kafka import ConfluentKafkaMetadataClient
 from .oidc import AuthlibOidcClient
 
 REQUEST_LOG = logging.getLogger("app.request")
@@ -61,6 +62,7 @@ def create_app(
     config: Settings | None = None,
     database: Database | None = None,
     oidc_client=None,
+    kafka_client=None,
 ) -> FastAPI:
     current = config or settings
     owned_database = database is None
@@ -76,6 +78,7 @@ def create_app(
     app.state.settings = current
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
+    app.state.kafka_client = kafka_client or ConfluentKafkaMetadataClient()
     app.dependency_overrides[get_settings] = lambda: current
     logging.getLogger("app").setLevel(current.log_level.upper())
 

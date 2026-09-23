@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, settings
 from .db import get_session
+from .kafka import KafkaMetadataClient
 from .repositories.protocols import OidcClient, ReadinessRepository
 from .repositories.sqlalchemy import (
     SqlAlchemyOidcMappingRepository,
@@ -17,6 +18,10 @@ from .repositories.sqlalchemy.administration import (
     SqlAlchemyNormalizerRepository,
     SqlAlchemySettingRepository,
 )
+from .repositories.sqlalchemy.connections import (
+    SqlAlchemyKafkaConnectionRepository,
+    SqlAlchemySourceRepository,
+)
 from .services.implementations.administration import (
     MappingAdministration,
     NormalizerAdministration,
@@ -25,6 +30,7 @@ from .services.implementations.administration import (
     UserAdministration,
 )
 from .services.implementations.auth import AuthService
+from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.protocols import AuthenticationService
 from .services.protocols.administration import (
     MappingAdministrationService,
@@ -33,6 +39,7 @@ from .services.protocols.administration import (
     SettingAdministrationService,
     UserAdministrationService,
 )
+from .services.protocols.connections import KafkaConnectionService, SourceService
 
 
 def get_settings() -> Settings:
@@ -65,6 +72,10 @@ def get_readiness_repository(
 
 def get_oidc_client(request: Request) -> OidcClient:
     return request.app.state.oidc_client
+
+
+def get_kafka_client(request: Request) -> KafkaMetadataClient:
+    return request.app.state.kafka_client
 
 
 def session_token(request: Request) -> str | None:
@@ -144,3 +155,43 @@ def get_setting_admin(session: Session = Depends(get_session)) -> SettingAdminis
 
 def get_normalizer_admin(session: Session = Depends(get_session)) -> NormalizerAdministrationService:
     return build_normalizer_admin(session)
+
+
+def build_connection_service(
+    session: Session, app_settings: Settings, client: KafkaMetadataClient
+) -> KafkaConnectionService:
+    return KafkaConnectionServiceImpl(
+        SqlAlchemyKafkaConnectionRepository(session),
+        SqlAlchemyUnitOfWork(session),
+        client,
+        app_settings.kafka_metadata_timeout_seconds,
+    )
+
+
+def build_source_service(
+    session: Session, app_settings: Settings, client: KafkaMetadataClient
+) -> SourceService:
+    return SourceServiceImpl(
+        SqlAlchemySourceRepository(session),
+        SqlAlchemyKafkaConnectionRepository(session),
+        SqlAlchemyNormalizerRepository(session),
+        SqlAlchemyUnitOfWork(session),
+        client,
+        app_settings.kafka_metadata_timeout_seconds,
+    )
+
+
+def get_connection_service(
+    session: Session = Depends(get_session),
+    app_settings: Settings = Depends(get_settings),
+    client: KafkaMetadataClient = Depends(get_kafka_client),
+) -> KafkaConnectionService:
+    return build_connection_service(session, app_settings, client)
+
+
+def get_source_service(
+    session: Session = Depends(get_session),
+    app_settings: Settings = Depends(get_settings),
+    client: KafkaMetadataClient = Depends(get_kafka_client),
+) -> SourceService:
+    return build_source_service(session, app_settings, client)

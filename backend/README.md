@@ -149,3 +149,24 @@ python -m pytest -q
 python -m alembic upgrade head
 python -m alembic check
 ```
+
+## Kafka connections and sources
+
+Kafka management is available under `/api/v1` and uses the existing permission pairs
+`connections.read`/`connections.write` and `sources.read`/`sources.write`. The API accepts
+only `PLAINTEXT` connections; credentials, URLs, arbitrary Kafka options and secrets are
+rejected. Metadata requests use `KAFKA_METADATA_TIMEOUT_SECONDS` (1–30 seconds).
+
+The normal workflow is:
+
+1. Create a connection with one or more validated `host:port` bootstrap servers.
+2. Call `POST /api/v1/kafka-connections/{id}/test` and optionally list topics with
+   `GET /api/v1/kafka-connections/{id}/topics`.
+3. Create a disabled source for an existing topic.
+4. Assign a normalizer with `PUT /api/v1/sources/{id}/normalizer`, then enable the source.
+5. Disable or delete the source when it is no longer needed.
+
+Creating a source and enabling it perform a live metadata check. Topic listing filters
+internal topics beginning with `__` unless `include_internal=true`; it never creates a
+source or starts a Kafka consumer. Deleting a connection cascades its sources while
+preserving parsed logs with nullable foreign keys.

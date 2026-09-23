@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     session_idle_ttl_seconds: int = 1800
     session_touch_interval_seconds: int = 60
     trusted_hosts: list[str] = []
+    kafka_metadata_timeout_seconds: int = 5
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
     @field_validator("cors_origins", "oidc_scopes", "trusted_hosts", mode="before")
@@ -50,6 +51,8 @@ class Settings(BaseSettings):
             self.session_touch_interval_seconds,
         )):
             raise ValueError("TTL values must be positive")
+        if not 1 <= self.kafka_metadata_timeout_seconds <= 30:
+            raise ValueError("kafka metadata timeout must be between 1 and 30 seconds")
         if self.oidc_enabled:
             required = (self.oidc_issuer_url, self.oidc_client_id,
                         self.oidc_client_secret, self.oidc_redirect_uri)
