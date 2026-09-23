@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from ...models import AuthSession, OidcRoleMapping, Role, User
@@ -85,6 +85,13 @@ class SqlAlchemyRoleRepository:
     def find_by_id(self, role_id: UUID) -> Role | None:
         return self.session.get(Role, role_id)
 
+    def list_all(self) -> list[Role]:
+        return list(self.session.scalars(select(Role).order_by(Role.priority.desc(), Role.id)))
+
+    def rename(self, role: Role, name: str, at: datetime) -> None:
+        role.name = name
+        role.updated_at = at
+
 
 class SqlAlchemyOidcMappingRepository:
     def __init__(self, session: Session):
@@ -96,6 +103,38 @@ class SqlAlchemyOidcMappingRepository:
                 select(OidcRoleMapping).where(OidcRoleMapping.issuer == issuer)
             )
         )
+
+    def list(
+        self,
+        issuer: str | None,
+        role_id: UUID | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[OidcRoleMapping], int]:
+        statement = select(OidcRoleMapping)
+        if issuer is not None:
+            statement = statement.where(OidcRoleMapping.issuer == issuer)
+        if role_id is not None:
+            statement = statement.where(OidcRoleMapping.role_id == role_id)
+        total = self.session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+        statement = statement.order_by(OidcRoleMapping.id).limit(limit).offset(offset)
+        return list(self.session.scalars(statement)), total
+
+    def find_by_id(self, mapping_id: UUID):
+        return self.session.get(OidcRoleMapping, mapping_id)
+
+    def add(self, mapping):
+        self.session.add(mapping)
+        self.session.flush()
+        return mapping
+
+    def update(self, mapping, values, at):
+        for key, value in values.items():
+            setattr(mapping, key, value)
+        mapping.updated_at = at
+
+    def delete(self, mapping):
+        self.session.delete(mapping)
 
 
 class SqlAlchemySessionRepository:
@@ -134,6 +173,13 @@ class SqlAlchemySessionRepository:
 
     def touch(self, auth_session: AuthSession, at: datetime) -> None:
         auth_session.last_seen_at = at
+
+    def revoke_for_user(self, user_id: UUID, at: datetime) -> None:
+        self.session.execute(
+            update(AuthSession)
+            .where(AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None))
+            .values(revoked_at=at)
+        )
 
 
 class SqlAlchemyReadinessRepository:

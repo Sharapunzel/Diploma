@@ -12,8 +12,27 @@ from .repositories.sqlalchemy import (
     SqlAlchemyUnitOfWork,
     SqlAlchemyUserRepository,
 )
+from .repositories.sqlalchemy.administration import (
+    SqlAlchemyAdministrationUserRepository,
+    SqlAlchemyNormalizerRepository,
+    SqlAlchemySettingRepository,
+)
+from .services.implementations.administration import (
+    MappingAdministration,
+    NormalizerAdministration,
+    RoleAdministration,
+    SettingAdministration,
+    UserAdministration,
+)
 from .services.implementations.auth import AuthService
 from .services.protocols import AuthenticationService
+from .services.protocols.administration import (
+    MappingAdministrationService,
+    NormalizerAdministrationService,
+    RoleAdministrationService,
+    SettingAdministrationService,
+    UserAdministrationService,
+)
 
 
 def get_settings() -> Settings:
@@ -74,3 +93,54 @@ def require_permission(permission: str):
         return principal
 
     return dependency
+
+
+def build_user_admin(session: Session) -> UserAdministration:
+    return UserAdministration(
+        SqlAlchemyAdministrationUserRepository(session),
+        SqlAlchemyRoleRepository(session),
+        SqlAlchemySessionRepository(session),
+        SqlAlchemyUnitOfWork(session),
+    )
+
+
+def build_role_admin(session: Session) -> RoleAdministration:
+    return RoleAdministration(SqlAlchemyRoleRepository(session), SqlAlchemyUnitOfWork(session))
+
+
+def build_mapping_admin(session: Session) -> MappingAdministration:
+    return MappingAdministration(
+        SqlAlchemyOidcMappingRepository(session),
+        SqlAlchemyRoleRepository(session),
+        SqlAlchemyUnitOfWork(session),
+    )
+
+
+def build_setting_admin(session: Session) -> SettingAdministration:
+    return SettingAdministration(SqlAlchemySettingRepository(session), SqlAlchemyUnitOfWork(session))
+
+
+def build_normalizer_admin(session: Session) -> NormalizerAdministration:
+    return NormalizerAdministration(SqlAlchemyNormalizerRepository(session), SqlAlchemyUnitOfWork(session))
+
+
+def get_user_admin(
+    session: Session = Depends(get_session),
+) -> UserAdministrationService:
+    return build_user_admin(session)
+
+
+def get_role_admin(session: Session = Depends(get_session)) -> RoleAdministrationService:
+    return build_role_admin(session)
+
+
+def get_mapping_admin(session: Session = Depends(get_session)) -> MappingAdministrationService:
+    return build_mapping_admin(session)
+
+
+def get_setting_admin(session: Session = Depends(get_session)) -> SettingAdministrationService:
+    return build_setting_admin(session)
+
+
+def get_normalizer_admin(session: Session = Depends(get_session)) -> NormalizerAdministrationService:
+    return build_normalizer_admin(session)

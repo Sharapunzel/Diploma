@@ -99,3 +99,53 @@ touch interval — 60, SameSite — `lax`, Secure — `false` только дл�
 Для production используйте HTTPS, `Secure` cookies, точные CORS origins и случайные
 секреты длиной не менее 32 байт. Известный development OIDC secret отклоняется;
 `SameSite=None` разрешён только вместе с `Secure=true`.
+
+## Административный API
+
+Все административные маршруты находятся под `/api/v1`. Guest может читать реестры,
+Administrator может изменять их. Изменяющие запросы всегда передают CSRF token из
+`GET /api/v1/auth/session` в заголовке `X-CSRF-Token`.
+
+| Область | Чтение | Изменение |
+| --- | --- | --- |
+| Users и roles | `users.read` | `users.write` |
+| OIDC role mappings | `users.read` | `users.write` |
+| App settings | `settings.read` | `settings.write` |
+| Normalizers | `normalizers.read` | `normalizers.write` |
+
+Guest — это аутентифицированный пользователь с read-only ролью. После local login он
+может, например, получить список нормализаторов через ту же cookie-сессию:
+
+```powershell
+$web = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+Invoke-RestMethod http://localhost:8000/api/v1/auth/local/login -Method Post -WebSession $web `
+  -ContentType application/json -Body '{"username":"guest","password":"guest-password"}'
+Invoke-RestMethod http://localhost:8000/api/v1/normalizers -WebSession $web
+```
+
+После local login Administrator получает CSRF token и может создать local user. Пароль
+при этом никогда не входит в ответ API:
+
+```powershell
+$session = Invoke-RestMethod http://localhost:8000/api/v1/auth/session -WebSession $web
+$headers = @{ "X-CSRF-Token" = $session.csrf_token }
+Invoke-RestMethod http://localhost:8000/api/v1/users -Method Post -WebSession $web -Headers $headers `
+  -ContentType application/json -Body '{"username":"analyst","password":"long-enough-password","display_name":"Analyst","role_id":"00000000-0000-4000-8000-000000000002"}'
+```
+
+`PUT /api/v1/app-settings/{key}` и `PATCH /api/v1/normalizers/{id}` требуют актуальное
+поле `version`. При устаревшей версии API возвращает `409 version_conflict` с
+`details.current_version`; повторите запрос после чтения текущей записи. Settings
+создаются только кодом/миграциями: HTTP API позволяет читать и менять лишь уже
+зарегистрированные keys. Поле `rule` normalizer на этом этапе хранится как opaque text
+и не исполняется и не проверяется API.
+
+Полный набор проверок запускается на отдельной БД:
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql+psycopg://diploma_user:diploma_password@localhost:5432/diploma_test"
+$env:DATABASE_URL = $env:TEST_DATABASE_URL
+python -m pytest -q
+python -m alembic upgrade head
+python -m alembic check
+```

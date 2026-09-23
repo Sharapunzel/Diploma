@@ -24,14 +24,30 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.api.v1.endpoints.auth import ERRORS
 from app.cli import create_admin
 from app.config import Settings
+from app.core.errors import DomainError
 from app.core.security import hash_password, token_digest
 from app.db import Database
 from app.dependencies import (
+    get_mapping_admin,
+    get_normalizer_admin,
     get_readiness_repository,
+    get_role_admin,
+    get_setting_admin,
+    get_user_admin,
     require_permission,
 )
 from app.main import create_app
-from app.models import AuthSession, OidcRoleMapping, Role, User
+from app.models import (
+    AppSetting,
+    AuthSession,
+    KafkaConnection,
+    Normalizer,
+    OidcRoleMapping,
+    ParsedLog,
+    Role,
+    Source,
+    User,
+)
 from app.oidc import AuthlibOidcClient
 from app.repositories.sqlalchemy import (
     SqlAlchemyOidcMappingRepository,
@@ -39,6 +55,15 @@ from app.repositories.sqlalchemy import (
     SqlAlchemySessionRepository,
     SqlAlchemyUnitOfWork,
     SqlAlchemyUserRepository,
+)
+from app.repositories.sqlalchemy.administration import (
+    SqlAlchemyNormalizerRepository,
+    SqlAlchemySettingRepository,
+)
+from app.schemas.administration import NormalizerPatch
+from app.services.implementations.administration import (
+    NormalizerAdministration,
+    SettingAdministration,
 )
 from app.services.implementations.auth import AuthService
 
@@ -80,11 +105,15 @@ def auth_database(auth_database_url):
     database.dispose()
 
 
-@pytest.fixture(autouse=True)
-def clean_auth_state(auth_database):
+def clear_auth_state(auth_database):
     with auth_database.engine.begin() as connection:
+        connection.execute(text("DELETE FROM logs.parsed_logs"))
         connection.execute(text("DELETE FROM app.auth_sessions"))
         connection.execute(text("DELETE FROM app.oidc_role_mappings"))
+        connection.execute(text("DELETE FROM app.sources"))
+        connection.execute(text("DELETE FROM app.kafka_connections"))
+        connection.execute(text("DELETE FROM app.normalizers"))
+        connection.execute(text("DELETE FROM app.app_settings"))
         connection.execute(text("DELETE FROM app.users"))
         connection.execute(
             text("UPDATE app.roles SET name = 'Administrator' WHERE id = :id"),
@@ -94,7 +123,13 @@ def clean_auth_state(auth_database):
             text("UPDATE app.roles SET name = 'Guest' WHERE id = :id"),
             {"id": GUEST_ID},
         )
+
+
+@pytest.fixture(autouse=True)
+def clean_auth_state(auth_database):
+    clear_auth_state(auth_database)
     yield
+    clear_auth_state(auth_database)
 
 
 @pytest.fixture
@@ -1030,3 +1065,752 @@ def test_openapi_declares_auth_paths_success_and_error_dtos(client):
     login_schema = schema["paths"]["/api/v1/auth/local/login"]["post"]["responses"]
     assert "200" in login_schema and "401" in login_schema and "422" in login_schema
     assert ERRORS
+
+
+def add_admin_user(database, username="admin", password="correct-password"):
+    with database.session_factory() as session:
+        user = User(
+            username=username,
+            password_hash=hash_password(password),
+            display_name="Administrator",
+            role_id=ADMIN_ID,
+        )
+        session.add(user)
+        session.commit()
+        return user.id
+
+
+def test_guest_reads_administration_but_cannot_mutate(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    assert client.get("/api/v1/users").status_code == 200
+    assert client.get("/api/v1/roles").status_code == 200
+    assert client.get("/api/v1/oidc-role-mappings").status_code == 200
+    assert client.get("/api/v1/app-settings").status_code == 200
+    assert client.get("/api/v1/normalizers").status_code == 200
+    csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+    headers = {"X-CSRF-Token": csrf}
+    requests = (
+        ("post", "/api/v1/users", {"username": "x", "password": "correct-password", "display_name": "X", "role_id": str(GUEST_ID)}),
+        ("patch", f"/api/v1/roles/{ADMIN_ID}", {"name": "Nope"}),
+        ("post", "/api/v1/oidc-role-mappings", {"issuer": "https://idp.test", "claim_name": "g", "claim_value": "x", "role_id": str(GUEST_ID)}),
+        ("put", "/api/v1/app-settings/missing", {"value": True, "version": 1}),
+        ("post", "/api/v1/normalizers", {"name": "x", "rule": "opaque"}),
+    )
+    for method, path, body in requests:
+        response = getattr(client, method)(path, json=body, headers=headers)
+        assert response.status_code == 403
+        assert response.json()["code"] == "permission_denied"
+
+
+def test_administrator_can_manage_users_roles_mappings_and_normalizers(
+    client, auth_database
+):
+    add_admin_user(auth_database)
+    assert login(client, "admin").status_code == 200
+    csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+    headers = {"X-CSRF-Token": csrf}
+    created = client.post(
+        "/api/v1/users",
+        json={
+            "username": "analyst",
+            "password": "long-enough-password",
+            "display_name": "Analyst",
+            "role_id": str(GUEST_ID),
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    user_id = created.json()["id"]
+    assert "password_hash" not in created.text
+    assert client.patch(
+        f"/api/v1/users/{user_id}",
+        json={"display_name": "Renamed Analyst"},
+        headers=headers,
+    ).status_code == 200
+    role = client.patch(
+        f"/api/v1/roles/{GUEST_ID}",
+        json={"name": "Read Only"},
+        headers=headers,
+    )
+    assert role.status_code == 200
+    mapping = client.post(
+        "/api/v1/oidc-role-mappings",
+        json={"issuer": "https://idp.test/path", "claim_name": "groups", "claim_value": "read", "role_id": str(GUEST_ID)},
+        headers=headers,
+    )
+    assert mapping.status_code == 201
+    normalizer = client.post(
+        "/api/v1/normalizers",
+        json={"name": "syslog", "description": "opaque", "rule": "not executed"},
+        headers=headers,
+    )
+    assert normalizer.status_code == 201
+    normalizer_id = normalizer.json()["id"]
+    assert normalizer.json()["version"] == 1
+    updated = client.patch(
+        f"/api/v1/normalizers/{normalizer_id}",
+        json={"description": "changed", "version": 1},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+    stale = client.patch(
+        f"/api/v1/normalizers/{normalizer_id}",
+        json={"rule": "stale", "version": 1},
+        headers=headers,
+    )
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "version_conflict"
+
+
+def test_settings_registry_and_normalizer_delete_are_version_aware(
+    client, auth_database
+):
+    add_admin_user(auth_database)
+    with auth_database.session_factory() as session:
+        setting = AppSetting(
+            key="test.setting",
+            value={"enabled": False},
+            category="test",
+            is_public=True,
+        )
+        session.add(setting)
+        session.commit()
+    assert login(client, "admin").status_code == 200
+    csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+    headers = {"X-CSRF-Token": csrf}
+    setting = client.get("/api/v1/app-settings/test.setting")
+    assert setting.status_code == 200 and setting.json()["version"] == 1
+    changed = client.put(
+        "/api/v1/app-settings/test.setting",
+        json={"value": {"enabled": True}, "version": 1},
+        headers=headers,
+    )
+    assert changed.status_code == 200 and changed.json()["version"] == 2
+    stale = client.put(
+        "/api/v1/app-settings/test.setting",
+        json={"value": {"enabled": False}, "version": 1},
+        headers=headers,
+    )
+    assert stale.status_code == 409 and stale.json()["code"] == "version_conflict"
+    assert client.put(
+        "/api/v1/app-settings/unknown",
+        json={"value": 1, "version": 1},
+        headers=headers,
+    ).status_code == 404
+    normalizer = client.post(
+        "/api/v1/normalizers",
+        json={"name": "delete-me", "rule": "opaque"},
+        headers=headers,
+    ).json()
+    assert client.patch(
+        f"/api/v1/normalizers/{normalizer['id']}",
+        json={"description": "changed", "version": 1},
+        headers=headers,
+    ).status_code == 200
+    assert client.delete(
+        f"/api/v1/normalizers/{normalizer['id']}?version=1", headers=headers
+    ).status_code == 409
+    assert client.delete(
+        f"/api/v1/normalizers/{normalizer['id']}?version=2", headers=headers
+    ).status_code == 204
+
+
+def test_administration_openapi_excludes_forbidden_future_routes(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/api/v1/users" in paths
+    assert "/api/v1/roles" in paths
+    assert "/api/v1/app-settings/{key}" in paths
+    assert "/api/v1/normalizers" in paths
+    assert "/api/v1/kafka-connections" not in paths
+    assert "/api/v1/sources" not in paths
+    assert "/api/v1/parsed-logs" not in paths
+    assert "post" not in paths["/api/v1/roles"]
+    assert "delete" not in paths["/api/v1/roles/{role_id}"]
+
+
+def admin_headers(client, database):
+    add_admin_user(database)
+    assert login(client, "admin").status_code == 200
+    return {"X-CSRF-Token": client.get("/api/v1/auth/session").json()["csrf_token"]}
+
+
+def create_normalizer(client, headers, name="normalizer"):
+    response = client.post(
+        "/api/v1/normalizers",
+        json={"name": name, "description": "test", "rule": "opaque rule"},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def test_administration_dto_validation_and_safe_errors(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    base = {
+        "username": "email-user",
+        "password": "long-enough-password",
+        "display_name": "Email User",
+        "role_id": str(GUEST_ID),
+    }
+    for invalid_email in ("bad@", "plain-address", "name@example"):
+        response = client.post(
+            "/api/v1/users", json={**base, "email": invalid_email}, headers=headers
+        )
+        assert response.status_code == 422
+        assert response.json()["code"] == "validation_error"
+        assert response.headers["X-Request-ID"] == response.json()["request_id"]
+    created = client.post(
+        "/api/v1/users", json={**base, "email": None}, headers=headers
+    )
+    assert created.status_code == 201
+    user_id = created.json()["id"]
+    normalizer = create_normalizer(client, headers)
+    mapping = client.post(
+        "/api/v1/oidc-role-mappings",
+        json={
+            "issuer": "https://idp.test/path/",
+            "claim_name": "groups",
+            "claim_value": "guests",
+            "role_id": str(GUEST_ID),
+        },
+        headers=headers,
+    ).json()
+    invalid_requests = (
+        ("patch", f"/api/v1/users/{user_id}", {"username": None}),
+        ("patch", f"/api/v1/users/{user_id}", {"display_name": None}),
+        ("patch", f"/api/v1/normalizers/{normalizer['id']}", {"name": None, "version": 1}),
+        ("patch", f"/api/v1/normalizers/{normalizer['id']}", {"rule": None, "version": 1}),
+        ("patch", f"/api/v1/oidc-role-mappings/{mapping['id']}", {"issuer": None}),
+        ("patch", f"/api/v1/oidc-role-mappings/{mapping['id']}", {"role_id": None}),
+        ("patch", f"/api/v1/normalizers/{normalizer['id']}", {"version": 1}),
+    )
+    for method, path, body in invalid_requests:
+        response = getattr(client, method)(path, json=body, headers=headers)
+        assert response.status_code == 422
+        assert response.json()["code"] == "validation_error"
+    assert mapping["issuer"] == "https://idp.test/path/"
+
+
+def test_administration_permissions_csrf_and_dependency_override(client, auth_database):
+    assert client.get("/api/v1/users").status_code == 401
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    invalid_csrf = client.post(
+        "/api/v1/normalizers", json={"name": "x", "rule": "opaque"}
+    )
+    assert invalid_csrf.status_code == 403
+    assert invalid_csrf.json()["code"] == "csrf_invalid"
+
+    class FakeUsers:
+        def list(self, *_):
+            return [], 0
+
+    class FakeRoles:
+        def list(self):
+            return []
+
+    class FakeMappings:
+        def list(self, *_):
+            return [], 0
+
+    class FakeSettings:
+        def list(self, _):
+            return []
+
+    class FakeNormalizers:
+        def list(self, *_):
+            return [], 0
+
+    overrides = {
+        get_user_admin: FakeUsers(),
+        get_role_admin: FakeRoles(),
+        get_mapping_admin: FakeMappings(),
+        get_setting_admin: FakeSettings(),
+        get_normalizer_admin: FakeNormalizers(),
+    }
+    for dependency, service in overrides.items():
+        client.app.dependency_overrides[dependency] = lambda service=service: service
+    try:
+        assert client.get("/api/v1/users").json()["items"] == []
+        assert client.get("/api/v1/roles").json() == []
+        assert client.get("/api/v1/oidc-role-mappings").json()["items"] == []
+        assert client.get("/api/v1/app-settings").json() == []
+        assert client.get("/api/v1/normalizers").json()["items"] == []
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_user_lifecycle_self_password_and_session_revocation(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    admin_session = client.get("/api/v1/auth/session").json()
+    admin_id = admin_session["user"]["id"]
+    changed = client.put(
+        f"/api/v1/users/{admin_id}/password",
+        json={"password": "new-long-enough-password"},
+        headers=headers,
+    )
+    assert changed.status_code == 200
+    assert client.get("/api/v1/auth/session").json()["authenticated"] is False
+    assert login(client, "admin", "new-long-enough-password").status_code == 200
+    refreshed_headers = {
+        "X-CSRF-Token": client.get("/api/v1/auth/session").json()["csrf_token"]
+    }
+    created = client.post(
+        "/api/v1/users",
+        json={
+            "id": "11111111-1111-4111-8111-111111111111",
+            "username": "case-user",
+            "password": "long-enough-password",
+            "display_name": "Case User",
+            "role_id": str(GUEST_ID),
+        },
+        headers=refreshed_headers,
+    )
+    assert created.status_code == 201
+    user_id = created.json()["id"]
+    duplicate = client.post(
+        "/api/v1/users",
+        json={
+            "username": "CASE-USER",
+            "password": "long-enough-password",
+            "display_name": "Duplicate",
+            "role_id": str(GUEST_ID),
+        },
+        headers=refreshed_headers,
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["code"] == "username_conflict"
+    assert client.post(
+        f"/api/v1/users/{user_id}/deactivate", headers=refreshed_headers
+    ).status_code == 200
+    assert client.post(
+        f"/api/v1/users/{user_id}/activate", headers=refreshed_headers
+    ).status_code == 200
+    assert client.put(
+        f"/api/v1/users/{admin_id}/role",
+        json={"role_id": str(GUEST_ID), "role_managed_by_oidc": False},
+        headers=refreshed_headers,
+    ).status_code == 409
+
+
+def test_deactivate_and_password_reset_revoke_other_user_sessions(
+    client, auth_database, auth_settings
+):
+    headers = admin_headers(client, auth_database)
+    created = client.post(
+        "/api/v1/users",
+        json={
+            "username": "session-target",
+            "password": "long-enough-password",
+            "display_name": "Session Target",
+            "role_id": str(GUEST_ID),
+        },
+        headers=headers,
+    ).json()
+    target_id = created["id"]
+    with TestClient(create_app(auth_settings, database=auth_database)) as target_client:
+        assert login(target_client, "session-target", "long-enough-password").status_code == 200
+        assert client.post(
+            f"/api/v1/users/{target_id}/deactivate", headers=headers
+        ).status_code == 200
+        assert target_client.get("/api/v1/auth/session").json()["authenticated"] is False
+    assert client.post(
+        f"/api/v1/users/{target_id}/activate", headers=headers
+    ).status_code == 200
+    with TestClient(create_app(auth_settings, database=auth_database)) as target_client:
+        assert login(target_client, "session-target", "long-enough-password").status_code == 200
+        assert client.put(
+            f"/api/v1/users/{target_id}/password",
+            json={"password": "changed-long-password"},
+            headers=headers,
+        ).status_code == 200
+        assert target_client.get("/api/v1/auth/session").json()["authenticated"] is False
+
+
+def test_mapping_pagination_and_normalizer_delete_graph(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    for number in range(3):
+        response = client.post(
+            "/api/v1/oidc-role-mappings",
+            json={
+                "issuer": "https://idp.test",
+                "claim_name": "groups",
+                "claim_value": f"group-{number}",
+                "role_id": str(GUEST_ID),
+            },
+            headers=headers,
+        )
+        assert response.status_code == 201
+    page = client.get("/api/v1/oidc-role-mappings?limit=1&offset=1").json()
+    assert page["total"] == 3 and len(page["items"]) == 1
+    assert client.get(
+        f"/api/v1/oidc-role-mappings?role_id={GUEST_ID}&limit=10"
+    ).json()["total"] == 3
+
+    normalizer = create_normalizer(client, headers, "delete-graph")
+    with auth_database.session_factory() as session:
+        connection = KafkaConnection(name="delete-graph-connection", bootstrap_servers=["broker:9092"])
+        session.add(connection)
+        session.flush()
+        source = Source(
+            name="delete-graph-source",
+            connection_id=connection.id,
+            normalizer_id=UUID(normalizer["id"]),
+            topic_name="delete-graph-topic",
+            is_enabled=True,
+        )
+        session.add(source)
+        session.flush()
+        timestamp = datetime.now(UTC)
+        parsed = ParsedLog(
+            source_id=source.id,
+            connection_id=connection.id,
+            normalizer_id=UUID(normalizer["id"]),
+            normalizer_version=1,
+            source_name=source.name,
+            connection_name=connection.name,
+            kafka_topic=source.topic_name,
+            kafka_partition=0,
+            kafka_offset=1,
+            deduplication_key="delete-graph-log",
+            fluent_bit_collected_at=timestamp,
+            backend_received_at=timestamp,
+            backend_processed_at=timestamp,
+            raw="raw",
+            ecs_data={},
+        )
+        session.add(parsed)
+        session.commit()
+        source_id, parsed_id = source.id, parsed.id
+        source_updated_at = source.updated_at
+    assert client.delete(
+        f"/api/v1/normalizers/{normalizer['id']}?version=1", headers=headers
+    ).status_code == 204
+    with auth_database.session_factory() as session:
+        source = session.get(Source, source_id)
+        parsed = session.get(ParsedLog, parsed_id)
+        assert source.is_enabled is False and source.normalizer_id is None
+        assert source.updated_at > source_updated_at
+        assert parsed is not None and parsed.normalizer_id is None
+
+
+def test_concurrent_version_conflicts_roll_back_side_effects(auth_database):
+    actor_id = add_admin_user(auth_database)
+    with auth_database.session_factory() as session:
+        setting = AppSetting(key="concurrent.setting", value={"value": 0}, category="test")
+        normalizer = Normalizer(name="concurrent-normalizer", rule="opaque")
+        session.add_all([setting, normalizer])
+        session.flush()
+        connection = KafkaConnection(
+            name="concurrent-connection", bootstrap_servers=["broker:9092"]
+        )
+        session.add(connection)
+        session.flush()
+        source = Source(
+            name="concurrent-source",
+            connection_id=connection.id,
+            normalizer_id=normalizer.id,
+            topic_name="concurrent-topic",
+            is_enabled=True,
+        )
+        session.add(source)
+        session.commit()
+        normalizer_id, source_id = normalizer.id, source.id
+    first = auth_database.session_factory()
+    second = auth_database.session_factory()
+    try:
+        settings_one = SettingAdministration(
+            SqlAlchemySettingRepository(first), SqlAlchemyUnitOfWork(first)
+        )
+        settings_two = SettingAdministration(
+            SqlAlchemySettingRepository(second), SqlAlchemyUnitOfWork(second)
+        )
+        assert settings_two.get("concurrent.setting").version == 1
+        assert settings_one.update("concurrent.setting", {"value": 1}, 1, actor_id).version == 2
+        with pytest.raises(DomainError) as stale_setting:
+            settings_two.update("concurrent.setting", {"value": 2}, 1, actor_id)
+        assert stale_setting.value.code == "version_conflict"
+        assert stale_setting.value.details["current_version"] == 2
+    finally:
+        first.close()
+        second.close()
+
+    first = auth_database.session_factory()
+    second = auth_database.session_factory()
+    try:
+        normalizers_one = NormalizerAdministration(
+            SqlAlchemyNormalizerRepository(first), SqlAlchemyUnitOfWork(first)
+        )
+        normalizers_two = NormalizerAdministration(
+            SqlAlchemyNormalizerRepository(second), SqlAlchemyUnitOfWork(second)
+        )
+        assert normalizers_two.get(normalizer_id).version == 1
+        assert normalizers_one.update(
+            normalizer_id,
+            NormalizerPatch(description="first", version=1),
+            actor_id,
+        ).version == 2
+        with pytest.raises(DomainError) as stale_normalizer:
+            normalizers_two.delete(normalizer_id, 1)
+        assert stale_normalizer.value.code == "version_conflict"
+        assert stale_normalizer.value.details["current_version"] == 2
+        with auth_database.session_factory() as session:
+            assert session.get(Normalizer, normalizer_id).description == "first"
+            source = session.get(Source, source_id)
+            assert source.is_enabled is True and source.normalizer_id == normalizer_id
+    finally:
+        first.close()
+        second.close()
+
+
+def test_administration_conflicts_use_real_constraint_names(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    duplicate_role = client.patch(
+        f"/api/v1/roles/{GUEST_ID}", json={"name": "Administrator"}, headers=headers
+    )
+    assert duplicate_role.status_code == 409
+    assert duplicate_role.json()["code"] == "role_name_conflict"
+
+    first_mapping = {
+        "issuer": "https://conflicts.test",
+        "claim_name": "groups",
+        "claim_value": "one",
+        "role_id": str(GUEST_ID),
+    }
+    assert client.post("/api/v1/oidc-role-mappings", json=first_mapping, headers=headers).status_code == 201
+    duplicate_mapping = client.post(
+        "/api/v1/oidc-role-mappings", json=first_mapping, headers=headers
+    )
+    assert duplicate_mapping.status_code == 409
+    assert duplicate_mapping.json()["code"] == "oidc_mapping_conflict"
+    second_mapping = client.post(
+        "/api/v1/oidc-role-mappings",
+        json={**first_mapping, "claim_value": "two"},
+        headers=headers,
+    ).json()
+    mapping_update = client.patch(
+        f"/api/v1/oidc-role-mappings/{second_mapping['id']}",
+        json={"claim_value": "one"},
+        headers=headers,
+    )
+    assert mapping_update.status_code == 409
+    assert mapping_update.json()["code"] == "oidc_mapping_conflict"
+
+    first_normalizer = create_normalizer(client, headers, "conflict-first")
+    duplicate_normalizer = client.post(
+        "/api/v1/normalizers",
+        json={"name": "conflict-first", "rule": "opaque"},
+        headers=headers,
+    )
+    assert duplicate_normalizer.status_code == 409
+    assert duplicate_normalizer.json()["code"] == "normalizer_name_conflict"
+    second_normalizer = create_normalizer(client, headers, "conflict-second")
+    normalizer_update = client.patch(
+        f"/api/v1/normalizers/{second_normalizer['id']}",
+        json={"name": first_normalizer["name"], "version": 1},
+        headers=headers,
+    )
+    assert normalizer_update.status_code == 409
+    assert normalizer_update.json()["code"] == "normalizer_name_conflict"
+
+    explicit_id = "22222222-2222-4222-8222-222222222222"
+    user = {
+        "id": explicit_id,
+        "username": "explicit-conflict",
+        "password": "long-enough-password",
+        "display_name": "Explicit Conflict",
+        "role_id": str(GUEST_ID),
+    }
+    assert client.post("/api/v1/users", json=user, headers=headers).status_code == 201
+    duplicate_uuid = client.post(
+        "/api/v1/users",
+        json={**user, "username": "another-user"},
+        headers=headers,
+    )
+    assert duplicate_uuid.status_code == 409
+    assert duplicate_uuid.json()["code"] == "integrity_conflict"
+
+
+def test_user_filters_identity_rules_and_self_actions(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    first = client.post(
+        "/api/v1/users",
+        json={
+            "username": "filter-local",
+            "password": "long-enough-password",
+            "display_name": "Local Filter",
+            "email": "local@example.com",
+            "role_id": str(GUEST_ID),
+        },
+        headers=headers,
+    ).json()
+    explicit = client.post(
+        "/api/v1/users",
+        json={
+            "id": "33333333-3333-4333-8333-333333333333",
+            "username": "filter-admin",
+            "password": "long-enough-password",
+            "display_name": "Admin Filter",
+            "role_id": str(ADMIN_ID),
+            "is_active": False,
+        },
+        headers=headers,
+    ).json()
+    with auth_database.session_factory() as session:
+        oidc_user = User(
+            oidc_issuer="https://idp.filter.test",
+            oidc_subject="filter-subject",
+            email="oidc@example.com",
+            display_name="OIDC Filter",
+            role_id=GUEST_ID,
+            role_managed_by_oidc=True,
+        )
+        session.add(oidc_user)
+        session.commit()
+        oidc_id = oidc_user.id
+    users = client.get("/api/v1/users?limit=2&offset=0").json()
+    assert users["total"] == 4 and len(users["items"]) == 2
+    assert [item["id"] for item in users["items"]] == sorted(item["id"] for item in users["items"])
+    assert client.get("/api/v1/users?q=Local%20Filter").json()["total"] == 1
+    assert client.get(f"/api/v1/users?role_id={ADMIN_ID}").json()["total"] == 2
+    assert client.get("/api/v1/users?is_active=false").json()["total"] == 1
+    oidc_page = client.get("/api/v1/users?authentication_method=oidc").json()
+    assert oidc_page["total"] == 1 and oidc_page["items"][0]["id"] == str(oidc_id)
+    oidc_response = client.get(f"/api/v1/users/{oidc_id}")
+    assert oidc_response.status_code == 200 and "password_hash" not in oidc_response.text
+    assert client.patch(
+        f"/api/v1/users/{first['id']}",
+        json={"username": "filter-local-renamed", "display_name": "Renamed", "email": None},
+        headers=headers,
+    ).status_code == 200
+    assert client.patch(
+        f"/api/v1/users/{oidc_id}", json={"username": "not-allowed"}, headers=headers
+    ).status_code == 409
+    assert client.put(
+        f"/api/v1/users/{oidc_id}/password",
+        json={"password": "long-enough-password"},
+        headers=headers,
+    ).status_code == 409
+    assert client.put(
+        f"/api/v1/users/{first['id']}/role",
+        json={"role_id": str(GUEST_ID), "role_managed_by_oidc": True},
+        headers=headers,
+    ).status_code == 409
+    assert client.put(
+        f"/api/v1/users/{oidc_id}/role",
+        json={"role_id": str(ADMIN_ID), "role_managed_by_oidc": False},
+        headers=headers,
+    ).status_code == 200
+    assert client.post(f"/api/v1/users/{explicit['id']}/deactivate", headers=headers).status_code == 200
+    assert client.post(f"/api/v1/users/{explicit['id']}/deactivate", headers=headers).status_code == 200
+    assert client.post(f"/api/v1/users/{explicit['id']}/activate", headers=headers).status_code == 200
+    assert client.post(f"/api/v1/users/{explicit['id']}/activate", headers=headers).status_code == 200
+    current_id = client.get("/api/v1/auth/session").json()["user"]["id"]
+    assert client.post(f"/api/v1/users/{current_id}/deactivate", headers=headers).status_code == 409
+    assert client.delete(f"/api/v1/users/{current_id}", headers=headers).status_code == 409
+    missing = client.get("/api/v1/users/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    assert missing.status_code == 404 and missing.headers["X-Request-ID"] == missing.json()["request_id"]
+
+
+def test_settings_registry_roles_and_openapi_contracts(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    assert client.get("/api/v1/app-settings").json() == []
+    with auth_database.session_factory() as session:
+        session.add_all(
+            [
+                AppSetting(key="settings.one", value={"old": 1}, category="alpha", is_public=True),
+                AppSetting(key="settings.two", value=False, category="beta"),
+            ]
+        )
+        session.commit()
+    assert len(client.get("/api/v1/app-settings?category=alpha").json()) == 1
+    changed = client.put(
+        "/api/v1/app-settings/settings.one",
+        json={"value": {"new": 2}, "version": 1},
+        headers=headers,
+    ).json()
+    assert changed["value"] == {"new": 2} and changed["version"] == 2
+    assert changed["updated_by_user_id"] == client.get("/api/v1/auth/session").json()["user"]["id"]
+    assert client.post("/api/v1/app-settings", headers=headers).status_code == 405
+    assert client.delete("/api/v1/app-settings/settings.one", headers=headers).status_code == 405
+    roles = client.get("/api/v1/roles").json()
+    assert {item["id"] for item in roles} == {str(ADMIN_ID), str(GUEST_ID)}
+    role_before = next(item for item in roles if item["id"] == str(GUEST_ID))
+    renamed = client.patch(
+        f"/api/v1/roles/{GUEST_ID}", json={"name": "Read-only"}, headers=headers
+    ).json()
+    assert renamed["id"] == role_before["id"]
+    assert renamed["permissions"] == role_before["permissions"]
+    assert renamed["priority"] == role_before["priority"]
+    assert renamed["updated_at"] >= role_before["updated_at"]
+    assert client.patch(
+        f"/api/v1/roles/{GUEST_ID}", json={"name": "  "}, headers=headers
+    ).status_code == 422
+    schema = client.get("/openapi.json").json()
+    password_schema = schema["components"]["schemas"]["PasswordUpdate"]["properties"]["password"]
+    assert password_schema["format"] == "password" and password_schema["writeOnly"] is True
+    assert "password_hash" not in schema["components"]["schemas"]["UserDTO"]["properties"]
+
+
+def test_mapping_legacy_crud_and_normalizer_listing_contracts(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    actor_id = client.get("/api/v1/auth/session").json()["user"]["id"]
+    explicit_mapping = client.post(
+        "/api/v1/oidc-role-mappings",
+        json={
+            "id": "44444444-4444-4444-8444-444444444444",
+            "issuer": "https://mapping.test/issuer",
+            "claim_name": "groups",
+            "claim_value": "initial",
+            "role_id": str(GUEST_ID),
+        },
+        headers=headers,
+    ).json()
+    assert client.get(f"/api/v1/oidc-role-mappings/{explicit_mapping['id']}").status_code == 200
+    updated = client.patch(
+        f"/api/v1/oidc-role-mappings/{explicit_mapping['id']}",
+        json={"claim_value": "updated"},
+        headers=headers,
+    )
+    assert updated.status_code == 200 and updated.json()["claim_value"] == "updated"
+    with auth_database.session_factory() as session:
+        legacy = OidcRoleMapping(
+            issuer="https://legacy.test",
+            claim_name="groups",
+            claim_value="legacy",
+            role_id=None,
+        )
+        session.add(legacy)
+        session.commit()
+        legacy_id = legacy.id
+    legacy_response = client.get(f"/api/v1/oidc-role-mappings/{legacy_id}")
+    assert legacy_response.status_code == 200 and legacy_response.json()["role_id"] is None
+    assert client.delete(f"/api/v1/oidc-role-mappings/{legacy_id}", headers=headers).status_code == 204
+    assert client.get(f"/api/v1/oidc-role-mappings/{legacy_id}").status_code == 404
+
+    literal_percent = create_normalizer(client, headers, "literal%normalizer")
+    literal_underscore = create_normalizer(client, headers, "literal_normalizer")
+    literal_backslash = create_normalizer(client, headers, "literal\\normalizer")
+    explicit_normalizer = client.post(
+        "/api/v1/normalizers",
+        json={
+            "id": "55555555-5555-4555-8555-555555555555",
+            "name": "opaque-normalizer",
+            "rule": "this is deliberately not an ECS parser rule",
+        },
+        headers=headers,
+    ).json()
+    assert literal_percent["created_by_user_id"] == actor_id
+    assert explicit_normalizer["updated_by_user_id"] == actor_id
+    page = client.get("/api/v1/normalizers?limit=2&offset=0").json()
+    assert page["total"] == 4 and len(page["items"]) == 2
+    assert [item["id"] for item in page["items"]] == sorted(item["id"] for item in page["items"])
+    assert client.get("/api/v1/normalizers", params={"q": "%"}).json()["total"] == 1
+    assert client.get("/api/v1/normalizers", params={"q": "_"}).json()["total"] == 1
+    assert client.get("/api/v1/normalizers", params={"q": "\\"}).json()["total"] == 1
+    assert literal_underscore["version"] == 1
+    assert literal_backslash["version"] == 1
+    for body in ({"name": " ", "rule": "opaque"}, {"name": "blank-rule", "rule": "  "}):
+        assert client.post("/api/v1/normalizers", json=body, headers=headers).status_code == 422
