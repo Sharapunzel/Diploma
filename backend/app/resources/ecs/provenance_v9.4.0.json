@@ -1,0 +1,9 @@
+{
+  "upstream": "https://github.com/elastic/ecs",
+  "tag": "v9.4.0",
+  "source_file": "generated/ecs/ecs_flat.yml",
+  "retrieved_on": "2026-09-23",
+  "sha256": "f2c78b7c68503d42f5713ebea63fbfafbbeb7056f0d3ec7208c9cc2202ba7d8f",
+  "license_file": "LICENSE.txt",
+  "license": "Apache-2.0"
+}

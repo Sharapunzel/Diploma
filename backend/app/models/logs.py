@@ -34,6 +34,12 @@ class ParsedLog(Base):
         Index("ix_parsed_logs_normalizer_id", "normalizer_id"),
         Index("ix_parsed_logs_fluent_collected", "fluent_bit_collected_at"),
         Index("ix_parsed_logs_ecs_data", "ecs_data", postgresql_using="gin"),
+        Index(
+            "ix_parsed_logs_raw_trgm",
+            "raw",
+            postgresql_using="gin",
+            postgresql_ops={"raw": "gin_trgm_ops"},
+        ),
         {"schema": "logs"},
     )
     id: Mapped[UUID] = mapped_column(
@@ -49,6 +55,7 @@ class ParsedLog(Base):
         ForeignKey("app.normalizers.id", ondelete="SET NULL")
     )
     normalizer_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    normalizer_name: Mapped[str] = mapped_column(Text, nullable=False)
     source_name: Mapped[str] = mapped_column(Text, nullable=False)
     connection_name: Mapped[str] = mapped_column(Text, nullable=False)
     kafka_topic: Mapped[str] = mapped_column(Text, nullable=False)

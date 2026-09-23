@@ -149,6 +149,7 @@ def insert_parsed_log(
         "connection_id": connection_id,
         "normalizer_id": normalizer_id,
         "normalizer_version": 1,
+        "normalizer_name": "Normalizer snapshot",
         "source_name": "Source snapshot",
         "connection_name": "Connection snapshot",
         "kafka_topic": "events",

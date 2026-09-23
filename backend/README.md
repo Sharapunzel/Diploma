@@ -170,3 +170,106 @@ Creating a source and enabling it perform a live metadata check. Topic listing f
 internal topics beginning with `__` unless `include_internal=true`; it never creates a
 source or starts a Kafka consumer. Deleting a connection cascades its sources while
 preserving parsed logs with nullable foreign keys.
+
+## Parsed logs and ECS catalog
+
+The API vendors the generated Elastic Common Schema artifact from the immutable
+[`v9.4.0` release](https://github.com/elastic/ecs/tree/v9.4.0). The original YAML,
+upstream license, retrieval date, source URL and SHA-256 are stored under
+`app/resources/ecs/`. Runtime catalog loading is local/offline; the same catalog API can
+later power normalizer field suggestions and validation. The source is
+`generated/ecs/ecs_flat.yml` at tag `v9.4.0` (`ecs_flat_v9.4.0.yml` in this repository),
+retrieved 2026-09-23; SHA-256:
+`f2c78b7c68503d42f5713ebea63fbfafbbeb7056f0d3ec7208c9cc2202ba7d8f`.
+
+All endpoints below require an authenticated session. Catalog, search and detail require
+`events.read`; single and bulk deletion require `events.delete`. Every POST (including the
+read-only search) and DELETE request must send the session-bound token in
+`X-CSRF-Token` as returned by `GET /api/v1/auth/session`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/ecs/schema` | ECS version, field count and safe artifact provenance |
+| `GET /api/v1/ecs/fields?q=&type=&level=&filterable=&limit=50&offset=0` | Search/browse the sorted field catalog |
+| `GET /api/v1/ecs/fields/{field_name}` | Read one dotted ECS field (including `@timestamp`) |
+| `POST /api/v1/parsed-logs/search` | Search normalized logs |
+| `GET /api/v1/parsed-logs/{log_id}` | Read full raw and ECS payload for one event |
+| `DELETE /api/v1/parsed-logs/{log_id}` | Delete one event |
+| `POST /api/v1/parsed-logs/actions/delete` | Delete by source, time interval, or both |
+
+Search combines ID/topic/partition groups (OR within a group, AND between groups),
+half-open time bounds `[from,to)`, literal raw substring search and up to 20 ECS field
+filters. `%`, `_` and backslash in `raw_query` are treated literally. Example:
+
+```json
+{
+  "raw_query": "authentication failure",
+  "processed_from": "2026-01-01T00:00:00Z",
+  "processed_to": "2026-02-01T00:00:00Z",
+  "ecs_filters": [
+    {"field": "event.action", "operator": "eq", "value": "login"},
+    {"field": "source.ip", "operator": "eq", "value": "192.0.2.10"}
+  ],
+  "limit": 50,
+  "cursor": null
+}
+```
+
+Available ECS operators are published with each field. String-like fields support
+`eq`, `neq`, case-insensitive substring `contains`, `exists` and `not_exists`; numbers
+support equality and ordered comparisons; dates support timezone-aware equality and ordered
+comparisons; booleans support equality; IP addresses support equality. Array-capable leaf
+fields additionally support `contains`; on every array, `eq` tests exact typed membership
+and `neq` requires an existing array without that element. For string-like arrays,
+`contains` performs a case-insensitive substring search in string elements; for numeric,
+boolean, date and IP arrays it is typed membership. Invalid IPs and dates are rejected for
+every operator; integer ECS fields accept JSON integers only. `exists` means the JSON path is
+present, including an explicit JSON `null`; `not_exists` means the path is absent (a present
+JSON `null` is therefore considered to exist). Malformed stored values do not match value
+comparisons (`eq`, `neq` or `contains`).
+Unsupported/object ECS types remain discoverable but are not filterable. Field names are
+looked up in the trusted catalog before being translated to parameterized JSONB queries;
+clients cannot submit SQL, casts or JSON paths.
+
+Results are ordered by `backend_processed_at DESC, id DESC`. The first page captures a
+database-time `created_at` cutoff, and every continuation applies that same cutoff. This
+excludes ordinary later inserts and backfills whose `created_at` is after the cutoff, but it
+is not a strict database snapshot: a transaction that commits later with `created_at` at or
+before the cutoff may appear on a later page, and deletions between pages can remove rows.
+The signed opaque cursor carries the cutoff and sort position, and binds both to the normalized
+filter fingerprint (but not page size); changing filters, tampering with the cursor or
+malformed/legacy cursor data returns `422 invalid_cursor`. A new search captures a new cutoff.
+The result
+has `items`, `has_more` and `next_cursor`, with no expensive total count. Search summaries
+contain at most 500 characters of raw text and the ECS version, never the full raw payload,
+ECS object or deduplication key. The detail endpoint returns those full event fields.
+
+Delete one returns `204` or `404 parsed_log_not_found`. Bulk deletion requires at least a
+source UUID or a complete non-empty `[processed_from,processed_to)` range; the only supported
+scopes are source, range, or their intersection. An empty/global delete is rejected with
+`422 deletion_scope_required`. Bulk deletion is one set-based database delete in one
+transaction. Migration `0003` installs `pg_trgm`, backfills immutable normalizer-name
+snapshots (using `legacy-unknown` only when the old relation cannot provide a name), and
+adds a GIN trigram index for raw substring search. Apply it with the normal
+`python -m alembic upgrade head` workflow.
+
+```http
+DELETE /api/v1/parsed-logs/7ca4e014-175a-4bfe-8e3f-5de190868647
+X-CSRF-Token: <session csrf token>
+```
+
+```http
+POST /api/v1/parsed-logs/actions/delete
+X-CSRF-Token: <session csrf token>
+Content-Type: application/json
+
+{"source_id":"7ca4e014-175a-4bfe-8e3f-5de190868647"}
+```
+
+```json
+{
+  "source_id": null,
+  "processed_from": "2026-01-01T00:00:00Z",
+  "processed_to": "2026-02-01T00:00:00Z"
+}
+```

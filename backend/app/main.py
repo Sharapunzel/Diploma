@@ -16,6 +16,7 @@ from .config import Settings, settings
 from .core.errors import DomainError
 from .db import Database
 from .dependencies import build_auth_service, get_settings
+from .ecs import EcsCatalog, PackagedEcsCatalog
 from .kafka import ConfluentKafkaMetadataClient
 from .oidc import AuthlibOidcClient
 
@@ -63,6 +64,7 @@ def create_app(
     database: Database | None = None,
     oidc_client=None,
     kafka_client=None,
+    ecs_catalog: EcsCatalog | None = None,
 ) -> FastAPI:
     current = config or settings
     owned_database = database is None
@@ -79,6 +81,7 @@ def create_app(
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
     app.state.kafka_client = kafka_client or ConfluentKafkaMetadataClient()
+    app.state.ecs_catalog = ecs_catalog if ecs_catalog is not None else PackagedEcsCatalog.load()
     app.dependency_overrides[get_settings] = lambda: current
     logging.getLogger("app").setLevel(current.log_level.upper())
 

@@ -5,8 +5,10 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
@@ -30,6 +32,8 @@ from app.core.errors import DomainError
 from app.core.security import hash_password, token_digest
 from app.db import Database
 from app.dependencies import (
+    get_cursor_codec,
+    get_ecs_catalog,
     get_kafka_client,
     get_mapping_admin,
     get_normalizer_admin,
@@ -39,6 +43,7 @@ from app.dependencies import (
     get_user_admin,
     require_permission,
 )
+from app.ecs import PackagedEcsCatalog, ValidatedEcsFilter
 from app.kafka import KafkaMetadata, KafkaMetadataError, KafkaTopic
 from app.main import create_app
 from app.models import (
@@ -64,12 +69,16 @@ from app.repositories.sqlalchemy.administration import (
     SqlAlchemyNormalizerRepository,
     SqlAlchemySettingRepository,
 )
+from app.repositories.sqlalchemy.parsed_logs import _filter_expression
 from app.schemas.administration import NormalizerPatch
+from app.schemas.parsed_logs import ParsedLogBulkDeleteRequest, ParsedLogSearchRequest
 from app.services.implementations.administration import (
     NormalizerAdministration,
     SettingAdministration,
 )
 from app.services.implementations.auth import AuthService
+from app.services.implementations.cursor import SignedParsedLogCursorCodec
+from app.services.implementations.parsed_logs import ParsedLogServiceImpl
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ADMIN_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -222,7 +231,7 @@ def test_0002_schema_permission_and_downgrade(auth_database_url):
         } <= constraints
         assert {"ix_auth_sessions_user_id", "ix_auth_sessions_expiry"} <= indexes
         assert "events.delete" in permissions
-        run_alembic(auth_database_url, "downgrade", "-1")
+        run_alembic(auth_database_url, "downgrade", "0001_database_foundation")
         with psycopg.connect(psycopg_url) as connection:
             assert connection.execute("SELECT to_regclass('app.auth_sessions')").fetchone()[0] is None
             permissions = connection.execute(
@@ -1473,6 +1482,7 @@ def test_mapping_pagination_and_normalizer_delete_graph(client, auth_database):
             connection_id=connection.id,
             normalizer_id=UUID(normalizer["id"]),
             normalizer_version=1,
+            normalizer_name="Legacy test normalizer",
             source_name=source.name,
             connection_name=connection.name,
             kafka_topic=source.topic_name,
@@ -2294,7 +2304,10 @@ def test_kafka_source_validation_permissions_and_safe_failures(client, auth_data
 def test_task4_openapi_has_no_future_ingestion_routes(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert "/api/v1/kafka-connections" in paths and "/api/v1/sources" in paths
-    assert not any("consumer" in path or "parsed-log" in path for path in paths)
+    assert not any("consumer" in path for path in paths)
+    assert "/api/v1/parsed-logs/search" in paths
+    assert "/api/v1/parsed-logs/{log_id}" in paths
+    assert "post" not in paths["/api/v1/parsed-logs/{log_id}"]
 
 
 def test_connection_delete_cascades_source_and_preserves_parsed_log(client, auth_database):
@@ -2317,6 +2330,7 @@ def test_connection_delete_cascades_source_and_preserves_parsed_log(client, auth
             source_id=UUID(source["id"]),
             connection_id=UUID(connection["id"]),
             normalizer_version=1,
+            normalizer_name="Legacy test normalizer",
             source_name=source["name"],
             connection_name=connection["name"],
             kafka_topic=source["topic_name"],
@@ -2340,3 +2354,792 @@ def test_connection_delete_cascades_source_and_preserves_parsed_log(client, auth
         persisted = session.get(ParsedLog, parsed_id)
         assert persisted is not None
         assert persisted.source_id is None and persisted.connection_id is None
+
+
+def add_parsed_log(
+    database, *, timestamp=None, collected_at=None, created_at=None, source_id=None, connection_id=None,
+    topic="events", partition=0, raw="raw event", ecs_data=None,
+):
+    timestamp = timestamp or datetime.now(UTC)
+    collected_at = collected_at or timestamp
+    with database.session_factory() as session:
+        log = ParsedLog(
+            source_id=source_id,
+            connection_id=connection_id,
+            normalizer_version=1,
+            normalizer_name="Normalizer snapshot",
+            source_name="Source snapshot",
+            connection_name="Connection snapshot",
+            kafka_topic=topic,
+            kafka_partition=partition,
+            kafka_offset=1,
+            deduplication_key=f"test-{uuid4()}",
+            fluent_bit_collected_at=collected_at,
+            backend_received_at=timestamp,
+            backend_processed_at=timestamp,
+            created_at=created_at,
+            raw=raw,
+            ecs_data=ecs_data or {"ecs": {"version": "9.4.0"}, "event": {"name": "login"}},
+        )
+        session.add(log)
+        session.commit()
+        return log.id
+
+
+def events_headers(client):
+    session = client.get("/api/v1/auth/session").json()
+    return {"X-CSRF-Token": session["csrf_token"]}
+
+
+def add_source_pair(database):
+    with database.session_factory() as session:
+        connection = KafkaConnection(
+            name=f"search-{uuid4()}", bootstrap_servers=["localhost:9092"]
+        )
+        session.add(connection)
+        session.flush()
+        sources = [
+            Source(
+                name=f"source-{uuid4()}",
+                connection_id=connection.id,
+                topic_name=f"topic-{index}-{uuid4()}",
+            )
+            for index in range(2)
+        ]
+        session.add_all(sources)
+        session.commit()
+        return connection.id, [(source.id, source.topic_name) for source in sources]
+
+
+def test_ecs_catalog_is_vendored_complete_and_offline():
+    catalog = PackagedEcsCatalog.load()
+    assert catalog.version == "9.4.0"
+    assert len(catalog.fields) > 2_000
+    assert {
+        "@timestamp", "message", "ecs.version", "event.action",
+        "host.name", "user.name", "source.ip",
+    } <= set(catalog.fields)
+    assert "event.name" not in catalog.fields
+    assert catalog.fields["@timestamp"].type == "date"
+    assert catalog.fields["source.ip"].type == "ip"
+    assert catalog.fields["message"].type == "match_only_text"
+    assert catalog.fields["@timestamp"].field_set == "base"
+    assert catalog.fields["message"].field_set == "base"
+    assert catalog.fields["client.as.number"].field_set == "as"
+    assert catalog.fields["source.ip"].field_set == "source"
+    assert catalog.fields["event.action"].type == "keyword"
+    assert catalog.provenance.sha256
+    assert not any("path" in key.lower() for key in catalog.provenance.__dict__)
+
+
+def test_create_app_accepts_ecs_catalog_without_loading_packaged_artifact(
+    auth_settings, auth_database, monkeypatch
+):
+    fake_catalog = PackagedEcsCatalog.load()
+    loader = Mock(return_value=fake_catalog)
+    monkeypatch.setattr(PackagedEcsCatalog, "load", loader)
+    default_app = create_app(auth_settings, database=auth_database)
+    assert default_app.state.ecs_catalog is fake_catalog
+    loader.assert_called_once_with()
+    loader.reset_mock()
+    app = create_app(auth_settings, database=auth_database, ecs_catalog=fake_catalog)
+    assert app.state.ecs_catalog is fake_catalog
+    loader.assert_not_called()
+
+
+def test_ecs_catalog_api_auth_search_pagination_and_not_found(client, auth_database):
+    assert client.get("/api/v1/ecs/schema").status_code == 401
+    add_local_user(auth_database)
+    response = login(client)
+    assert response.status_code == 200
+    schema = client.get("/api/v1/ecs/schema")
+    assert schema.status_code == 200 and schema.json()["version"] == "9.4.0"
+    fields = client.get("/api/v1/ecs/fields", params={"q": "event.action", "limit": 1})
+    assert fields.status_code == 200
+    assert fields.json()["items"][0]["name"] == "event.action"
+    assert fields.json()["total"] >= 1
+    assert client.get("/api/v1/ecs/fields/@timestamp").json()["type"] == "date"
+    assert client.get("/api/v1/ecs/fields/@timestamp").json()["field_set"] == "base"
+    assert client.get("/api/v1/ecs/fields/message").json()["field_set"] == "base"
+    assert client.get("/api/v1/ecs/fields/client.as.number").json()["field_set"] == "as"
+    assert client.get("/api/v1/ecs/fields/source.ip").json()["field_set"] == "source"
+    missing = client.get("/api/v1/ecs/fields/not.a.real.ecs.field")
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "ecs_field_not_found"
+    packaged = client.app.state.ecs_catalog
+    replacement = PackagedEcsCatalog(packaged.fields, packaged.provenance)
+    client.app.dependency_overrides[get_ecs_catalog] = lambda: replacement
+    assert client.get("/api/v1/ecs/fields/event.action").status_code == 200
+    openapi = client.app.openapi()
+    assert "/api/v1/parsed-logs/actions/delete" in openapi["paths"]
+    assert "post" not in openapi["paths"]["/api/v1/parsed-logs/{log_id}"]
+    assert "422" in openapi["paths"]["/api/v1/parsed-logs/search"]["post"]["responses"]
+
+
+def test_parsed_log_search_filters_signed_cursor_and_detail(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    class CountingCursorCodec:
+        def __init__(self):
+            self.delegate = SignedParsedLogCursorCodec(
+                client.app.state.settings.oidc_state_secret.get_secret_value()
+            )
+            self.decoded = 0
+            self.encoded = 0
+
+        def decode(self, token, body):
+            self.decoded += 1
+            return self.delegate.decode(token, body)
+
+        def encode(self, processed_at, log_id, snapshot_boundary, body):
+            self.encoded += 1
+            return self.delegate.encode(processed_at, log_id, snapshot_boundary, body)
+
+    cursor_codec = CountingCursorCodec()
+    client.app.dependency_overrides[get_cursor_codec] = lambda: cursor_codec
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    ids = [
+        add_parsed_log(
+            auth_database,
+            timestamp=timestamp,
+            raw=f"authentication failure {index}",
+            ecs_data={"ecs": {"version": "9.4.0"}, "event": {"action": "login"}},
+        )
+        for index in range(3)
+    ]
+    request = {
+        "limit": 2,
+        "raw_query": "  failure  ",
+        "ecs_filters": [{"field": "event.action", "operator": "eq", "value": "login"}],
+    }
+    response = client.post(
+        "/api/v1/parsed-logs/search", json=request, headers=events_headers(client)
+    )
+    assert response.status_code == 200, response.text
+    first_page = response.json()
+    assert first_page["has_more"] is True
+    assert cursor_codec.decoded == 1 and cursor_codec.encoded == 1
+    assert all(len(item["raw_preview"]) <= 500 for item in first_page["items"])
+    time.sleep(0.01)
+    inserted_after_page_one = add_parsed_log(
+        auth_database,
+        timestamp=timestamp,
+        created_at=datetime.now(UTC),
+        raw="authentication failure inserted later",
+        ecs_data={"ecs": {"version": "9.4.0"}, "event": {"action": "login"}},
+    )
+    backfill_after_page_one = add_parsed_log(
+        auth_database,
+        timestamp=timestamp - timedelta(days=1),
+        created_at=datetime.now(UTC),
+        raw="authentication failure backfill",
+        ecs_data={"ecs": {"version": "9.4.0"}, "event": {"action": "login"}},
+    )
+    next_request = {**request, "cursor": first_page["next_cursor"]}
+    second = client.post(
+        "/api/v1/parsed-logs/search", json=next_request, headers=events_headers(client)
+    )
+    assert second.status_code == 200, second.text
+    assert cursor_codec.decoded == 2
+    all_ids = [item["id"] for item in first_page["items"] + second.json()["items"]]
+    assert len(all_ids) == len(set(all_ids)) == 3
+    assert str(inserted_after_page_one) not in all_ids
+    assert str(backfill_after_page_one) not in all_ids
+    time.sleep(0.01)
+    fresh = client.post(
+        "/api/v1/parsed-logs/search", json={**request, "limit": 100},
+        headers=events_headers(client),
+    )
+    assert fresh.status_code == 200
+    fresh_ids = {item["id"] for item in fresh.json()["items"]}
+    assert {str(inserted_after_page_one), str(backfill_after_page_one)} <= fresh_ids
+    changed_filters = {**next_request, "raw_query": "different"}
+    invalid = client.post(
+        "/api/v1/parsed-logs/search", json=changed_filters, headers=events_headers(client)
+    )
+    assert invalid.status_code == 422 and invalid.json()["code"] == "invalid_cursor"
+    signed = cursor_codec.delegate.serializer
+    payload = signed.loads(first_page["next_cursor"])
+    payload["snapshot_boundary"] = None
+    malformed = next_request | {"cursor": signed.dumps(payload)}
+    invalid = client.post(
+        "/api/v1/parsed-logs/search", json=malformed, headers=events_headers(client)
+    )
+    assert invalid.status_code == 422 and invalid.json()["code"] == "invalid_cursor"
+    legacy_cursor = signed.dumps({
+        "processed_at": timestamp.isoformat(), "id": str(ids[0]),
+        "filters": cursor_codec.delegate._fingerprint(
+            ParsedLogSearchRequest.model_validate(request)
+        ),
+    })
+    invalid = client.post(
+        "/api/v1/parsed-logs/search",
+        json={**request, "cursor": legacy_cursor}, headers=events_headers(client),
+    )
+    assert invalid.status_code == 422 and invalid.json()["code"] == "invalid_cursor"
+    tampered = next_request | {"cursor": first_page["next_cursor"] + "x"}
+    invalid = client.post(
+        "/api/v1/parsed-logs/search", json=tampered, headers=events_headers(client)
+    )
+    assert invalid.status_code == 422 and invalid.json()["code"] == "invalid_cursor"
+    detail = client.get(f"/api/v1/parsed-logs/{ids[0]}")
+    assert detail.status_code == 200
+    assert detail.json()["raw"] == "authentication failure 0"
+    assert detail.json()["ecs_data"]["event"]["action"] == "login"
+
+
+def test_parsed_log_typed_ecs_filters_and_bad_values(client, auth_database):
+    add_local_user(auth_database)
+    login(client)
+    add_parsed_log(
+        auth_database,
+        ecs_data={
+            "ecs": {"version": "9.4.0"},
+            "event": {
+                "duration": 42,
+                "action": "login",
+                "category": ["authentication", "network"],
+                "created": "2026-01-01T00:00:00Z",
+            },
+            "source": {"ip": "192.0.2.10"},
+            "host": {"name": "sensor-a"},
+            "cloud": {"entity": {"attributes": {"mfa_enabled": True}}},
+        },
+    )
+    add_parsed_log(
+        auth_database,
+        ecs_data={
+            "ecs": {"version": "legacy"},
+            "event": {"duration": "bad-number", "category": "not-an-array"},
+        },
+    )
+    headers = events_headers(client)
+    for filter_value in (
+        {"field": "event.duration", "operator": "gte", "value": 40},
+        {"field": "source.ip", "operator": "eq", "value": "192.0.2.10"},
+        {"field": "host.name", "operator": "contains", "value": "sensor"},
+        {"field": "event.category", "operator": "contains", "value": "auth"},
+        {"field": "event.category", "operator": "eq", "value": "network"},
+        {"field": "event.created", "operator": "gte", "value": "2026-01-01T00:00:00Z"},
+        {"field": "cloud.entity.attributes.mfa_enabled", "operator": "eq", "value": True},
+        {"field": "source.ip", "operator": "exists"},
+        {"field": "host.ip", "operator": "not_exists"},
+    ):
+        response = client.post(
+            "/api/v1/parsed-logs/search",
+            json={"ecs_filters": [filter_value]},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        expected_count = 2 if filter_value["operator"] == "not_exists" else 1
+        assert len(response.json()["items"]) == expected_count
+    combined = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [
+            {"field": "event.duration", "operator": "gt", "value": 40},
+            {"field": "source.ip", "operator": "eq", "value": "192.0.2.10"},
+        ]},
+        headers=headers,
+    )
+    assert combined.status_code == 200 and len(combined.json()["items"]) == 1
+    malformed_numeric = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.duration", "operator": "gte", "value": 1}]},
+        headers=headers,
+    )
+    assert malformed_numeric.status_code == 200
+    assert len(malformed_numeric.json()["items"]) == 1
+    invalid_type = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.duration", "operator": "eq", "value": "42"}]},
+        headers=headers,
+    )
+    assert invalid_type.status_code == 422
+    assert invalid_type.json()["code"] == "ecs_filter_invalid"
+    assert invalid_type.json()["details"] == {
+        "index": 0, "field": "event.duration", "reason": "invalid_value_type"
+    }
+    fractional_integer = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.duration", "operator": "eq", "value": 1.5}]},
+        headers=headers,
+    )
+    assert fractional_integer.status_code == 422
+    assert fractional_integer.json()["code"] == "ecs_filter_invalid"
+    positive_integer = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.duration", "operator": "eq", "value": 42}]},
+        headers=headers,
+    )
+    assert positive_integer.status_code == 200
+    assert len(positive_integer.json()["items"]) == 1
+    invalid_ip = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "source.ip", "operator": "eq", "value": "not-an-ip"}]},
+        headers=headers,
+    )
+    assert invalid_ip.status_code == 422 and invalid_ip.json()["code"] == "ecs_filter_invalid"
+    invalid_array_ip = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "host.ip", "operator": "contains", "value": "not-an-ip"}]},
+        headers=headers,
+    )
+    assert invalid_array_ip.status_code == 422
+    invalid_date = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.created", "operator": "eq", "value": "2026-01-01T00:00:00"}]},
+        headers=headers,
+    )
+    assert invalid_date.status_code == 422
+    invalid_operator = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.action", "operator": "sql", "value": "x"}]},
+        headers=headers,
+    )
+    assert invalid_operator.status_code == 422
+    invalid_field = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "unknown.field", "operator": "eq", "value": 1}]},
+        headers=headers,
+    )
+    assert invalid_field.status_code == 422
+    non_filterable = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "agent", "operator": "exists"}]},
+        headers=headers,
+    )
+    assert non_filterable.status_code == 422
+
+
+def test_parsed_log_typed_array_filters_and_json_null_presence(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    original = client.app.state.ecs_catalog
+    array_fields = dict(original.fields)
+    for name in (
+        "event.duration", "event.created", "cloud.entity.attributes.mfa_enabled"
+    ):
+        field = array_fields[name]
+        array_fields[name] = replace(
+            field,
+            is_array=True,
+            operators=("eq", "neq", "contains", "exists", "not_exists"),
+        )
+    client.app.state.ecs_catalog = PackagedEcsCatalog(array_fields, original.provenance)
+
+    for field_name, value in (
+        ("event.duration", 7), ("event.created", "2026-01-01T00:00:00Z")
+    ):
+        catalog_field = client.get(f"/api/v1/ecs/fields/{field_name}").json()
+        assert set(catalog_field["operators"]) == {
+            "eq", "neq", "contains", "exists", "not_exists"
+        }
+        for operator in ("gt", "gte", "lt", "lte"):
+            response = client.post(
+                "/api/v1/parsed-logs/search",
+                json={"ecs_filters": [{"field": field_name, "operator": operator, "value": value}]},
+                headers=events_headers(client),
+            )
+            assert response.status_code == 422
+            assert response.json()["code"] == "ecs_filter_invalid"
+        with pytest.raises(ValueError, match="Unsupported ECS array operator"):
+            _filter_expression(
+                ValidatedEcsFilter(array_fields[field_name], "gt", value)
+            )
+
+    add_parsed_log(
+        auth_database, raw="array-semantics valid",
+        ecs_data={
+            "ecs": {"version": "9.4.0"},
+            "host": {"ip": ["192.0.2.1", "192.0.2.2"]},
+            "event": {
+                "duration": [42, 7],
+                "created": ["2026-01-01T00:00:00+00:00"],
+            },
+            "cloud": {"entity": {"attributes": {"mfa_enabled": [True]}}},
+        },
+    )
+    add_parsed_log(
+        auth_database, raw="array-semantics malformed",
+        ecs_data={
+            "ecs": {"version": "9.4.0"},
+            "host": {"ip": "not-an-array"},
+            "event": {"duration": ["bad-number", None], "created": None},
+            "cloud": {"entity": {"attributes": {"mfa_enabled": "true"}}},
+        },
+    )
+    add_parsed_log(
+        auth_database, raw="array-semantics missing",
+        ecs_data={"ecs": {"version": "9.4.0"}},
+    )
+    headers = events_headers(client)
+
+    def search(field, operator, value_marker=...):
+        item = {"field": field, "operator": operator}
+        if value_marker is not ...:
+            item["value"] = value_marker
+        response = client.post(
+            "/api/v1/parsed-logs/search",
+            json={"raw_query": "array-semantics", "ecs_filters": [item]},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["items"]
+
+    assert len(search("host.ip", "eq", "192.0.2.1")) == 1
+    assert len(search("host.ip", "neq", "192.0.2.10")) == 1
+    assert len(search("host.ip", "contains", "192.0.2.1")) == 1
+    assert len(search("event.duration", "eq", 42)) == 1
+    assert len(search("event.duration", "neq", 99)) == 1
+    assert len(search("event.duration", "contains", 7)) == 1
+    assert len(search("event.created", "eq", "2026-01-01T00:00:00+00:00")) == 1
+    assert len(search("event.created", "eq", "2026-01-01T00:00:00Z")) == 1
+    assert len(search(
+        "cloud.entity.attributes.mfa_enabled", "contains", True
+    )) == 1
+    assert len(search("host.ip", "exists")) == 2
+    assert len(search("host.ip", "not_exists")) == 1
+    assert len(search("event.created", "exists")) == 2
+    assert len(search("event.created", "not_exists")) == 1
+    assert len(search("cloud.entity.attributes.mfa_enabled", "neq", False)) == 1
+
+    invalid_numeric_array = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.duration", "operator": "contains", "value": 1.5}]},
+        headers=headers,
+    )
+    assert invalid_numeric_array.status_code == 422
+
+    invalid_ip = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "host.ip", "operator": "contains", "value": "bad-ip"}]},
+        headers=headers,
+    )
+    assert invalid_ip.status_code == 422
+    invalid_naive_date = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"ecs_filters": [{"field": "event.created", "operator": "contains", "value": "2026-01-01T00:00:00"}]},
+        headers=headers,
+    )
+    assert invalid_naive_date.status_code == 422
+
+
+def test_parsed_log_raw_escaping_and_newest_first_projection(client, auth_database):
+    add_local_user(auth_database)
+    login(client)
+    now = datetime.now(UTC)
+    matching = add_parsed_log(
+        auth_database, timestamp=now, raw='100%_\\ "quoted" café'
+    )
+    add_parsed_log(
+        auth_database, timestamp=now + timedelta(seconds=1), raw="100XXZZ quoted cafe"
+    )
+    response = client.post(
+        "/api/v1/parsed-logs/search",
+        json={"raw_query": "100%_\\"},
+        headers=events_headers(client),
+    )
+    assert response.status_code == 200, response.text
+    assert [row["id"] for row in response.json()["items"]] == [str(matching)]
+    assert set(response.json()["items"][0]).isdisjoint(
+        {"raw", "ecs_data", "deduplication_key"}
+    )
+    empty_search = client.post(
+        "/api/v1/parsed-logs/search", json={}, headers=events_headers(client)
+    )
+    assert empty_search.status_code == 200
+    assert empty_search.json()["items"][0]["raw_preview"] == "100XXZZ quoted cafe"
+    assert empty_search.json()["has_more"] is False
+
+
+def test_parsed_log_string_contains_ignores_malformed_json_and_escapes_literals(
+    client, auth_database
+):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    matching_id = add_parsed_log(
+        auth_database,
+        raw="scalar-contains valid",
+        ecs_data={"ecs": {"version": "9.4.0"}, "host": {"name": "Sensor-A"}},
+    )
+    literal_id = add_parsed_log(
+        auth_database,
+        raw="scalar-contains literal",
+        ecs_data={
+            "ecs": {"version": "9.4.0"},
+            "host": {"name": r"sensor%_\node"},
+        },
+    )
+    add_parsed_log(
+        auth_database,
+        raw="scalar-contains malformed",
+        ecs_data={
+            "ecs": {"version": "9.4.0"},
+            "host": {"name": {"details": "sensor"}},
+        },
+    )
+    headers = events_headers(client)
+
+    def search(term):
+        response = client.post(
+            "/api/v1/parsed-logs/search",
+            json={
+                "raw_query": "scalar-contains",
+                "ecs_filters": [{"field": "host.name", "operator": "contains", "value": term}],
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return {item["id"] for item in response.json()["items"]}
+
+    assert search("SENSOR") == {str(matching_id), str(literal_id)}
+    assert search("%_" + chr(92)) == {str(literal_id)}
+
+
+def test_parsed_log_origin_and_half_open_time_filters(client, auth_database):
+    add_local_user(auth_database)
+    login(client)
+    connection_id, sources = add_source_pair(auth_database)
+    source_ids = [source_id for source_id, _ in sources]
+    topics = [topic for _, topic in sources]
+    start = datetime(2026, 2, 1, tzinfo=UTC)
+    collected_start = datetime(2026, 1, 1, tzinfo=UTC)
+    included = add_parsed_log(
+        auth_database, timestamp=start, collected_at=collected_start,
+        source_id=source_ids[0], connection_id=connection_id,
+        topic=topics[0], partition=3,
+    )
+    add_parsed_log(
+        auth_database, timestamp=start + timedelta(seconds=1),
+        collected_at=collected_start + timedelta(seconds=1), source_id=source_ids[1],
+        connection_id=connection_id, topic=topics[1], partition=4,
+    )
+    response = client.post(
+        "/api/v1/parsed-logs/search",
+        json={
+            "source_ids": [str(source_ids[0]), str(source_ids[1])],
+            "connection_ids": [str(connection_id)],
+            "kafka_topics": topics,
+            "kafka_partitions": [3, 4],
+            "processed_from": start.isoformat(),
+            "processed_to": (start + timedelta(seconds=1)).isoformat(),
+            "collected_from": collected_start.isoformat(),
+            "collected_to": (collected_start + timedelta(seconds=1)).isoformat(),
+        },
+        headers=events_headers(client),
+    )
+    assert response.status_code == 200, response.text
+    assert [row["id"] for row in response.json()["items"]] == [str(included)]
+
+
+def test_parsed_log_permissions_csrf_and_deletion_are_scoped(client, auth_database):
+    guest_id = add_local_user(auth_database)
+    first = add_parsed_log(auth_database)
+    later = add_parsed_log(auth_database, timestamp=datetime.now(UTC) + timedelta(seconds=1))
+    assert client.delete(f"/api/v1/parsed-logs/{first}").status_code == 401
+    assert client.get(f"/api/v1/parsed-logs/{first}").status_code == 401
+    assert login(client).status_code == 200
+    guest_csrf = events_headers(client)
+    assert client.post(
+        "/api/v1/parsed-logs/search", json={}, headers=guest_csrf
+    ).status_code == 200
+    assert client.delete(
+        f"/api/v1/parsed-logs/{first}", headers=guest_csrf
+    ).status_code == 403
+    with auth_database.session_factory() as session:
+        user = session.get(User, guest_id)
+        user.role_id = ADMIN_ID
+        session.commit()
+    # The current session re-reads its role from the database on each request.
+    no_csrf = client.post(
+        "/api/v1/parsed-logs/actions/delete", json={"source_id": str(uuid4())}
+    )
+    assert no_csrf.status_code == 403 and no_csrf.json()["code"] == "csrf_invalid"
+    headers = events_headers(client)
+    unsafe = client.post("/api/v1/parsed-logs/actions/delete", json={}, headers=headers)
+    assert unsafe.status_code == 422 and unsafe.json()["code"] == "deletion_scope_required"
+    partial_range = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"processed_from": datetime.now(UTC).isoformat()},
+        headers=headers,
+    )
+    assert partial_range.status_code == 422
+    reverse_range = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"processed_from": "2000-01-02T00:00:00Z", "processed_to": "2000-01-01T00:00:00Z"},
+        headers=headers,
+    )
+    assert reverse_range.status_code == 422
+    zero_range = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"processed_from": "2000-01-01T00:00:00Z", "processed_to": "2000-01-01T00:00:00Z"},
+        headers=headers,
+    )
+    assert zero_range.status_code == 422
+
+    connection_id, sources = add_source_pair(auth_database)
+    source_a, topic_a = sources[0]
+    source_b, topic_b = sources[1]
+    source_only_id = add_parsed_log(
+        auth_database, timestamp=datetime(2020, 1, 1, tzinfo=UTC),
+        source_id=source_a, connection_id=connection_id, topic=topic_a,
+    )
+    other_source_id = add_parsed_log(
+        auth_database, timestamp=datetime(2020, 1, 1, tzinfo=UTC),
+        source_id=source_b, connection_id=connection_id, topic=topic_b,
+    )
+    source_delete = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"source_id": str(source_a)}, headers=headers,
+    )
+    assert source_delete.status_code == 200 and source_delete.json()["deleted_count"] == 1
+    nonexistent_source_delete = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"source_id": str(uuid4())}, headers=headers,
+    )
+    assert nonexistent_source_delete.status_code == 200
+    assert nonexistent_source_delete.json()["deleted_count"] == 0
+    range_start = datetime(2021, 1, 1, tzinfo=UTC)
+    range_id = add_parsed_log(auth_database, timestamp=range_start)
+    boundary_id = add_parsed_log(auth_database, timestamp=range_start + timedelta(days=1))
+    range_delete = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={
+            "processed_from": range_start.isoformat(),
+            "processed_to": (range_start + timedelta(days=1)).isoformat(),
+        },
+        headers=headers,
+    )
+    assert range_delete.status_code == 200 and range_delete.json()["deleted_count"] == 1
+
+    source_period_start = datetime(2022, 1, 1, tzinfo=UTC)
+    intersection_id = add_parsed_log(
+        auth_database, timestamp=source_period_start, source_id=source_a,
+        connection_id=connection_id, topic=topic_a,
+    )
+    outside_intersection_id = add_parsed_log(
+        auth_database, timestamp=source_period_start, source_id=source_b,
+        connection_id=connection_id, topic=topic_b,
+    )
+    intersection = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={
+            "source_id": str(source_a),
+            "processed_from": source_period_start.isoformat(),
+            "processed_to": (source_period_start + timedelta(days=1)).isoformat(),
+        },
+        headers=headers,
+    )
+    assert intersection.status_code == 200 and intersection.json()["deleted_count"] == 1
+    deleted = client.delete(f"/api/v1/parsed-logs/{first}", headers=headers)
+    assert deleted.status_code == 204
+    assert client.delete(f"/api/v1/parsed-logs/{first}", headers=headers).status_code == 404
+    with auth_database.session_factory() as session:
+        assert session.get(ParsedLog, later) is not None
+        assert session.get(ParsedLog, source_only_id) is None
+        assert session.get(ParsedLog, other_source_id) is not None
+        assert session.get(ParsedLog, range_id) is None
+        assert session.get(ParsedLog, boundary_id) is not None
+        assert session.get(ParsedLog, intersection_id) is None
+        assert session.get(ParsedLog, outside_intersection_id) is not None
+
+
+def test_parsed_log_database_failures_rollback_without_logging_values(caplog):
+    repository = Mock()
+    unit_of_work = Mock()
+    codec = Mock()
+    service = ParsedLogServiceImpl(repository, unit_of_work, object(), codec)
+    repository.delete_many.side_effect = RuntimeError("sensitive filter value")
+    request = ParsedLogBulkDeleteRequest(source_id=uuid4())
+    with pytest.raises(DomainError) as bulk_error:
+        service.delete_many(request)
+    assert bulk_error.value.code == "internal_error"
+    unit_of_work.rollback.assert_called_once()
+    unit_of_work.commit.assert_not_called()
+    assert "sensitive filter value" not in caplog.text
+
+    unit_of_work.reset_mock()
+    repository.reset_mock()
+    repository.find_by_id.return_value = object()
+    repository.delete.side_effect = RuntimeError("sensitive delete value")
+    with pytest.raises(DomainError) as delete_error:
+        service.delete(uuid4())
+    assert delete_error.value.code == "internal_error"
+    unit_of_work.rollback.assert_called_once()
+    unit_of_work.commit.assert_not_called()
+    assert "sensitive delete value" not in caplog.text
+
+    unit_of_work.reset_mock()
+    repository.reset_mock()
+    repository.search.side_effect = RuntimeError("sensitive search value")
+    with pytest.raises(DomainError) as search_error:
+        service.search(ParsedLogSearchRequest())
+    assert search_error.value.code == "internal_error"
+    unit_of_work.rollback.assert_called_once()
+    assert "sensitive search value" not in caplog.text
+
+
+def test_parsed_log_migration_backfills_normalizer_snapshots(auth_database_url, auth_database):
+    run_alembic(auth_database_url, "downgrade", "0002_auth_sessions")
+    try:
+        now = datetime.now(UTC)
+        with auth_database.engine.begin() as connection:
+            normalizer_id = connection.execute(
+                text("INSERT INTO app.normalizers (name, rule) VALUES ('historical-normalizer', '{}') RETURNING id")
+            ).scalar_one()
+            for index, linked_normalizer in enumerate((normalizer_id, None)):
+                connection.execute(
+                    text("""
+                        INSERT INTO logs.parsed_logs (
+                            normalizer_id, normalizer_version, source_name, connection_name,
+                            kafka_topic, kafka_partition, kafka_offset, deduplication_key,
+                            fluent_bit_collected_at, backend_received_at, backend_processed_at,
+                            raw, ecs_data
+                        ) VALUES (
+                            :normalizer_id, 1, 'source-old', 'connection-old', 'events', 0,
+                            :offset, :dedup, :timestamp, :timestamp, :timestamp, 'raw', '{}'
+                        )
+                    """), {
+                        "normalizer_id": linked_normalizer,
+                        "offset": index,
+                        "dedup": f"migration-backfill-{uuid4()}",
+                        "timestamp": now,
+                    },
+                )
+        run_alembic(auth_database_url, "upgrade", "head")
+        with auth_database.engine.connect() as connection:
+            names = set(connection.execute(text(
+                "SELECT normalizer_name FROM logs.parsed_logs"
+            )).scalars())
+            opclass = connection.execute(text("""
+                SELECT opc.opcname
+                FROM pg_index AS idx
+                JOIN pg_class AS index_class ON index_class.oid = idx.indexrelid
+                JOIN pg_opclass AS opc ON opc.oid = idx.indclass[0]
+                WHERE index_class.relname = 'ix_parsed_logs_raw_trgm'
+            """)).scalar_one()
+            column = connection.execute(text("""
+                SELECT is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = 'logs' AND table_name = 'parsed_logs'
+                  AND column_name = 'normalizer_name'
+            """)).one()
+        assert names == {"historical-normalizer", "legacy-unknown"}
+        assert opclass == "gin_trgm_ops"
+        assert column == ("NO", None)
+        run_alembic(auth_database_url, "downgrade", "0002_auth_sessions")
+        with auth_database.engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM logs.parsed_logs")).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT to_regclass('logs.ix_parsed_logs_raw_trgm')
+            """)).scalar_one() is None
+            assert connection.execute(text("""
+                SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'
+            """)).scalar_one() == "pg_trgm"
+        run_alembic(auth_database_url, "upgrade", "head")
+        with auth_database.engine.connect() as connection:
+            assert set(connection.execute(text(
+                "SELECT normalizer_name FROM logs.parsed_logs"
+            )).scalars()) == {"historical-normalizer", "legacy-unknown"}
+    finally:
+        run_alembic(auth_database_url, "upgrade", "head")

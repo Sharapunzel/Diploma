@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, settings
 from .db import get_session
+from .ecs import EcsCatalog
 from .kafka import KafkaMetadataClient
 from .repositories.protocols import OidcClient, ReadinessRepository
 from .repositories.sqlalchemy import (
@@ -31,6 +32,8 @@ from .services.implementations.administration import (
 )
 from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
+from .services.implementations.cursor import SignedParsedLogCursorCodec
+from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
 from .services.protocols import AuthenticationService
 from .services.protocols.administration import (
     MappingAdministrationService,
@@ -40,6 +43,7 @@ from .services.protocols.administration import (
     UserAdministrationService,
 )
 from .services.protocols.connections import KafkaConnectionService, SourceService
+from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
 
 
 def get_settings() -> Settings:
@@ -76,6 +80,38 @@ def get_oidc_client(request: Request) -> OidcClient:
 
 def get_kafka_client(request: Request) -> KafkaMetadataClient:
     return request.app.state.kafka_client
+
+
+def get_ecs_catalog(request: Request) -> EcsCatalog:
+    return request.app.state.ecs_catalog
+
+
+def get_cursor_codec(
+    app_settings: Settings = Depends(get_settings),
+) -> CursorCodec:
+    return SignedParsedLogCursorCodec(app_settings.oidc_state_secret.get_secret_value())
+
+
+def get_ecs_catalog_service(
+    catalog: EcsCatalog = Depends(get_ecs_catalog),
+) -> EcsCatalogService:
+    return EcsCatalogServiceImpl(catalog)
+
+
+def get_parsed_log_service(
+    session: Session = Depends(get_session),
+    app_settings: Settings = Depends(get_settings),
+    catalog: EcsCatalog = Depends(get_ecs_catalog),
+    cursor_codec: CursorCodec = Depends(get_cursor_codec),
+) -> ParsedLogService:
+    from .repositories.sqlalchemy.parsed_logs import SqlAlchemyParsedLogRepository
+
+    return ParsedLogServiceImpl(
+        SqlAlchemyParsedLogRepository(session),
+        SqlAlchemyUnitOfWork(session),
+        catalog,
+        cursor_codec,
+    )
 
 
 def session_token(request: Request) -> str | None:
