@@ -44,9 +44,10 @@ class EcsCatalogServiceImpl:
     def fields(
         self, query: str | None, field_type: str | None, level: str | None,
         filterable: bool | None, limit: int, offset: int,
+        mappable: bool | None = None,
     ) -> EcsFieldPage:
         fields, total = self.catalog.list_fields(
-            query, field_type, level, filterable, limit, offset
+            query, field_type, level, filterable, limit, offset, mappable
         )
         return EcsFieldPage(
             items=[EcsFieldDTO.from_field(field) for field in fields],

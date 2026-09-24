@@ -22,10 +22,19 @@ class EcsFieldDTO(StrictRequest):
     field_set: str
     filterable: bool
     operators: list[str]
+    mappable: bool
+    mappable_reason: str | None
 
     @classmethod
     def from_field(cls, field: EcsField) -> EcsFieldDTO:
-        return cls(**{**field.__dict__, "operators": list(field.operators)})
+        return cls(
+            **{
+                **field.__dict__,
+                "operators": list(field.operators),
+                "mappable": field.mappable,
+                "mappable_reason": field.mappable_reason,
+            }
+        )
 
 
 class EcsFieldPage(StrictRequest):

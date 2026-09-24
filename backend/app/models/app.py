@@ -157,6 +157,7 @@ class Normalizer(TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
         CheckConstraint("version > 0", name="version_positive"),
+        CheckConstraint("jsonb_typeof(rule) = 'object'", name="rule_object"),
         Index("ix_normalizers_created_by_user_id", "created_by_user_id"),
         Index("ix_normalizers_updated_by_user_id", "updated_by_user_id"),
         {"schema": "app"},
@@ -166,7 +167,7 @@ class Normalizer(TimestampMixin, Base):
     )
     name: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    rule: Mapped[str] = mapped_column(Text, nullable=False)
+    rule: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     version: Mapped[int] = mapped_column(
         Integer, server_default=text("1"), nullable=False
     )

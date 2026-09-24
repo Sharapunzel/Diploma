@@ -137,8 +137,8 @@ Invoke-RestMethod http://localhost:8000/api/v1/users -Method Post -WebSession $w
 поле `version`. При устаревшей версии API возвращает `409 version_conflict` с
 `details.current_version`; повторите запрос после чтения текущей записи. Settings
 создаются только кодом/миграциями: HTTP API позволяет читать и менять лишь уже
-зарегистрированные keys. Поле `rule` normalizer на этом этапе хранится как opaque text
-и не исполняется и не проверяется API.
+зарегистрированные keys. Поле `rule` normalizer является JSONB-объектом v1;
+его структура и ECS-совместимость проверяются перед созданием или заменой.
 
 Полный набор проверок запускается на отдельной БД:
 
@@ -273,3 +273,82 @@ Content-Type: application/json
   "processed_to": "2026-02-01T00:00:00Z"
 }
 ```
+
+## JSON-нормализация (TASK-6)
+
+Миграция `0004` сохраняет прежний произвольный текст как
+`{"format_version":0,"legacy_rule_text":"..."}`. Такой normalizer доступен для
+чтения и редактирования, но новые активации источника с ним получают
+`409 normalizer_legacy_incompatible`. PATCH описания не делает правило
+исполняемым: администратор должен заменить `rule` валидным объектом v1.
+Downgrade восстанавливает исходный текст legacy-правила, а v1 — как JSON-текст.
+Миграция не меняет `sources.is_enabled`.
+
+`GET /api/v1/normalizers/block-types` публикует режимы и параметры блоков
+(`normalizers.read`). `GET /api/v1/ecs/fields` и detail существующего каталога
+дают `mappable` и `mappable_reason`; поиск и пагинация сохраняются, можно
+передать `mappable=true`. `filterable` относится только к поиску событий и не
+подменяет `mappable`. `POST /api/v1/normalizers/preview` (`normalizers.write`,
+session-bound CSRF) принимает несохранённые `rule` и `sample`, не меняя БД:
+
+```json
+{
+  "rule": {
+    "format_version": 1,
+    "variants": [{
+      "key": "web", "priority": 10,
+      "when": {"kind": "prefix", "value": "2025-"},
+      "blocks": [
+        {"key": "columns", "kind": "columns", "candidates": [{
+          "delimiter": " ", "columns": ["date", "time", "ip", "status"]
+        }]},
+        {"key": "source_ip", "kind": "map_ecs", "target": "source.ip",
+         "source": {"ref": "columns.ip"}, "required": true},
+        {"key": "http_status", "kind": "map_ecs", "target": "http.response.status_code",
+         "source": {"ref": "columns.status"}, "required": true},
+        {"key": "event_time", "kind": "map_ecs", "target": "@timestamp",
+         "source": {"refs": ["columns.date", "columns.time"], "join": " "},
+         "transform": {"date_format": "%Y-%m-%d %H:%M:%S", "timezone": "UTC"},
+         "required": true}
+      ]
+    }]
+  },
+  "sample": {"timestamp": "2025-06-01T12:01:00Z", "log": "2025-06-01 12:00:00 192.0.2.9 404"}
+}
+```
+
+Варианты сортируются по уникальному числовому `priority`; первый совпавший
+`when` (`prefix`, `contains`, RE2 `regex`) исполняется без перехода к следующему
+при ошибке. Блоки идут по порядку массива. `regex` использует RE2 именованные
+группы, `template` — литералы и `%{name}`, `columns` — ручной порядок колонок,
+`json` — разрешённые dotted paths с альтернативами `requires`/`extract`.
+Каждый extractor может иметь до 8 кандидатов, первый подходящий выигрывает;
+`set` задаёт константные выходы кандидата. У `map_ecs` источник — `ref`,
+`literal` или `refs` с `join`/`as_array`. Ключи блоков стабильны и применяются
+для ссылок и диагностики, например `columns.ip`. Вложенный разбор выглядит так:
+
+```json
+[
+  {"key":"outer","kind":"regex","candidates":[{"pattern":"payload=(?P<body>\\{.*\\})"}]},
+  {"key":"inner","kind":"json","input":"outer.body","candidates":[
+    {"requires":["event.action"],"extract":{"action":"event.action"}},
+    {"requires":["action"],"extract":{"action":"action"}}
+  ]},
+  {"key":"action","kind":"map_ecs","target":"event.action",
+   "source":{"ref":"inner.action"},"required":true}
+]
+```
+
+Результат содержит `status` (`complete`/`partial`/`failed`), `variant_key`,
+`diagnostics`, компактный `trace` и отдельный `fluent_bit_collected_at`.
+`ecs_data` выдаётся только при `complete`/`partial`; `event.original` и
+`ecs.version` задаёт система. Если событие не содержит времени и
+`@timestamp` не объявлен обязательным, используется время сбора Fluent Bit,
+статус `partial` с `event_time_fallback`. Обязательное невалидное время даёт
+`failed`. Текущие лимиты: правило и `log` по 64 KiB, вложенность JSON 16,
+варианты 16, блоки/вариант 32, кандидаты/блок 8, паттерн 1024 символа,
+кэш компиляции 128 записей. Неизвестные параметры и поля, небезопасный для RE2
+синтаксис, битые/будущие ссылки и несовместимые типы отвергаются до сохранения
+с адресом варианта/блока/параметра. Движок не читает Kafka и не записывает
+`parsed_logs`: подключение consumer и хранение результатов относятся к
+последующим задачам.

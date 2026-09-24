@@ -18,6 +18,7 @@ from .db import Database
 from .dependencies import build_auth_service, get_settings
 from .ecs import EcsCatalog, PackagedEcsCatalog
 from .kafka import ConfluentKafkaMetadataClient
+from .normalization.engine import NormalizationEngine
 from .oidc import AuthlibOidcClient
 
 REQUEST_LOG = logging.getLogger("app.request")
@@ -82,6 +83,7 @@ def create_app(
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
     app.state.kafka_client = kafka_client or ConfluentKafkaMetadataClient()
     app.state.ecs_catalog = ecs_catalog if ecs_catalog is not None else PackagedEcsCatalog.load()
+    app.state.normalization_engine = NormalizationEngine(app.state.ecs_catalog)
     app.dependency_overrides[get_settings] = lambda: current
     logging.getLogger("app").setLevel(current.log_level.upper())
 

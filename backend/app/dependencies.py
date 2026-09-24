@@ -5,6 +5,7 @@ from .config import Settings, settings
 from .db import get_session
 from .ecs import EcsCatalog
 from .kafka import KafkaMetadataClient
+from .normalization.engine import NormalizationEngine
 from .repositories.protocols import OidcClient, ReadinessRepository
 from .repositories.sqlalchemy import (
     SqlAlchemyOidcMappingRepository,
@@ -33,6 +34,7 @@ from .services.implementations.administration import (
 from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.implementations.cursor import SignedParsedLogCursorCodec
+from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
 from .services.protocols import AuthenticationService
 from .services.protocols.administration import (
@@ -43,6 +45,7 @@ from .services.protocols.administration import (
     UserAdministrationService,
 )
 from .services.protocols.connections import KafkaConnectionService, SourceService
+from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
 
 
@@ -84,6 +87,16 @@ def get_kafka_client(request: Request) -> KafkaMetadataClient:
 
 def get_ecs_catalog(request: Request) -> EcsCatalog:
     return request.app.state.ecs_catalog
+
+
+def get_normalization_engine(request: Request) -> NormalizationEngine:
+    return request.app.state.normalization_engine
+
+
+def get_normalizer_preview_service(
+    engine: NormalizationEngine = Depends(get_normalization_engine),
+) -> NormalizerPreviewService:
+    return NormalizerPreviewServiceImpl(engine)
 
 
 def get_cursor_codec(
@@ -167,8 +180,12 @@ def build_setting_admin(session: Session) -> SettingAdministration:
     return SettingAdministration(SqlAlchemySettingRepository(session), SqlAlchemyUnitOfWork(session))
 
 
-def build_normalizer_admin(session: Session) -> NormalizerAdministration:
-    return NormalizerAdministration(SqlAlchemyNormalizerRepository(session), SqlAlchemyUnitOfWork(session))
+def build_normalizer_admin(
+    session: Session, engine: NormalizationEngine | None = None,
+) -> NormalizerAdministration:
+    return NormalizerAdministration(
+        SqlAlchemyNormalizerRepository(session), SqlAlchemyUnitOfWork(session), engine,
+    )
 
 
 def get_user_admin(
@@ -189,8 +206,11 @@ def get_setting_admin(session: Session = Depends(get_session)) -> SettingAdminis
     return build_setting_admin(session)
 
 
-def get_normalizer_admin(session: Session = Depends(get_session)) -> NormalizerAdministrationService:
-    return build_normalizer_admin(session)
+def get_normalizer_admin(
+    session: Session = Depends(get_session),
+    engine: NormalizationEngine = Depends(get_normalization_engine),
+) -> NormalizerAdministrationService:
+    return build_normalizer_admin(session, engine)
 
 
 def build_connection_service(

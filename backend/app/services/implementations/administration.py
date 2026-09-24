@@ -5,7 +5,10 @@ from sqlalchemy.exc import IntegrityError
 
 from ...core.errors import DomainError
 from ...core.security import hash_password
+from ...ecs import PackagedEcsCatalog
 from ...models import Normalizer, OidcRoleMapping, User
+from ...normalization.compiler import RuleValidationError
+from ...normalization.engine import NormalizationEngine
 from ...repositories.protocols import (
     OidcMappingRepository,
     RoleRepository,
@@ -352,8 +355,25 @@ class SettingAdministration:
 
 
 class NormalizerAdministration:
-    def __init__(self, normalizers: NormalizerRepository, uow: UnitOfWork) -> None:
+    def __init__(
+        self, normalizers: NormalizerRepository, uow: UnitOfWork,
+        engine: NormalizationEngine | None = None,
+    ) -> None:
         self.normalizers, self.uow = normalizers, uow
+        self.engine = engine
+
+    def _validate_rule(self, rule: dict | object) -> dict:
+        if hasattr(rule, "model_dump"):
+            rule = rule.model_dump(mode="json", exclude_none=True)
+        if self.engine is None:
+            self.engine = NormalizationEngine(PackagedEcsCatalog.load())
+        try:
+            self.engine.compile(rule)
+        except RuleValidationError as error:
+            raise DomainError(
+                "normalizer_rule_invalid", str(error), 422, error.details
+            ) from None
+        return rule
 
     def list(self, query: str | None, limit: int, offset: int):
         return self.normalizers.list(query, limit, offset)
@@ -365,15 +385,16 @@ class NormalizerAdministration:
         return normalizer
 
     def create(self, data: NormalizerCreate, actor_id: UUID):
-        normalizer = Normalizer(
-            id=data.id,
-            name=data.name,
-            description=data.description,
-            rule=data.rule,
-            created_by_user_id=actor_id,
-            updated_by_user_id=actor_id,
-        )
         try:
+            rule = self._validate_rule(data.rule)
+            normalizer = Normalizer(
+                id=data.id,
+                name=data.name,
+                description=data.description,
+                rule=rule,
+                created_by_user_id=actor_id,
+                updated_by_user_id=actor_id,
+            )
             self.normalizers.add(normalizer)
             self.uow.commit()
             return normalizer
@@ -385,6 +406,9 @@ class NormalizerAdministration:
                 "Normalizer name already exists",
                 {"uq_normalizers_name"},
             )
+        except DomainError:
+            self.uow.rollback()
+            raise
         except Exception:
             self.uow.rollback()
             raise
@@ -394,6 +418,8 @@ class NormalizerAdministration:
         values = data.model_dump(exclude_unset=True, exclude={"version"})
         values["updated_by_user_id"] = actor_id
         try:
+            if "rule" in values:
+                values["rule"] = self._validate_rule(values["rule"])
             updated = self.normalizers.update_versioned(normalizer, values, data.version, now())
             if updated is None:
                 self.uow.rollback()
@@ -414,6 +440,9 @@ class NormalizerAdministration:
                 "Normalizer name already exists",
                 {"uq_normalizers_name"},
             )
+        except DomainError:
+            self.uow.rollback()
+            raise
         except Exception:
             self.uow.rollback()
             raise

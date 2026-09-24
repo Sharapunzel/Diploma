@@ -29,6 +29,18 @@ class EcsField:
     filterable: bool
     operators: tuple[str, ...]
 
+    @property
+    def mappable(self) -> bool:
+        return self.mappable_reason is None
+
+    @property
+    def mappable_reason(self) -> str | None:
+        if self.name in {"event.original", "ecs.version"}:
+            return "system_managed"
+        if self.type not in SUPPORTED_TYPES:
+            return "unsupported_ecs_type"
+        return None
+
 
 @dataclass(frozen=True)
 class EcsProvenance:
@@ -55,6 +67,7 @@ class EcsCatalog(Protocol):
     def list_fields(
         self, query: str | None, field_type: str | None, level: str | None,
         filterable: bool | None, limit: int, offset: int,
+        mappable: bool | None = None,
     ) -> tuple[list[EcsField], int]: ...
 
 
@@ -116,6 +129,7 @@ class PackagedEcsCatalog:
     def list_fields(
         self, query: str | None, field_type: str | None, level: str | None,
         filterable: bool | None, limit: int, offset: int,
+        mappable: bool | None = None,
     ) -> tuple[list[EcsField], int]:
         normalized_query = query.casefold() if query else None
         matches = [
@@ -125,6 +139,7 @@ class PackagedEcsCatalog:
             and (field_type is None or field.type == field_type)
             and (level is None or field.level == level)
             and (filterable is None or field.filterable is filterable)
+            and (mappable is None or field.mappable is mappable)
         ]
         matches.sort(key=lambda field: field.name)
         return matches[offset:offset + limit], len(matches)

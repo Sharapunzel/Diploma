@@ -2,7 +2,17 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+from ..normalization.schema import NESTED_RULE_EXAMPLE, RULE_EXAMPLE, RuleV1
 
 
 def trimmed(value: str) -> str:
@@ -208,22 +218,17 @@ class NormalizerCreate(BaseModel):
     id: UUID | None = None
     name: str = Field(min_length=1, max_length=200)
     description: str | None = None
-    rule: str = Field(min_length=1)
+    rule: RuleV1 = Field(json_schema_extra={"examples": [RULE_EXAMPLE, NESTED_RULE_EXAMPLE]})
     _name = field_validator("name")(trimmed)
-
-    @field_validator("rule")
-    @classmethod
-    def nonblank_rule(cls, value):
-        if not value.strip():
-            raise ValueError("rule must not be blank")
-        return value
 
 
 class NormalizerPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
-    rule: str | None = Field(default=None, min_length=1)
+    rule: RuleV1 | None = Field(
+        default=None, json_schema_extra={"examples": [RULE_EXAMPLE, NESTED_RULE_EXAMPLE]},
+    )
     version: int = Field(ge=1)
 
     @model_validator(mode="after")
@@ -240,25 +245,23 @@ class NormalizerPatch(BaseModel):
     def trim_name(cls, value):
         return value if value is None else trimmed(value)
 
-    @field_validator("rule")
-    @classmethod
-    def nonblank_rule(cls, value):
-        if value is not None and not value.strip():
-            raise ValueError("rule must not be blank")
-        return value
-
-
 class NormalizerDTO(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     name: str
     description: str | None
-    rule: str
+    rule: dict[str, Any]
     version: int
     created_by_user_id: UUID | None
     updated_by_user_id: UUID | None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def rule_status(self) -> Literal["ready", "legacy_incompatible"]:
+        version = self.rule.get("format_version")
+        return "ready" if type(version) is int and version == 1 else "legacy_incompatible"
 
 
 class NormalizerPage(BaseModel):

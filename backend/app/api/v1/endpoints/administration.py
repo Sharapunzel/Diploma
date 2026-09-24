@@ -6,11 +6,13 @@ from fastapi import APIRouter, Depends, Query, Response
 from ....dependencies import (
     get_mapping_admin,
     get_normalizer_admin,
+    get_normalizer_preview_service,
     get_role_admin,
     get_setting_admin,
     get_user_admin,
     require_permission,
 )
+from ....normalization.schema import NormalizationResult, PreviewRequest
 from ....schemas.administration import (
     MappingCreate,
     MappingDTO,
@@ -39,6 +41,7 @@ from ....services.protocols.administration import (
     SettingAdministrationService,
     UserAdministrationService,
 )
+from ....services.protocols.normalization import NormalizerPreviewService
 
 router = APIRouter(tags=["administration"])
 ERRORS = {"401": {"model": ErrorResponse}, "403": {"model": ErrorResponse},
@@ -198,6 +201,23 @@ def list_normalizers(limit: int = Query(50, ge=1, le=100), offset: int = Query(0
                      _: object = Depends(require_permission("normalizers.read"))):
     items, total = service.list(q, limit, offset)
     return NormalizerPage(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/normalizers/block-types", responses=ERRORS)
+def normalizer_block_types(
+    service: NormalizerPreviewService = Depends(get_normalizer_preview_service),
+    _: object = Depends(require_permission("normalizers.read")),
+):
+    return service.block_types()
+
+
+@router.post("/normalizers/preview", response_model=NormalizationResult, responses=ERRORS)
+def preview_normalizer(
+    data: PreviewRequest,
+    _: object = Depends(require_permission("normalizers.write")),
+    service: NormalizerPreviewService = Depends(get_normalizer_preview_service),
+):
+    return service.preview(data)
 
 
 @router.get("/normalizers/{normalizer_id}", response_model=NormalizerDTO, responses=ERRORS)

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
 import httpx2
+import jsonschema
 import psycopg
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -57,6 +58,7 @@ from app.models import (
     Source,
     User,
 )
+from app.normalization.schema import ValueSource
 from app.oidc import AuthlibOidcClient
 from app.repositories.sqlalchemy import (
     SqlAlchemyOidcMappingRepository,
@@ -83,6 +85,238 @@ from app.services.implementations.parsed_logs import ParsedLogServiceImpl
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ADMIN_ID = UUID("00000000-0000-4000-8000-000000000001")
 GUEST_ID = UUID("00000000-0000-4000-8000-000000000002")
+
+
+def simple_normalizer_rule():
+    return {
+        "format_version": 1,
+        "variants": [{
+            "key": "plain", "priority": 1,
+            "when": {"kind": "contains", "value": " "},
+            "blocks": [{
+                "key": "message", "kind": "map_ecs", "target": "message",
+                "source": {"ref": "log"}, "required": True,
+            }],
+        }],
+    }
+
+
+def test_normalizer_preview_catalog_and_permissions(client, auth_database):
+    assert client.get("/api/v1/normalizers/block-types").status_code == 401
+    assert client.post("/api/v1/normalizers/preview", json={
+        "rule": simple_normalizer_rule(),
+        "sample": {"timestamp": "2025-06-01T12:00:00Z", "log": "user created"},
+    }).status_code == 401
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    kinds = {item["kind"] for item in client.get("/api/v1/normalizers/block-types").json()}
+    assert kinds == {"regex", "template", "columns", "json", "map_ecs"}
+    mappable_page = client.get("/api/v1/ecs/fields", params={"mappable": True, "limit": 5})
+    assert mappable_page.status_code == 200
+    assert all(item["mappable"] for item in mappable_page.json()["items"])
+    field = client.get("/api/v1/ecs/fields/event.original").json()
+    assert field["mappable"] is False and field["mappable_reason"] == "system_managed"
+    assert client.get("/api/v1/ecs/fields", params={"mappable": False, "q": "event.original"}).json()["total"] >= 1
+    schema = client.get("/openapi.json").json()["components"]["schemas"]
+    rule_schema = schema["RuleV1"]
+    assert rule_schema["properties"]["format_version"]["const"] == 1
+    block_items = schema["Variant"]["properties"]["blocks"]["items"]
+    assert {"$ref": "#/components/schemas/RegexBlock"} in block_items["oneOf"]
+    assert {"$ref": "#/components/schemas/MapBlock"} in block_items["oneOf"]
+    assert {"RegexBlock", "TemplateBlock", "ColumnsBlock", "JsonBlock", "MapBlock"} <= set(schema)
+    assert schema["Condition"]["properties"]["kind"]["enum"] == ["prefix", "contains", "regex"]
+    assert schema["ColumnsCandidate"]["properties"]["delimiter"]["enum"] == [" ", ",", ";", "|", "\t"]
+    source_schema = schema["ValueSource"]
+    assert len(source_schema["oneOf"]) == 4
+    assert {tuple(schema[item["$ref"].rsplit("/", 1)[-1]]["required"])
+            for item in source_schema["oneOf"]} == {
+        ("ref",), ("literal",), ("refs", "join"), ("refs", "as_array"),
+    }
+    guest_preview = client.post("/api/v1/normalizers/preview", json={
+        "rule": simple_normalizer_rule(),
+        "sample": {"timestamp": "2025-06-01T12:00:00Z", "log": "user created"},
+    })
+    assert guest_preview.status_code == 403
+    assert guest_preview.json()["code"] == "csrf_invalid"
+    csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+    assert client.post("/api/v1/normalizers/preview", json={
+        "rule": simple_normalizer_rule(), "sample": {},
+    }, headers={"X-CSRF-Token": csrf}).status_code == 403
+
+
+def test_normalizer_preview_crud_and_rule_errors(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    payload = {"rule": simple_normalizer_rule(),
+               "sample": {"timestamp": "2025-06-01T12:00:00Z", "log": "user created"}}
+    preview = client.post("/api/v1/normalizers/preview", json=payload, headers=headers)
+    assert preview.status_code == 200
+    assert preview.json()["status"] == "partial"
+    assert preview.json()["ecs_data"]["message"] == "user created"
+    assert client.get("/api/v1/normalizers").json()["total"] == 0
+    bad_rule = simple_normalizer_rule()
+    bad_rule["variants"][0]["blocks"][0]["target"] = "event.original"
+    invalid = client.post("/api/v1/normalizers/preview", json={**payload, "rule": bad_rule}, headers=headers)
+    assert invalid.status_code == 422
+    assert invalid.json()["code"] == "normalizer_rule_invalid"
+    assert invalid.json()["details"] == {"variant": "plain", "block": "message", "parameter": "target"}
+    assert invalid.headers["X-Request-ID"] == invalid.json()["request_id"]
+    assert client.post("/api/v1/normalizers", json={"name": "bad", "rule": bad_rule}, headers=headers).status_code == 422
+    created = client.post("/api/v1/normalizers", json={"name": "v1", "rule": payload["rule"]}, headers=headers)
+    assert created.status_code == 201
+    normalizer = created.json()
+    assert normalizer["rule_status"] == "ready" and normalizer["version"] == 1
+    revised = simple_normalizer_rule()
+    revised["variants"][0]["when"]["value"] = "created"
+    changed = client.patch(f"/api/v1/normalizers/{normalizer['id']}",
+                           json={"rule": revised, "version": 1}, headers=headers)
+    assert changed.status_code == 200 and changed.json()["version"] == 2
+    stale = client.patch(f"/api/v1/normalizers/{normalizer['id']}",
+                         json={"rule": payload["rule"], "version": 1}, headers=headers)
+    assert stale.status_code == 409 and stale.json()["code"] == "version_conflict"
+    assert client.get(f"/api/v1/normalizers/{normalizer['id']}").json()["rule"] == revised
+
+
+def test_normalizer_value_source_variants_are_accepted_and_exclusive(client, auth_database):
+    headers = admin_headers(client, auth_database)
+
+    def make_rule(source):
+        configured = simple_normalizer_rule()
+        if source.get("as_array") and "join" not in source:
+            configured["variants"][0]["blocks"][0]["target"] = "related.ip"
+            configured["variants"][0]["blocks"].insert(0, {
+                "key": "parse", "kind": "regex",
+                "candidates": [{"pattern": r"(?P<ip>\S+)"}],
+            })
+            source = {"refs": ["parse.ip"], "as_array": True}
+        configured["variants"][0]["blocks"][-1]["source"] = source
+        return configured
+
+    for source in (
+        {"ref": "log"}, {"literal": "constant"},
+        {"refs": ["log"], "join": " "},
+        {"refs": ["log"], "as_array": True},
+    ):
+        response = client.post("/api/v1/normalizers/preview", json={
+            "rule": make_rule(source),
+            "sample": {"timestamp": "2025-06-01T12:00:00Z", "log": "user created"},
+        }, headers=headers)
+        assert response.status_code == 200, response.json()
+    for source in (
+        {"ref": "log", "literal": "two"},
+        {"refs": ["log"], "join": " ", "as_array": True},
+        {"refs": ["log"]},
+    ):
+        response = client.post("/api/v1/normalizers/preview", json={
+            "rule": make_rule(source),
+            "sample": {"timestamp": "2025-06-01T12:00:00Z", "log": "user created"},
+        }, headers=headers)
+        assert response.status_code == 422, (source, response.json())
+        assert response.json()["code"] in {"validation_error", "normalizer_rule_invalid"}
+
+
+def test_value_source_openapi_matches_validation_and_api(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    components = client.get("/openapi.json").json()["components"]
+    published = {
+        "$ref": "#/components/schemas/ValueSource",
+        "components": components,
+    }
+    validator = jsonschema.Draft202012Validator(published)
+    valid = (
+        {"ref": "log"}, {"ref": "x" * 2048},
+        {"literal": "value"}, {"literal": 0}, {"literal": False},
+        {"literal": ["a", None]}, {"literal": {"key": None}},
+        {"refs": ["log"], "join": ""},
+        {"refs": ["log"], "join": "x" * 64},
+        {"refs": ["log"] * 32, "as_array": True},
+    )
+    invalid = (
+        {}, {"ref": "log", "as_array": False}, {"ref": "log", "join": None},
+        {"refs": ["log"], "join": " ", "as_array": False},
+        {"ref": "log", "literal": "other"},
+        {"literal": None}, {"ref": ""}, {"refs": [""]},
+        {"refs": ["log"]}, {"refs": ["log"], "as_array": False},
+        {"refs": ["log"], "join": " ", "as_array": True},
+        {"ref": "x" * 2049}, {"refs": ["log"] * 33, "as_array": True},
+        {"refs": ["log"], "join": "x" * 65},
+        {"literal": "v", "unexpected": 1},
+    )
+    for candidate in valid:
+        assert validator.is_valid(candidate), candidate
+        assert ValueSource.model_validate(candidate).model_dump() == candidate
+    for candidate in invalid:
+        assert not validator.is_valid(candidate), candidate
+        with pytest.raises(ValidationError):
+            ValueSource.model_validate(candidate)
+        rule = simple_normalizer_rule()
+        rule["variants"][0]["blocks"][0]["source"] = candidate
+        response = client.post("/api/v1/normalizers/preview", json={
+            "rule": rule,
+            "sample": {"timestamp": "2025-06-01T12:00:00Z", "log": "user created"},
+        }, headers=headers)
+        assert response.status_code == 422, candidate
+
+
+def test_normalizer_legacy_activation_rejected(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    with auth_database.session_factory() as session:
+        legacy = Normalizer(name="legacy", rule={"format_version": 0, "legacy_rule_text": "opaque"})
+        connection = KafkaConnection(name="legacy-connection", bootstrap_servers=["broker:9092"])
+        session.add_all([legacy, connection])
+        session.flush()
+        source = Source(name="legacy-source", connection_id=connection.id,
+                        normalizer_id=legacy.id, topic_name="events", is_enabled=False)
+        session.add(source)
+        session.commit()
+        source_id, legacy_id = source.id, legacy.id
+    assert client.get(f"/api/v1/normalizers/{legacy_id}").json()["rule_status"] == "legacy_incompatible"
+    response = client.post(f"/api/v1/sources/{source_id}/enable", headers=headers)
+    assert response.status_code == 409
+    assert response.json()["code"] == "normalizer_legacy_incompatible"
+    with auth_database.session_factory() as session:
+        assert session.get(Source, source_id).is_enabled is False
+
+
+def test_0004_legacy_roundtrip_and_enabled_source(auth_database_url, auth_database):
+    run_alembic(auth_database_url, "downgrade", "0003_parsed_logs_search")
+    try:
+        legacy_text = "legacy %d / raw ✓"
+        with auth_database.engine.begin() as connection:
+            legacy_id = connection.execute(text("""
+                INSERT INTO app.normalizers (name, rule) VALUES ('legacy-roundtrip', :rule)
+                RETURNING id
+            """), {"rule": legacy_text}).scalar_one()
+            connection_id = connection.execute(text("""
+                INSERT INTO app.kafka_connections (name, bootstrap_servers)
+                VALUES ('roundtrip-connection', ARRAY['broker:9092']) RETURNING id
+            """)).scalar_one()
+            source_id = connection.execute(text("""
+                INSERT INTO app.sources (name, connection_id, normalizer_id, topic_name, is_enabled)
+                VALUES ('roundtrip-source', :connection_id, :normalizer_id, 'events', true)
+                RETURNING id
+            """), {"connection_id": connection_id, "normalizer_id": legacy_id}).scalar_one()
+        run_alembic(auth_database_url, "upgrade", "head")
+        with auth_database.engine.connect() as connection:
+            row = connection.execute(text("SELECT rule, version FROM app.normalizers WHERE id=:id"),
+                                     {"id": legacy_id}).one()
+            assert row.rule == {"format_version": 0, "legacy_rule_text": legacy_text}
+            assert row.version == 1
+            assert connection.execute(text("SELECT is_enabled FROM app.sources WHERE id=:id"),
+                                      {"id": source_id}).scalar_one() is True
+        with auth_database.session_factory() as session:
+            session.add(Normalizer(name="v1-roundtrip", rule=simple_normalizer_rule()))
+            session.commit()
+        run_alembic(auth_database_url, "downgrade", "0003_parsed_logs_search")
+        with auth_database.engine.connect() as connection:
+            assert connection.execute(text("SELECT rule FROM app.normalizers WHERE id=:id"),
+                                      {"id": legacy_id}).scalar_one() == legacy_text
+            v1_text = connection.execute(text(
+                "SELECT rule FROM app.normalizers WHERE name='v1-roundtrip'"
+            )).scalar_one()
+            import json
+            assert json.loads(v1_text) == simple_normalizer_rule()
+    finally:
+        run_alembic(auth_database_url, "upgrade", "head")
 
 
 def run_alembic(database_url: str, *arguments: str):
@@ -1155,7 +1389,7 @@ def test_administrator_can_manage_users_roles_mappings_and_normalizers(
     assert mapping.status_code == 201
     normalizer = client.post(
         "/api/v1/normalizers",
-        json={"name": "syslog", "description": "opaque", "rule": "not executed"},
+        json={"name": "syslog", "description": "opaque", "rule": simple_normalizer_rule()},
         headers=headers,
     )
     assert normalizer.status_code == 201
@@ -1170,7 +1404,7 @@ def test_administrator_can_manage_users_roles_mappings_and_normalizers(
     assert updated.json()["version"] == 2
     stale = client.patch(
         f"/api/v1/normalizers/{normalizer_id}",
-        json={"rule": "stale", "version": 1},
+        json={"rule": simple_normalizer_rule(), "version": 1},
         headers=headers,
     )
     assert stale.status_code == 409
@@ -1214,7 +1448,7 @@ def test_settings_registry_and_normalizer_delete_are_version_aware(
     ).status_code == 404
     normalizer = client.post(
         "/api/v1/normalizers",
-        json={"name": "delete-me", "rule": "opaque"},
+        json={"name": "delete-me", "rule": simple_normalizer_rule()},
         headers=headers,
     ).json()
     assert client.patch(
@@ -1252,7 +1486,7 @@ def admin_headers(client, database):
 def create_normalizer(client, headers, name="normalizer"):
     response = client.post(
         "/api/v1/normalizers",
-        json={"name": name, "description": "test", "rule": "opaque rule"},
+        json={"name": name, "description": "test", "rule": simple_normalizer_rule()},
         headers=headers,
     )
     assert response.status_code == 201
@@ -1514,7 +1748,7 @@ def test_concurrent_version_conflicts_roll_back_side_effects(auth_database):
     actor_id = add_admin_user(auth_database)
     with auth_database.session_factory() as session:
         setting = AppSetting(key="concurrent.setting", value={"value": 0}, category="test")
-        normalizer = Normalizer(name="concurrent-normalizer", rule="opaque")
+        normalizer = Normalizer(name="concurrent-normalizer", rule=simple_normalizer_rule())
         session.add_all([setting, normalizer])
         session.flush()
         connection = KafkaConnection(
@@ -1615,7 +1849,7 @@ def test_administration_conflicts_use_real_constraint_names(client, auth_databas
     first_normalizer = create_normalizer(client, headers, "conflict-first")
     duplicate_normalizer = client.post(
         "/api/v1/normalizers",
-        json={"name": "conflict-first", "rule": "opaque"},
+        json={"name": "conflict-first", "rule": simple_normalizer_rule()},
         headers=headers,
     )
     assert duplicate_normalizer.status_code == 409
@@ -1812,7 +2046,7 @@ def test_mapping_legacy_crud_and_normalizer_listing_contracts(client, auth_datab
         json={
             "id": "55555555-5555-4555-8555-555555555555",
             "name": "opaque-normalizer",
-            "rule": "this is deliberately not an ECS parser rule",
+            "rule": simple_normalizer_rule(),
         },
         headers=headers,
     ).json()

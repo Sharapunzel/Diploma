@@ -114,6 +114,12 @@ class SqlAlchemyNormalizerRepository:
     def find_by_id(self, normalizer_id: UUID) -> Normalizer | None:
         return self.session.get(Normalizer, normalizer_id)
 
+    def find_by_id_for_update(self, normalizer_id: UUID) -> Normalizer | None:
+        return self.session.scalar(
+            select(Normalizer).where(Normalizer.id == normalizer_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+
     def add(self, normalizer: Normalizer) -> Normalizer:
         self.session.add(normalizer)
         self.session.flush()

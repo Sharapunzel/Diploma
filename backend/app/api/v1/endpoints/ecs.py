@@ -28,12 +28,13 @@ def get_fields(
     field_type: str | None = Query(default=None, alias="type", max_length=64),
     level: str | None = Query(default=None, max_length=32),
     filterable: bool | None = None,
+    mappable: bool | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=100_000),
     _: tuple = Depends(require_permission("events.read")),
     service: EcsCatalogService = Depends(get_ecs_catalog_service),
 ):
-    return service.fields(q, field_type, level, filterable, limit, offset)
+    return service.fields(q, field_type, level, filterable, limit, offset, mappable)
 
 
 @router.get("/fields/{field_name:path}", response_model=EcsFieldDTO, responses=AUTH_ERRORS | {

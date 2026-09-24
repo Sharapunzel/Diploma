@@ -9,6 +9,7 @@ dependencies = [
   "alembic>=1.13,<2",
   "anyio>=4.10,<4.15",
   "fastapi>=0.115,<1",
+  "google-re2==1.1.20250805",
   "httpx2>=2.9,<3",
   "itsdangerous>=2.2,<3",
   "pwdlib[argon2]>=0.2,<1",
@@ -30,7 +31,7 @@ include = ["app*"]
 "app.resources.ecs" = ["*.yml", "*.txt", "*.json"]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9", "ruff>=0.8,<1"]
+test = ["jsonschema>=4,<5", "pytest>=8,<9", "ruff>=0.8,<1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

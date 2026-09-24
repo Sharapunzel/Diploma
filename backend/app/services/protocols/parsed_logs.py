@@ -38,5 +38,6 @@ class EcsCatalogService(Protocol):
     def fields(
         self, query: str | None, field_type: str | None, level: str | None,
         filterable: bool | None, limit: int, offset: int,
+        mappable: bool | None = None,
     ) -> EcsFieldPage: ...
     def field(self, field_name: str) -> EcsFieldDTO: ...

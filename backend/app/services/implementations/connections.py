@@ -41,6 +41,14 @@ def metadata_for(client: KafkaMetadataClient, config: KafkaConnectionConfig, tim
         kafka_error(error)
 
 
+def executable_rule(rule: object) -> bool:
+    return (
+        isinstance(rule, dict)
+        and type(rule.get("format_version")) is int
+        and rule["format_version"] == 1
+    )
+
+
 class KafkaConnectionServiceImpl:
     def __init__(self, repository: KafkaConnectionRepository, uow: UnitOfWork, client: KafkaMetadataClient, timeout: int) -> None:
         self.repository, self.uow, self.client, self.timeout = repository, uow, client, timeout
@@ -247,8 +255,11 @@ class SourceServiceImpl:
         if source.normalizer_id is None:
             fail("source_normalizer_required", "Source requires a normalizer", 409)
         connection = self._connection(source.connection_id)
-        if self.normalizers.find_by_id(source.normalizer_id) is None:
+        normalizer = self.normalizers.find_by_id(source.normalizer_id)
+        if normalizer is None:
             fail("normalizer_not_found", "Normalizer not found")
+        if not executable_rule(normalizer.rule):
+            fail("normalizer_legacy_incompatible", "Normalizer rule must be upgraded to v1", 409)
         snapshot = (source.connection_id, source.topic_name, source.normalizer_id, source.is_enabled,
                     connection.id, tuple(connection.bootstrap_servers), connection.security_protocol)
         self._check_topic(connection, source.topic_name)
@@ -259,8 +270,11 @@ class SourceServiceImpl:
             fail("source_configuration_changed", "Source configuration changed during Kafka check", 409)
         current = (source.connection_id, source.topic_name, source.normalizer_id, source.is_enabled,
                    connection.id, tuple(connection.bootstrap_servers), connection.security_protocol)
-        if current != checked or self.normalizers.find_by_id(source.normalizer_id) is None:
+        current_normalizer = self.normalizers.find_by_id_for_update(source.normalizer_id)
+        if current != checked or current_normalizer is None:
             fail("source_configuration_changed", "Source configuration changed during Kafka check", 409)
+        if not executable_rule(current_normalizer.rule):
+            fail("normalizer_legacy_incompatible", "Normalizer rule must be upgraded to v1", 409)
         try:
             self.sources.update(source, {"is_enabled": True}, current_time())
             self.uow.commit()
