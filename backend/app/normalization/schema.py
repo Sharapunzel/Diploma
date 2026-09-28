@@ -171,7 +171,7 @@ class RuleV1(StrictModel):
 
 
 class Diagnostic(StrictModel):
-    code: str
+    code: str = Field(min_length=1, max_length=64)
     variant: str | None = None
     block: str | None = None
     field: str | None = None

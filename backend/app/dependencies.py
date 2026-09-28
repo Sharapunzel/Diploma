@@ -24,6 +24,7 @@ from .repositories.sqlalchemy.connections import (
     SqlAlchemyKafkaConnectionRepository,
     SqlAlchemySourceRepository,
 )
+from .repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from .services.implementations.administration import (
     MappingAdministration,
     NormalizerAdministration,
@@ -36,6 +37,7 @@ from .services.implementations.connections import KafkaConnectionServiceImpl, So
 from .services.implementations.cursor import SignedParsedLogCursorCodec
 from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
+from .services.implementations.processing import DurableProcessingServiceImpl
 from .services.protocols import AuthenticationService
 from .services.protocols.administration import (
     MappingAdministrationService,
@@ -47,6 +49,7 @@ from .services.protocols.administration import (
 from .services.protocols.connections import KafkaConnectionService, SourceService
 from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
+from .services.protocols.processing import DurableProcessingService
 
 
 def get_settings() -> Settings:
@@ -124,6 +127,14 @@ def get_parsed_log_service(
         SqlAlchemyUnitOfWork(session),
         catalog,
         cursor_codec,
+    )
+
+
+def build_durable_processing_service(
+    session: Session, engine: NormalizationEngine
+) -> DurableProcessingService:
+    return DurableProcessingServiceImpl(
+        SqlAlchemyProcessingRepository(session), SqlAlchemyUnitOfWork(session), engine
     )
 
 

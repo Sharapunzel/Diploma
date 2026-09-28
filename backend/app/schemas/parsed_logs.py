@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from ..ecs import EcsField
+from ..normalization.schema import Diagnostic
 
 
 class StrictRequest(BaseModel):
@@ -135,6 +136,8 @@ class ParsedLogSummary(StrictRequest):
     connection_name: str
     normalizer_name: str
     normalizer_version: int
+    normalization_status: Literal["complete", "partial"]
+    normalization_diagnostics: list[Diagnostic]
     kafka_topic: str
     kafka_partition: int
     kafka_offset: int
@@ -161,6 +164,8 @@ class ParsedLogSummary(StrictRequest):
             connection_name=log.connection_name,
             normalizer_name=log.normalizer_name,
             normalizer_version=log.normalizer_version,
+            normalization_status=log.normalization_status,
+            normalization_diagnostics=log.normalization_diagnostics,
             kafka_topic=log.kafka_topic,
             kafka_partition=log.kafka_partition,
             kafka_offset=log.kafka_offset,
@@ -183,6 +188,8 @@ class ParsedLogSummary(StrictRequest):
             connection_name=log.connection_name,
             normalizer_name=log.normalizer_name,
             normalizer_version=log.normalizer_version,
+            normalization_status=log.normalization_status,
+            normalization_diagnostics=log.normalization_diagnostics,
             kafka_topic=log.kafka_topic,
             kafka_partition=log.kafka_partition,
             kafka_offset=log.kafka_offset,

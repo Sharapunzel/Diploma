@@ -8,7 +8,7 @@ from .app import (
     User,
 )
 from .auth import AuthSession
-from .logs import ParsedLog
+from .logs import ParsedLog, ProcessedKafkaRecord, ProcessingError
 
 __all__ = [
     "AppSetting",
@@ -17,6 +17,8 @@ __all__ = [
     "Normalizer",
     "OidcRoleMapping",
     "ParsedLog",
+    "ProcessedKafkaRecord",
+    "ProcessingError",
     "Role",
     "Source",
     "User",

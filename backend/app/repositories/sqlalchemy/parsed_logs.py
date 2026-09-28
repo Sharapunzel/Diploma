@@ -240,6 +240,7 @@ class SqlAlchemyParsedLogRepository:
                 ParsedLog.id, ParsedLog.source_id, ParsedLog.connection_id,
                 ParsedLog.normalizer_id, ParsedLog.source_name, ParsedLog.connection_name,
                 ParsedLog.normalizer_name, ParsedLog.normalizer_version, ParsedLog.kafka_topic,
+                ParsedLog.normalization_status, ParsedLog.normalization_diagnostics,
                 ParsedLog.kafka_partition, ParsedLog.kafka_offset,
                 ParsedLog.fluent_bit_collected_at, ParsedLog.backend_received_at,
                 ParsedLog.backend_processed_at, ParsedLog.created_at,

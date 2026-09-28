@@ -354,7 +354,9 @@ def auth_database(auth_database_url):
 
 def clear_auth_state(auth_database):
     with auth_database.engine.begin() as connection:
+        connection.execute(text("DELETE FROM logs.processing_errors"))
         connection.execute(text("DELETE FROM logs.parsed_logs"))
+        connection.execute(text("DELETE FROM logs.processed_kafka_records"))
         connection.execute(text("DELETE FROM app.auth_sessions"))
         connection.execute(text("DELETE FROM app.oidc_role_mappings"))
         connection.execute(text("DELETE FROM app.sources"))
