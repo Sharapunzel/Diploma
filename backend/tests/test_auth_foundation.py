@@ -71,6 +71,7 @@ from app.repositories.sqlalchemy.administration import (
     SqlAlchemyNormalizerRepository,
     SqlAlchemySettingRepository,
 )
+from app.repositories.sqlalchemy.consumers import SqlAlchemyConsumerStateRepository
 from app.repositories.sqlalchemy.parsed_logs import _filter_expression
 from app.schemas.administration import NormalizerPatch
 from app.schemas.parsed_logs import ParsedLogBulkDeleteRequest, ParsedLogSearchRequest
@@ -354,6 +355,7 @@ def auth_database(auth_database_url):
 
 def clear_auth_state(auth_database):
     with auth_database.engine.begin() as connection:
+        connection.execute(text("DELETE FROM logs.kafka_operational_events"))
         connection.execute(text("DELETE FROM logs.processing_errors"))
         connection.execute(text("DELETE FROM logs.parsed_logs"))
         connection.execute(text("DELETE FROM logs.processed_kafka_records"))
@@ -2071,6 +2073,7 @@ class FakeKafkaMetadataClient:
         self.calls = 0
         self.mode = "ok"
         self.topic_names = ("events", "metrics", "__consumer_offsets")
+        self.topic_ids = {name: f"id-{name}" for name in self.topic_names}
 
     def metadata(self, config, timeout):
         self.calls += 1
@@ -2081,10 +2084,11 @@ class FakeKafkaMetadataClient:
         return KafkaMetadata(
             broker_count=1,
             topics=tuple(
-                KafkaTopic(name=name, partition_count=index + 1)
+                KafkaTopic(name=name, partition_count=index + 1, identity=self.topic_ids[name])
                 for index, name in enumerate(self.topic_names)
             ),
             latency_ms=1.5,
+            cluster_identity=config.bootstrap_servers[0],
         )
 
 
@@ -2225,12 +2229,11 @@ def test_parallel_enable_and_source_update_contend_without_deadlock(client, auth
         updated = update_future.result(timeout=5)
     assert sorted([enabled.status_code, updated.status_code]) == [200, 409]
     conflict = enabled if enabled.status_code == 409 else updated
-    assert conflict.json()["code"] == "source_configuration_changed"
+    assert conflict.json()["code"] in {"source_configuration_changed", "topic_identity_changed"}
     persisted = client.get(f"/api/v1/sources/{source['id']}").json()
-    if enabled.status_code == 200:
-        assert persisted["is_enabled"] is True and persisted["topic_name"] == "events"
-    else:
-        assert persisted["is_enabled"] is False and persisted["topic_name"] == "metrics"
+    assert persisted["topic_name"] == "events"
+    with auth_database.session_factory() as session:
+        assert session.get(Source, UUID(source["id"])).kafka_topic_identity == "id-events"
 
 
 def test_source_update_returns_conflict_when_source_deleted_during_kafka_check(
@@ -2373,8 +2376,8 @@ def test_kafka_connections_topics_and_source_lifecycle(client, auth_database):
     }
     topics = client.get(f"/api/v1/kafka-connections/{connection_id}/topics")
     assert topics.json()["items"] == [
-        {"name": "events", "partition_count": 1},
-        {"name": "metrics", "partition_count": 2},
+        {"name": "events", "partition_count": 1, "is_registered": False},
+        {"name": "metrics", "partition_count": 2, "is_registered": False},
     ]
     assert topics.json()["total"] == 2
     assert client.get(
@@ -2439,6 +2442,243 @@ def test_kafka_connections_topics_and_source_lifecycle(client, auth_database):
         f"/api/v1/sources/{source_id}/normalizer", json={"normalizer_id": None}, headers=headers
     ).status_code == 200
     assert client.delete(f"/api/v1/sources/{source_id}", headers=headers).status_code == 204
+
+
+def test_archived_topic_generation_requires_explicit_new_source(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "generation", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    normalizer = create_normalizer(client, headers, "generation")
+    old = client.post(
+        "/api/v1/sources",
+        json={"name": "old", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    assert client.put(
+        f"/api/v1/sources/{old['id']}/normalizer",
+        json={"normalizer_id": normalizer["id"]}, headers=headers,
+    ).status_code == 200
+    assert client.post(f"/api/v1/sources/{old['id']}/enable", headers=headers).status_code == 200
+    fake.topic_ids["events"] = "new-events-id"
+    with auth_database.session_factory() as session:
+        assert SqlAlchemyConsumerStateRepository(session).archive_recreated(
+            UUID(old["id"]), "id-events", "new-events-id"
+        )
+        session.commit()
+    topics = client.get(f"/api/v1/kafka-connections/{connection['id']}/topics").json()
+    assert next(item for item in topics["items"] if item["name"] == "events")["is_registered"] is False
+    old_state = client.get(f"/api/v1/sources/{old['id']}").json()
+    assert old_state["is_archived"] is True and old_state["is_enabled"] is False
+    for path, method, payload in (
+        (f"/api/v1/sources/{old['id']}", client.patch, {"topic_name": "metrics"}),
+        (f"/api/v1/sources/{old['id']}/normalizer", client.put, {"normalizer_id": None}),
+    ):
+        response = method(path, json=payload, headers=headers)
+        assert response.status_code == 409 and response.json()["code"] == "source_archived"
+    blocked = client.post(f"/api/v1/sources/{old['id']}/enable", headers=headers)
+    assert blocked.status_code == 409 and blocked.json()["code"] == "source_archived"
+    new_response = client.post(
+        "/api/v1/sources",
+        json={"name": "new", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    )
+    assert new_response.status_code == 201
+    new = new_response.json()
+    assert new["id"] != old["id"] and not new["is_enabled"] and new["normalizer_id"] is None
+    assert client.post(f"/api/v1/sources/{new['id']}/enable", headers=headers).status_code == 409
+    assert client.put(
+        f"/api/v1/sources/{new['id']}/normalizer",
+        json={"normalizer_id": normalizer["id"]}, headers=headers,
+    ).status_code == 200
+    assert client.post(f"/api/v1/sources/{new['id']}/enable", headers=headers).status_code == 200
+    topics = client.get(f"/api/v1/kafka-connections/{connection['id']}/topics").json()
+    assert next(item for item in topics["items"] if item["name"] == "events")["is_registered"] is True
+
+
+def test_disabled_recreated_source_is_archived_on_explicit_registration(client, auth_database):
+    from app.models import KafkaOperationalEvent, Source
+
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "disabled-generation", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    old = client.post(
+        "/api/v1/sources",
+        json={"name": "old-disabled", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    assert old["is_enabled"] is False
+    fake.topic_ids["events"] = "replacement-id"
+    topics = client.get(f"/api/v1/kafka-connections/{connection['id']}/topics").json()
+    assert next(item for item in topics["items"] if item["name"] == "events")["is_registered"] is False
+    new_response = client.post(
+        "/api/v1/sources",
+        json={"name": "new-disabled", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    )
+    assert new_response.status_code == 201, new_response.text
+    new = new_response.json()
+    assert new["id"] != old["id"] and not new["is_enabled"] and new["normalizer_id"] is None
+    with auth_database.session_factory() as session:
+        previous = session.get(Source, UUID(old["id"]))
+        assert previous.is_archived and not previous.is_enabled
+        event = session.scalar(select(KafkaOperationalEvent).where(
+            KafkaOperationalEvent.source_identity == UUID(old["id"]),
+            KafkaOperationalEvent.kind == "topic_recreated",
+        ))
+        assert event is not None and event.new_topic_identity == "replacement-id"
+    blocked = client.post(f"/api/v1/sources/{old['id']}/enable", headers=headers)
+    assert blocked.status_code == 409 and blocked.json()["code"] == "source_archived"
+
+
+def test_patch_cannot_adopt_recreated_topic_without_history(client, auth_database):
+    from app.models import KafkaOperationalEvent, Source
+
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "patch-generation", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    old = client.post(
+        "/api/v1/sources",
+        json={"name": "old-patch", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    fake.topic_ids["events"] = "replacement-id"
+    patch = client.patch(
+        f"/api/v1/sources/{old['id']}", json={"topic_name": "events"}, headers=headers
+    )
+    assert patch.status_code == 409 and patch.json()["code"] == "topic_identity_changed"
+    renamed = client.patch(
+        f"/api/v1/sources/{old['id']}", json={"name": "old-renamed"}, headers=headers
+    )
+    assert renamed.status_code == 200
+    with auth_database.session_factory() as session:
+        previous = session.get(Source, UUID(old["id"]))
+        assert previous.kafka_topic_identity == "id-events"
+        assert previous.name == "old-renamed" and not previous.is_archived
+        assert session.scalar(select(KafkaOperationalEvent).where(
+            KafkaOperationalEvent.source_identity == UUID(old["id"])
+        )) is None
+    replacement = client.post(
+        "/api/v1/sources",
+        json={"name": "new-patch", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    )
+    assert replacement.status_code == 201, replacement.text
+    assert replacement.json()["id"] != old["id"]
+    with auth_database.session_factory() as session:
+        previous = session.get(Source, UUID(old["id"]))
+        assert previous.is_archived and previous.kafka_topic_identity == "id-events"
+        event = session.scalar(select(KafkaOperationalEvent).where(
+            KafkaOperationalEvent.source_identity == UUID(old["id"]),
+            KafkaOperationalEvent.kind == "topic_recreated",
+        ))
+        assert event is not None and event.new_topic_identity == "replacement-id"
+
+
+def test_replacement_registration_rolls_back_archive_on_storage_failure(
+    client, auth_database, monkeypatch
+):
+    from app.models import KafkaOperationalEvent, Source
+    from app.repositories.sqlalchemy.connections import SqlAlchemySourceRepository
+
+    headers = admin_headers(client, auth_database)
+    fake = FakeKafkaMetadataClient()
+    use_fake_kafka(client, fake)
+    connection = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "rollback-generation", "bootstrap_servers": ["localhost:9092"]},
+        headers=headers,
+    ).json()
+    old = client.post(
+        "/api/v1/sources",
+        json={"name": "rollback-old", "connection_id": connection["id"], "topic_name": "events"},
+        headers=headers,
+    ).json()
+    fake.topic_ids["events"] = "replacement-id"
+    original = SqlAlchemySourceRepository.archive_recreated
+
+    def fail_after_archive(self, source_id, old_id, new_id):
+        assert original(self, source_id, old_id, new_id)
+        raise SQLAlchemyError("simulated transaction failure")
+
+    monkeypatch.setattr(SqlAlchemySourceRepository, "archive_recreated", fail_after_archive)
+    with pytest.raises(SQLAlchemyError, match="simulated transaction failure"):
+        client.post(
+            "/api/v1/sources",
+            json={"name": "rollback-new", "connection_id": connection["id"], "topic_name": "events"},
+            headers=headers,
+        )
+    with auth_database.session_factory() as session:
+        old_source = session.get(Source, UUID(old["id"]))
+        assert not old_source.is_archived
+        assert session.scalar(select(Source).where(Source.name == "rollback-new")) is None
+        assert session.scalar(select(KafkaOperationalEvent).where(
+            KafkaOperationalEvent.source_identity == UUID(old["id"]),
+        )) is None
+
+
+def test_same_cluster_second_connection_cannot_register_source(client, auth_database):
+    from dataclasses import replace
+
+    headers = admin_headers(client, auth_database)
+
+    class SameClusterClient(FakeKafkaMetadataClient):
+        def metadata(self, config, timeout):
+            return replace(super().metadata(config, timeout), cluster_identity="shared-cluster")
+
+    use_fake_kafka(client, SameClusterClient())
+    first = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "first-cluster-address", "bootstrap_servers": ["first:9092"]},
+        headers=headers,
+    ).json()
+    second = client.post(
+        "/api/v1/kafka-connections",
+        json={"name": "second-cluster-address", "bootstrap_servers": ["second:9092"]},
+        headers=headers,
+    ).json()
+    first_source = client.post(
+        "/api/v1/sources",
+        json={"name": "first-source", "connection_id": first["id"], "topic_name": "events"},
+        headers=headers,
+    )
+    assert first_source.status_code == 201
+    duplicate = client.post(
+        "/api/v1/sources",
+        json={"name": "duplicate", "connection_id": second["id"], "topic_name": "events"},
+        headers=headers,
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["code"] == "cluster_connection_conflict"
+    blocked = client.patch(
+        f"/api/v1/kafka-connections/{first['id']}",
+        json={"bootstrap_servers": ["third:9092"]}, headers=headers,
+    )
+    assert blocked.status_code == 409 and blocked.json()["code"] == "source_exists"
+    assert client.delete(f"/api/v1/sources/{first_source.json()['id']}", headers=headers).status_code == 204
+    assert client.patch(
+        f"/api/v1/kafka-connections/{first['id']}",
+        json={"bootstrap_servers": ["third:9092"]}, headers=headers,
+    ).status_code == 200
+    assert client.post(
+        "/api/v1/sources",
+        json={"name": "second-source", "connection_id": second["id"], "topic_name": "events"},
+        headers=headers,
+    ).status_code == 201
 
 
 def test_kafka_source_validation_permissions_and_safe_failures(client, auth_database):

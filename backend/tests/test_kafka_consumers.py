@@ -10,7 +10,7 @@ from time import monotonic, sleep
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
 from app.db import Database
@@ -28,6 +28,7 @@ from app.kafka import (
 )
 from app.models import (
     KafkaConnection,
+    KafkaOperationalEvent,
     Normalizer,
     ParsedLog,
     ProcessedKafkaRecord,
@@ -87,6 +88,7 @@ def consumer_database(consumer_database_url):
 
 def _clear(database: Database) -> None:
     with database.engine.begin() as connection:
+        connection.execute(text("DELETE FROM logs.kafka_operational_events"))
         connection.execute(text("DELETE FROM logs.processing_errors"))
         connection.execute(text("DELETE FROM logs.parsed_logs"))
         connection.execute(text("DELETE FROM logs.processed_kafka_records"))
@@ -132,7 +134,8 @@ def _rule() -> dict:
 def _source(database: Database, *, enabled: bool = True, topic: str = "events"):
     with database.session_factory() as session:
         connection = KafkaConnection(
-            name=f"consumer-connection-{uuid4()}", bootstrap_servers=["broker:9092"]
+            name=f"consumer-connection-{uuid4()}",
+            bootstrap_servers=[f"broker-{uuid4()}:9092"],
         )
         normalizer = Normalizer(name=f"consumer-normalizer-{uuid4()}", rule=_rule())
         session.add_all([connection, normalizer])
@@ -142,7 +145,7 @@ def _source(database: Database, *, enabled: bool = True, topic: str = "events"):
             connection_id=connection.id,
             normalizer_id=normalizer.id,
             topic_name=topic,
-            kafka_topic_identity="topic-id",
+            kafka_topic_identity="topic-id" if topic == "events" else "topic-disabled",
             is_enabled=enabled,
         )
         session.add(source)
@@ -156,6 +159,7 @@ class FakeMetadataClient:
             broker_count=1,
             topics=(KafkaTopic("events", 1, "topic-id"), KafkaTopic("disabled", 1, "topic-disabled")),
             latency_ms=1,
+            cluster_identity=config.bootstrap_servers[0],
         )
 
 
@@ -168,6 +172,7 @@ class FixedMetadataClient:
             broker_count=1,
             topics=(KafkaTopic("events", 1, self.identity),),
             latency_ms=1,
+            cluster_identity=config.bootstrap_servers[0],
         )
 
 
@@ -345,31 +350,142 @@ def test_commit_retry_uses_durable_already_processed_without_duplicate_rows(
     assert [offsets[0].offset for offsets in consumer.commits] == [1, 1]
 
 
-@pytest.mark.parametrize(
-    ("committed", "low", "history"),
-    [({0: None}, 0, True), ({0: 3}, 4, False)],
-)
-def test_consumer_never_skips_unknown_or_retained_position(
-    consumer_database, clean_consumer_data, committed, low, history
+def test_topic_recreated_during_processing_prevents_first_commit(
+    consumer_database, clean_consumer_data, monkeypatch
+):
+    from app.services.implementations.processing import DurableProcessingServiceImpl
+
+    _, source_id = _source(consumer_database)
+    metadata = FixedMetadataClient("topic-id")
+    original = DurableProcessingServiceImpl.process
+
+    def switch_after_durable_write(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        metadata.identity = "replacement-topic-id"
+        return result
+
+    monkeypatch.setattr(DurableProcessingServiceImpl, "process", switch_after_durable_write)
+    consumer = FakeConsumer([
+        KafkaAssignment("events", (0,)),
+        KafkaMessage(
+            "events", 0, 0,
+            b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}', RECEIVED_AT,
+        ),
+    ])
+    supervisor = _supervisor(consumer_database, consumer, metadata)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.closed)
+    finally:
+        assert supervisor.stop()
+    assert consumer.commits == []
+    with consumer_database.session_factory() as session:
+        assert session.get(Source, source_id).is_archived
+        assert session.scalar(select(func.count()).select_from(ProcessedKafkaRecord)) == 1
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+
+
+def test_topic_recreated_before_failed_commit_retry_prevents_second_commit(
+    consumer_database, clean_consumer_data
+):
+    _, source_id = _source(consumer_database)
+    metadata = FixedMetadataClient("topic-id")
+
+    class SwitchingConsumer(FakeConsumer):
+        def commit(self, offsets, timeout):
+            try:
+                super().commit(offsets, timeout)
+            finally:
+                metadata.identity = "replacement-topic-id"
+
+    consumer = SwitchingConsumer([
+        KafkaAssignment("events", (0,)),
+        KafkaMessage(
+            "events", 0, 0,
+            b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}', RECEIVED_AT,
+        ),
+    ], failed_commits=1)
+    supervisor = _supervisor(consumer_database, consumer, metadata)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.closed)
+    finally:
+        assert supervisor.stop()
+    assert [item[0].offset for item in consumer.commits] == [1]
+    assert consumer.committed_offsets.get(0) is None
+    with consumer_database.session_factory() as session:
+        assert session.get(Source, source_id).is_archived
+        assert session.scalar(select(func.count()).select_from(ProcessedKafkaRecord)) == 1
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+
+
+def test_metadata_outage_after_durable_write_delays_commit_without_duplicate(
+    consumer_database, clean_consumer_data, monkeypatch
+):
+    from app.kafka import KafkaMetadataError
+    from app.services.implementations.processing import DurableProcessingServiceImpl
+
+    _, source_id = _source(consumer_database)
+
+    class FlakyMetadata(FixedMetadataClient):
+        fail_next = False
+        failed = False
+
+        def metadata(self, config, timeout):
+            if self.fail_next:
+                self.fail_next = False
+                self.failed = True
+                raise KafkaMetadataError("unavailable")
+            return super().metadata(config, timeout)
+
+    metadata = FlakyMetadata("topic-id")
+    original = DurableProcessingServiceImpl.process
+
+    def fail_metadata_after_write(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        metadata.fail_next = True
+        return result
+
+    monkeypatch.setattr(DurableProcessingServiceImpl, "process", fail_metadata_after_write)
+    consumer = FakeConsumer([
+        KafkaAssignment("events", (0,)),
+        KafkaMessage(
+            "events", 0, 0,
+            b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}', RECEIVED_AT,
+        ),
+    ])
+    supervisor = _supervisor(consumer_database, consumer, metadata)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.commits == [(KafkaPartition("events", 0, 1),)])
+    finally:
+        assert supervisor.stop()
+    assert metadata.failed and consumer.paused and consumer.resumed
+    with consumer_database.session_factory() as session:
+        assert session.get(Source, source_id).is_enabled
+        assert session.scalar(select(func.count()).select_from(ProcessedKafkaRecord)) == 1
+
+
+def test_consumer_never_skips_unknown_position_with_history(
+    consumer_database, clean_consumer_data
 ):
     connection_id, source_id = _source(consumer_database)
-    if history:
-        with consumer_database.session_factory() as session:
-            session.add(ProcessedKafkaRecord(
-                connection_identity=connection_id,
-                connection_id=connection_id,
-                source_id=source_id,
-                normalizer_id=None,
-                kafka_topic="events",
-                kafka_topic_identity="topic-id",
-                kafka_partition=0,
-                kafka_offset=0,
-                result_status="failed",
-                backend_received_at=RECEIVED_AT,
-                backend_processed_at=RECEIVED_AT + timedelta(seconds=1),
-            ))
-            session.commit()
-    consumer = FakeConsumer([KafkaAssignment("events", (0,))], committed=committed, low=low)
+    with consumer_database.session_factory() as session:
+        session.add(ProcessedKafkaRecord(
+            connection_identity=connection_id,
+            connection_id=connection_id,
+            source_id=source_id,
+            normalizer_id=None,
+            kafka_topic="events",
+            kafka_topic_identity="topic-id",
+            kafka_partition=0,
+            kafka_offset=0,
+            result_status="failed",
+            backend_received_at=RECEIVED_AT,
+            backend_processed_at=RECEIVED_AT + timedelta(seconds=1),
+        ))
+        session.commit()
+    consumer = FakeConsumer([KafkaAssignment("events", (0,))], committed={0: None})
     supervisor = _supervisor(consumer_database, consumer)
     supervisor.start()
     try:
@@ -378,6 +494,368 @@ def test_consumer_never_skips_unknown_or_retained_position(
         supervisor.stop()
     assert consumer.assigned == []
     assert consumer.commits == []
+
+
+def test_retention_gap_is_durable_before_assignment_and_other_partition_continues(
+    consumer_database, clean_consumer_data
+):
+    connection_id, source_id = _source(consumer_database)
+    payload = b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}'
+
+    class CheckedConsumer(FakeConsumer):
+        def watermarks(self, topic, partition, timeout):
+            return (4 if partition == 0 else 0), 20
+
+        def assign(self, partitions):
+            with consumer_database.session_factory() as session:
+                gaps = list(session.scalars(select(KafkaOperationalEvent)))
+            assert [(gap.offset_start, gap.offset_end) for gap in gaps] == [(2, 4)]
+            super().assign(partitions)
+
+    consumer = CheckedConsumer(
+        [
+            KafkaAssignment("events", (0, 1)),
+            KafkaMessage("events", 0, 4, payload, RECEIVED_AT),
+            KafkaMessage("events", 1, 0, payload, RECEIVED_AT),
+        ],
+        committed={0: 2, 1: 0},
+    )
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: len(consumer.commits) == 2)
+    finally:
+        assert supervisor.stop()
+    assert consumer.assigned == [
+        (KafkaPartition("events", 0, 4), KafkaPartition("events", 1, 0))
+    ]
+    assert {offsets[0].offset for offsets in consumer.commits} == {1, 5}
+    with consumer_database.session_factory() as session:
+        gap = session.scalar(select(KafkaOperationalEvent))
+        assert gap is not None
+        assert (gap.source_identity, gap.connection_identity, gap.kafka_partition) == (
+            source_id, connection_id, 0
+        )
+        assert gap.reason_code == "offset_below_low_watermark"
+        assert gap.old_topic_identity == "topic-id"
+        assert session.scalar(select(ProcessedKafkaRecord).where(
+            ProcessedKafkaRecord.kafka_offset == 2
+        )) is None
+
+
+def test_sparse_offset_stops_only_affected_partition_after_one_seek(
+    consumer_database, clean_consumer_data
+):
+    _, source_id = _source(consumer_database)
+    payload = b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}'
+    consumer = FakeConsumer(
+        [
+            KafkaAssignment("events", (0, 1)),
+            KafkaMessage("events", 0, 2, payload, RECEIVED_AT),
+            KafkaMessage("events", 1, 0, payload, RECEIVED_AT),
+        ],
+        committed={0: 1, 1: 0},
+        low=0,
+        high=3,
+        resume_events=(KafkaMessage("events", 0, 2, payload, RECEIVED_AT),),
+    )
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: len(consumer.commits) == 1 and len(consumer.seeks) == 1)
+        _wait(lambda: supervisor._workers[source_id].stopped_partitions.get(0)
+              == "offset_missing_within_watermarks")
+        sleep(0.1)
+    finally:
+        assert supervisor.stop()
+    assert consumer.seeks == [KafkaPartition("events", 0, 1)]
+    assert [item[0].offset for item in consumer.commits] == [1]
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(ParsedLog).where(
+            ParsedLog.source_id == source_id,
+            ParsedLog.kafka_partition == 1,
+        )) is not None
+        assert session.scalar(select(KafkaOperationalEvent)) is None
+
+
+def test_targeted_topic_identity_change_precedes_new_generation_processing(
+    consumer_database, clean_consumer_data
+):
+    _, source_id = _source(consumer_database)
+    payload = b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}'
+
+    class SwitchingMetadata(FixedMetadataClient):
+        targeted_calls = 0
+
+        def metadata_for_topic(self, config, topic_name, timeout):
+            self.targeted_calls += 1
+            return self.metadata(config, timeout)
+
+    metadata = SwitchingMetadata("topic-id")
+
+    class SwitchingConsumer(FakeConsumer):
+        def commit(self, offsets, timeout):
+            super().commit(offsets, timeout)
+            metadata.identity = "replacement-topic-id"
+
+    consumer = SwitchingConsumer([
+        KafkaAssignment("events", (0,)),
+        KafkaMessage("events", 0, 0, payload, RECEIVED_AT),
+        KafkaMessage("events", 0, 1, payload, RECEIVED_AT),
+    ])
+    supervisor = _supervisor(consumer_database, consumer, metadata)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.closed)
+    finally:
+        assert supervisor.stop()
+    assert metadata.targeted_calls >= 2
+    assert [item[0].offset for item in consumer.commits] == [1]
+    with consumer_database.session_factory() as session:
+        source = session.get(Source, source_id)
+        assert source.is_archived
+        assert session.scalar(select(ProcessedKafkaRecord).where(
+            ProcessedKafkaRecord.source_id == source_id,
+            ProcessedKafkaRecord.kafka_offset == 1,
+        )) is None
+
+
+def test_retention_gap_restart_and_growing_low_do_not_duplicate_or_hide_ranges(
+    consumer_database, clean_consumer_data
+):
+    _source(consumer_database)
+    for low, expected in ((4, [(2, 4)]), (4, [(2, 4)]), (7, [(2, 4), (4, 7)])):
+        consumer = FakeConsumer([KafkaAssignment("events", (0,))], committed={0: 2}, low=low)
+        supervisor = _supervisor(consumer_database, consumer)
+        supervisor.start()
+        try:
+            _wait(lambda current=consumer: bool(current.assigned))
+        finally:
+            assert supervisor.stop()
+        assert consumer.assigned[0] == (KafkaPartition("events", 0, low),)
+        with consumer_database.session_factory() as session:
+            intervals = list(session.execute(
+                select(KafkaOperationalEvent.offset_start, KafkaOperationalEvent.offset_end)
+                .order_by(KafkaOperationalEvent.offset_start)
+            ))
+        assert intervals == expected
+
+
+def test_restart_after_gap_commit_but_before_assignment_reuses_event(
+    consumer_database, clean_consumer_data
+):
+    _source(consumer_database)
+    assignment_failed = threading.Event()
+
+    class FailAssignment(FakeConsumer):
+        def assign(self, partitions):
+            assignment_failed.set()
+            raise KafkaConsumerError("unavailable")
+
+    first = FailAssignment([KafkaAssignment("events", (0,))], committed={0: 2}, low=4)
+    supervisor = _supervisor(consumer_database, first)
+    supervisor.start()
+    try:
+        assert assignment_failed.wait(3)
+    finally:
+        assert supervisor.stop()
+    assert not first.assigned and not first.commits
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+    restarted = FakeConsumer([KafkaAssignment("events", (0,))], committed={0: 2}, low=4)
+    supervisor = _supervisor(consumer_database, restarted)
+    supervisor.start()
+    try:
+        _wait(lambda: bool(restarted.assigned))
+    finally:
+        assert supervisor.stop()
+    assert restarted.assigned == [(KafkaPartition("events", 0, 4),)]
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+
+
+@pytest.mark.parametrize(
+    ("committed", "low", "reason"),
+    [({0: None}, 4, "position_unknown_after_history"),
+     ({0: 2}, 3, "retention_watermark_regressed")],
+)
+def test_gap_history_rejects_unknown_position_or_regressed_watermark(
+    consumer_database, clean_consumer_data, committed, low, reason
+):
+    _, source_id = _source(consumer_database)
+    first = FakeConsumer([KafkaAssignment("events", (0,))], committed={0: 2}, low=4)
+    supervisor = _supervisor(consumer_database, first)
+    supervisor.start()
+    try:
+        _wait(lambda: bool(first.assigned))
+    finally:
+        assert supervisor.stop()
+    restarted = FakeConsumer([KafkaAssignment("events", (0,))], committed=committed, low=low)
+    supervisor = _supervisor(consumer_database, restarted)
+    supervisor.start()
+    try:
+        _wait(lambda: source_id in supervisor._workers and
+              supervisor._workers[source_id].stopped_partitions.get(0) == reason)
+    finally:
+        assert supervisor.stop()
+    assert not restarted.assigned and not restarted.commits
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+
+
+def test_watermark_advancing_after_assignment_is_recorded_before_later_message(
+    consumer_database, clean_consumer_data
+):
+    _source(consumer_database)
+
+    class AdvancingConsumer(FakeConsumer):
+        def __init__(self, events):
+            super().__init__(events, committed={0: 2})
+            self.watermark_calls = 0
+
+        def watermarks(self, topic, partition, timeout):
+            self.watermark_calls += 1
+            return (2 if self.watermark_calls == 1 else 4), 10
+
+    consumer = AdvancingConsumer([
+        KafkaAssignment("events", (0,)),
+        KafkaMessage(
+            "events", 0, 4,
+            b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}', RECEIVED_AT,
+        ),
+    ])
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.commits == [(KafkaPartition("events", 0, 5),)])
+    finally:
+        assert supervisor.stop()
+    assert consumer.paused and consumer.resumed
+    with consumer_database.session_factory() as session:
+        gap = session.scalar(select(KafkaOperationalEvent))
+        assert (gap.offset_start, gap.offset_end) == (2, 4)
+
+
+def test_retention_gap_storage_failure_never_advances_before_retry(
+    consumer_database, clean_consumer_data, monkeypatch
+):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.repositories.sqlalchemy.consumers import SqlAlchemyConsumerStateRepository
+
+    _source(consumer_database)
+    original = SqlAlchemyConsumerStateRepository.record_retention_gap
+    attempts = 0
+
+    def fail_once(repository, *args):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SQLAlchemyError("simulated storage outage")
+        return original(repository, *args)
+
+    monkeypatch.setattr(SqlAlchemyConsumerStateRepository, "record_retention_gap", fail_once)
+    consumer = FakeConsumer([KafkaAssignment("events", (0,))], committed={0: 2}, low=4)
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: attempts >= 2 and bool(consumer.assigned))
+    finally:
+        assert supervisor.stop()
+    assert consumer.assigned == [(KafkaPartition("events", 0, 4),)]
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+
+
+def test_retention_gap_storage_retry_does_not_block_other_partition(
+    consumer_database, clean_consumer_data, monkeypatch
+):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.repositories.sqlalchemy.consumers import SqlAlchemyConsumerStateRepository
+
+    _source(consumer_database)
+    allow_gap = threading.Event()
+    original = SqlAlchemyConsumerStateRepository.record_retention_gap
+
+    def delayed_gap(repository, *args):
+        if not allow_gap.is_set():
+            raise SQLAlchemyError("simulated storage outage")
+        return original(repository, *args)
+
+    monkeypatch.setattr(SqlAlchemyConsumerStateRepository, "record_retention_gap", delayed_gap)
+
+    class TwoPartitionConsumer(FakeConsumer):
+        def watermarks(self, topic, partition, timeout):
+            return (4 if partition == 0 else 0), 10
+
+    payload = b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}'
+    consumer = TwoPartitionConsumer([
+        KafkaAssignment("events", (0, 1)),
+        KafkaMessage("events", 0, 4, payload, RECEIVED_AT),
+        KafkaMessage("events", 1, 0, payload, RECEIVED_AT),
+    ], committed={0: 2, 1: 0})
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.commits == [(KafkaPartition("events", 1, 1),)])
+        assert consumer.assigned[0] == (KafkaPartition("events", 1, 0),)
+        with consumer_database.session_factory() as session:
+            assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 0
+        allow_gap.set()
+        _wait(lambda: any(offsets[0].partition == 0 for offsets in consumer.commits))
+    finally:
+        allow_gap.set()
+        assert supervisor.stop()
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 1
+
+
+@pytest.mark.parametrize(
+    ("position", "low", "high", "expected_assignment"),
+    [(4, 4, 8, True), (8, 4, 8, True), (9, 4, 8, False)],
+)
+def test_assignment_watermark_boundaries_do_not_create_gap(
+    consumer_database, clean_consumer_data, position, low, high, expected_assignment
+):
+    _source(consumer_database)
+    consumer = FakeConsumer(
+        [KafkaAssignment("events", (0,))], committed={0: position}, low=low, high=high
+    )
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        if expected_assignment:
+            _wait(lambda: bool(consumer.assigned))
+        else:
+            _wait(lambda: consumer.closed)
+    finally:
+        assert supervisor.stop()
+    assert bool(consumer.assigned) is expected_assignment
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 0
+
+
+def test_invalid_position_stops_only_affected_partition(
+    consumer_database, clean_consumer_data
+):
+    _source(consumer_database)
+    payload = b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok accepted"}'
+    consumer = FakeConsumer([
+        KafkaAssignment("events", (0, 1)),
+        KafkaMessage("events", 1, 0, payload, RECEIVED_AT),
+    ], committed={0: 11, 1: 0}, high=10)
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: consumer.commits == [(KafkaPartition("events", 1, 1),)])
+        worker = next(iter(supervisor._workers.values()))
+        assert worker.stopped_partitions == {0: "position_outside_available_range"}
+    finally:
+        assert supervisor.stop()
+    assert consumer.assigned == [(KafkaPartition("events", 1, 0),)]
+    with consumer_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 0
 
 
 def test_restart_uses_confirmed_position_and_assigns_new_partition(
@@ -527,6 +1005,32 @@ def test_topic_identity_migration_roundtrip(
         _run_alembic(consumer_database_url, "upgrade", "head")
 
 
+def test_generation_migration_roundtrip_preserves_existing_ledger(
+    consumer_database, consumer_database_url, clean_consumer_data
+):
+    connection_id, source_id = _source(consumer_database, enabled=False)
+    with consumer_database.session_factory.begin() as session:
+        session.add(ProcessedKafkaRecord(
+            connection_identity=connection_id, connection_id=connection_id,
+            source_id=source_id, kafka_topic="events", kafka_topic_identity="topic-id",
+            kafka_partition=0, kafka_offset=11, result_status="failed",
+            backend_received_at=RECEIVED_AT, backend_processed_at=RECEIVED_AT,
+        ))
+    _run_alembic(consumer_database_url, "downgrade", "0006_kafka_topic_identity")
+    try:
+        with consumer_database.engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT count(*) FROM logs.processed_kafka_records WHERE kafka_offset=11"
+            )).scalar_one() == 1
+        _run_alembic(consumer_database_url, "upgrade", "head")
+        with consumer_database.engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT is_archived FROM app.sources WHERE id=:id"
+            ), {"id": source_id}).scalar_one() is False
+    finally:
+        _run_alembic(consumer_database_url, "upgrade", "head")
+
+
 @pytest.mark.parametrize("identity", [None, ""])
 def test_history_with_missing_or_invalid_topic_identity_stops_safely(
     consumer_database, clean_consumer_data, identity
@@ -563,6 +1067,28 @@ def test_history_with_missing_or_invalid_topic_identity_stops_safely(
     assert consumer.assigned == []
 
 
+def test_legacy_null_topic_identity_history_is_not_assigned_to_new_generation(
+    consumer_database, clean_consumer_data
+):
+    connection_id, source_id = _source(consumer_database)
+    with consumer_database.session_factory.begin() as session:
+        session.add(ProcessedKafkaRecord(
+            connection_identity=connection_id, connection_id=connection_id,
+            source_id=source_id, kafka_topic="events", kafka_topic_identity=None,
+            kafka_partition=0, kafka_offset=0, result_status="failed",
+            backend_received_at=RECEIVED_AT, backend_processed_at=RECEIVED_AT,
+        ))
+    consumer = FakeConsumer([KafkaAssignment("events", (0,))])
+    supervisor = _supervisor(consumer_database, consumer)
+    supervisor.start()
+    try:
+        _wait(lambda: source_id in supervisor._workers and
+              supervisor._workers[source_id].state.reason == "legacy_topic_identity_unknown")
+    finally:
+        assert supervisor.stop()
+    assert not consumer.assigned and not consumer.commits
+
+
 def test_recreated_topic_cannot_reuse_durable_coordinates(
     consumer_database, clean_consumer_data
 ):
@@ -596,11 +1122,79 @@ def test_recreated_topic_cannot_reuse_durable_coordinates(
         supervisor.stop()
     assert consumer.assigned == []
     assert consumer.commits == []
+    with consumer_database.session_factory() as session:
+        archived = session.get(Source, source_id)
+        assert archived.is_archived and not archived.is_enabled
+        events = list(session.scalars(select(KafkaOperationalEvent)))
+        assert len(events) == 1
+        assert (events[0].kind, events[0].old_topic_identity,
+                events[0].new_topic_identity) == (
+            "topic_recreated", "topic-id", "new-topic-id"
+        )
+
+
+def test_recreation_storage_outage_neither_archives_nor_reads_new_topic(
+    consumer_database, clean_consumer_data, monkeypatch
+):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.repositories.sqlalchemy.consumers import SqlAlchemyConsumerStateRepository
+
+    _, source_id = _source(consumer_database)
+
+    def unavailable(*_args):
+        raise SQLAlchemyError("simulated storage outage")
+
+    monkeypatch.setattr(SqlAlchemyConsumerStateRepository, "archive_recreated", unavailable)
+    consumer = FakeConsumer([KafkaAssignment("events", (0,))])
+    supervisor = _supervisor(consumer_database, consumer, FixedMetadataClient("new-topic-id"))
+    supervisor.start()
+    try:
+        _wait(lambda: source_id in supervisor._workers and
+              supervisor._workers[source_id].state.reason == "storage_unavailable")
+    finally:
+        assert supervisor.stop()
+    assert not consumer.assigned and not consumer.commits
+    with consumer_database.session_factory() as session:
+        source = session.get(Source, source_id)
+        assert not source.is_archived and source.is_enabled
+        assert session.scalar(select(func.count()).select_from(KafkaOperationalEvent)) == 0
+
+
+def test_preexisting_duplicate_cluster_sources_cannot_start_two_consumers(
+    consumer_database, clean_consumer_data
+):
+    from dataclasses import replace
+
+    _source(consumer_database)
+    _source(consumer_database)
+
+    class SameClusterMetadata(FakeMetadataClient):
+        def metadata(self, config, timeout):
+            return replace(super().metadata(config, timeout), cluster_identity="one-cluster")
+
+    factory = FakeConsumerFactory(FakeConsumer([KafkaAssignment("events", (0,))]))
+    supervisor = KafkaSourceSupervisor(
+        consumer_database.session_factory,
+        NormalizationEngine(PackagedEcsCatalog.load()),
+        SameClusterMetadata(), factory,
+        metadata_timeout=1, poll_timeout=0.02, retry_delay=0.02, sync_interval=0.02,
+    )
+    supervisor.start()
+    try:
+        _wait(lambda: len(supervisor._workers) == 2 and
+              any(worker.state.reason == "cluster_identity_conflict"
+                  for worker in supervisor._workers.values()))
+    finally:
+        assert supervisor.stop()
+    assert len(factory.groups) == 1
 
 
 def test_patch_same_topic_after_recreation_preserves_identity_with_history(
     consumer_database, clean_consumer_data
 ):
+    from app.core.errors import DomainError
+
     connection_id, source_id = _source(consumer_database, enabled=False)
     with consumer_database.session_factory() as session:
         source = session.get(Source, source_id)
@@ -630,11 +1224,15 @@ def test_patch_same_topic_after_recreation_preserves_identity_with_history(
             FixedMetadataClient("new-topic-id"),
             timeout=1,
         )
-        updated = service.update(source_id, SourcePatch(topic_name="events"))
-        assert updated.kafka_topic_identity == "old-topic-id"
+        with pytest.raises(DomainError) as error:
+            service.update(source_id, SourcePatch(topic_name="events"))
+        assert error.value.code == "topic_identity_changed"
+    with consumer_database.session_factory() as session:
+        source = session.get(Source, source_id)
+        assert source.kafka_topic_identity == "old-topic-id"
 
 
-def test_recreated_source_with_history_stops_before_consumer_assignment(
+def test_recreated_source_with_history_processes_new_generation_separately(
     consumer_database, clean_consumer_data
 ):
     connection_id, source_id = _source(consumer_database)
@@ -667,7 +1265,13 @@ def test_recreated_source_with_history_stops_before_consumer_assignment(
         )
         session.add(recreated)
         session.commit()
-    consumer = FakeConsumer([KafkaAssignment("events", (0,))])
+    consumer = FakeConsumer([
+        KafkaAssignment("events", (0,)),
+        KafkaMessage(
+            "events", 0, 0,
+            b'{"timestamp":"2026-03-02T11:59:00Z","log":"ok"}', RECEIVED_AT,
+        ),
+    ])
     supervisor = _supervisor(
         consumer_database, consumer, FixedMetadataClient("new-topic-id")
     )
@@ -677,15 +1281,17 @@ def test_recreated_source_with_history_stops_before_consumer_assignment(
         )
     supervisor.start()
     try:
-        _wait(
-            lambda: recreated_id in supervisor._workers
-            and supervisor._workers[recreated_id].state.reason
-            == "topic_identity_history_mismatch"
-        )
+        _wait(lambda: len(consumer.commits) == 1)
     finally:
         assert supervisor.stop()
-    assert consumer.assigned == []
-    assert consumer.commits == []
+    assert consumer.assigned == [(KafkaPartition("events", 0, 0),)]
+    assert consumer.commits == [(KafkaPartition("events", 0, 1),)]
+    with consumer_database.session_factory() as session:
+        rows = list(session.scalars(select(ProcessedKafkaRecord).order_by(
+            ProcessedKafkaRecord.kafka_topic_identity
+        )))
+        assert {row.kafka_topic_identity for row in rows} == {"old-topic-id", "new-topic-id"}
+        assert any(row.source_id == recreated_id and row.result_status == "complete" for row in rows)
 
 
 def test_commit_failure_buffers_later_offsets_in_partition_order(

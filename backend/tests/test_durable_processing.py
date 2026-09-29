@@ -81,6 +81,7 @@ def _clear_processing_data(database: Database) -> None:
         connection.execute(text("DELETE FROM logs.processing_errors"))
         connection.execute(text("DELETE FROM logs.parsed_logs"))
         connection.execute(text("DELETE FROM logs.processed_kafka_records"))
+        connection.execute(text("DELETE FROM logs.kafka_operational_events"))
         connection.execute(text("DELETE FROM app.sources"))
         connection.execute(text("DELETE FROM app.kafka_connections"))
         connection.execute(text("DELETE FROM app.normalizers"))
@@ -163,6 +164,7 @@ def _context(database: Database, *, rule: dict | None = None, enabled: bool = Tr
             connection_id=connection.id,
             normalizer_id=normalizer.id,
             topic_name="events",
+            kafka_topic_identity="test-topic-id",
             is_enabled=enabled,
         )
         session.add(source)
@@ -188,7 +190,20 @@ def _service(session, *, engine=None, repository=None, uow=None, clock=None):
 
 
 def _coordinates(connection_id, partition=0, offset=0, topic="events"):
-    return KafkaCoordinates(connection_id, topic, partition, offset)
+    return KafkaCoordinates(connection_id, topic, partition, offset, "test-topic-id")
+
+
+def test_processing_rejects_record_without_verified_topic_identity(
+    processing_database, clean_processing_data
+):
+    connection_id, source_id, _ = _context(processing_database)
+    with processing_database.session_factory() as session:
+        service = _service(session)
+        with pytest.raises(ProcessingConfigurationError, match="kafka_coordinates_invalid"):
+            service.process(
+                source_id, KafkaCoordinates(connection_id, "events", 0, 0),
+                _payload(), RECEIVED_AT,
+            )
 
 
 def test_complete_partial_failed_and_status_dto(processing_database, clean_processing_data):

@@ -202,12 +202,52 @@ outcomes, so they can be committed and do not stop the source. Database, rule,
 configuration and Kafka failures are not committed; the affected partition is paused and
 retried, while other sources can continue. If PostgreSQL succeeded but Kafka commit failed,
 the repeat uses the durable ledger and returns `already_processed` before retrying commit.
+The worker rechecks the broker topic ID immediately before every first or retried offset
+commit, including after a durable database write. A changed ID archives the old source
+without committing its offset; an unavailable identity check delays commit and retries.
+Kafka metadata verification and offset commit are separate broker operations, not an
+atomic transaction: a topic replacement strictly between that last check and commit
+remains a residual race. The check narrows this window but cannot eliminate it.
 
 At creation and startup the application records and compares the broker topic UUID. A
-source with durable history stops safely rather than accepting a missing or changed topic
-identity, an unknown committed position, or a committed offset outside Kafka's currently
-available `[low, high]` range (for example after retention). It never silently seeks to
-`latest` or resets such history. A position equal to `high` waits for new records.
+committed next offset `N < low` for the *same verified topic ID* is a low-watermark gap. The
+worker first commits an append-only `logs.kafka_operational_events` row containing the
+source/connection snapshots, partition, topic ID and unavailable half-open offset range
+`[N, low)`, then explicitly assigns/seeks to `low`. It does not create synthetic log or
+processing-error rows for missing offsets. The range measures unavailable Kafka positions,
+not a proven count of lost log messages. On restart an existing interval is reused;
+further watermark movement adds only the uncovered extension. The cause of watermark
+movement (such as retention or administrative deletion) is not
+inferred from that observation alone. Sparse positions inside `[low, high)` are not
+classified as this gap; if a repeated seek cannot recover the expected message, only
+that partition stops with `offset_missing_within_watermarks`. If PostgreSQL cannot commit
+the event, no position advances and the partition retries while other partitions continue.
+`N == low` and `N == high` are not gaps. `N > high`, unknown committed position with
+durable history, contradictory metadata, missing topic ID and legacy ledger rows with a
+NULL topic ID remain fail-closed, not automatic retention recovery. An invalid position
+stops the affected partition while independently valid partitions continue.
+
+If Kafka reports a *new* topic ID under the old name, the worker atomically records a
+`topic_recreated` event and disables/archives the old source. Its historical events remain
+readable, but normal PATCH, normalizer change and enable cannot revive it. The topics list
+reports the replacement as `is_registered=false`; an administrator must explicitly create
+a new source (new UUID and consumer group), assign a normalizer, then enable it. The new
+registration also archives a stale disabled source and records the event in the same
+database transaction; a failure leaves the old source current and creates nothing. The
+new source starts at the earliest still available position. Ledger uniqueness and lookup use
+connection UUID, topic ID, partition and offset, so offsets reused by another generation
+do not produce false `already_processed`. Historical NULL-ID ledger rows are not guessed
+into a generation and require explicit resolution outside this automatic path.
+
+This deployment assumes one Kafka cluster. A cluster ID, not a bootstrap-server string,
+is bound to a connection when its first source is registered; another connection resolving
+to the same cluster cannot register a source (`409 cluster_connection_conflict`). Changing
+bootstrap/security settings is blocked while any source remains on that connection. Two
+addresses of one cluster cannot start independent consumers of the same physical topic.
+Only one application process with consumers enabled is supported; multi-cluster/HA ownership
+is not implemented. Migration `0007` adds the generation indexes and operational events.
+Its downgrade refuses to discard operational events, archived-source state or generations
+whose old coordinate key would collide; remove/resolve these deliberately before rollback.
 
 Shutdown asks workers to finish their current durable operation and close their Kafka
 consumer. Workers are non-daemon threads. If a worker exceeds the bounded shutdown wait,
@@ -415,8 +455,8 @@ offset)`, исходным payload в байтах и временем полу�
 конфигурации источника/правила либо ошибка PostgreSQL не считается обработанной
 записью и должна приводить к повтору, а не к продвижению будущего Kafka offset.
 
-`logs.processed_kafka_records` является общим durable-ledger для обоих исходов. Его
-уникальное ограничение охватывает UUID подключения, topic, partition и offset; тот же
+`logs.processed_kafka_records` является общим durable-ledger для обоих исходов. Для
+новых записей уникальный ключ охватывает UUID подключения, Kafka topic ID, partition и offset; тот же
 набор координат возвращает `already_processed`, в том числе после удаления
 `parsed_logs` через существующий API и после удаления конфигурационных сущностей.
 Результат, строка ledger и соответствующая запись события либо ошибки фиксируются одной
@@ -426,6 +466,5 @@ offset)`, исходным payload в байтах и временем полу�
 
 Миграция `0005` добавляет статусы и диагностику событий; исторические строки получают
 `complete` и пустой список причин, поскольку более точная классификация для них
-недоступна. Автоматические replay и retention не выполняются. Переиспользование offset
-после пересоздания Kafka-топика с новой идентичностью будет разрешаться на уровне
-consumer/Kafka metadata в TASK-8.
+недоступна. Автоматический replay учтённых ошибок не выполняется. Политики retention
+и смены поколения топика описаны в разделе Kafka consumers выше.

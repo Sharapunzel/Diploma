@@ -11,7 +11,6 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     Text,
-    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -106,9 +105,15 @@ class ProcessedKafkaRecord(Base):
 
     __tablename__ = "processed_kafka_records"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_processed_kafka_record_generation",
+            "connection_identity", "kafka_topic_identity", "kafka_partition", "kafka_offset",
+            unique=True, postgresql_where=text("kafka_topic_identity IS NOT NULL"),
+        ),
+        Index(
+            "uq_processed_kafka_record_legacy",
             "connection_identity", "kafka_topic", "kafka_partition", "kafka_offset",
-            name="uq_processed_kafka_record_coordinates",
+            unique=True, postgresql_where=text("kafka_topic_identity IS NULL"),
         ),
         CheckConstraint("btrim(kafka_topic) <> ''", name="topic_not_blank"),
         CheckConstraint("kafka_partition >= 0", name="partition_nonnegative"),
@@ -144,6 +149,57 @@ class ProcessedKafkaRecord(Base):
     )
     backend_processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+
+
+class KafkaOperationalEvent(Base):
+    __tablename__ = "kafka_operational_events"
+    __table_args__ = (
+        CheckConstraint("kind IN ('retention_gap', 'topic_recreated')", name="kind_valid"),
+        CheckConstraint("btrim(topic_name) <> ''", name="topic_not_blank"),
+        CheckConstraint("btrim(old_topic_identity) <> ''", name="old_identity_not_blank"),
+        CheckConstraint(
+            "(kind = 'retention_gap' AND kafka_partition >= 0 AND "
+            "offset_start >= 0 AND offset_end > offset_start AND new_topic_identity IS NULL) "
+            "OR (kind = 'topic_recreated' AND kafka_partition IS NULL AND "
+            "offset_start IS NULL AND offset_end IS NULL AND "
+            "new_topic_identity IS NOT NULL AND btrim(new_topic_identity) <> '' AND "
+            "new_topic_identity <> old_topic_identity)",
+            name="payload_valid",
+        ),
+        Index(
+            "uq_kafka_retention_gap", "source_identity", "old_topic_identity",
+            "kafka_partition", "offset_start", "offset_end", unique=True,
+            postgresql_where=text("kind = 'retention_gap'"),
+        ),
+        Index(
+            "uq_kafka_topic_recreated", "source_identity", "old_topic_identity",
+            "new_topic_identity", unique=True,
+            postgresql_where=text("kind = 'topic_recreated'"),
+        ),
+        Index("ix_kafka_operational_events_source_detected", "source_identity", "detected_at"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_code: Mapped[str] = mapped_column(Text, nullable=False)
+    source_id: Mapped[UUID | None] = mapped_column(ForeignKey("app.sources.id", ondelete="SET NULL"))
+    source_identity: Mapped[UUID] = mapped_column(nullable=False)
+    source_name: Mapped[str] = mapped_column(Text, nullable=False)
+    connection_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("app.kafka_connections.id", ondelete="SET NULL")
+    )
+    connection_identity: Mapped[UUID] = mapped_column(nullable=False)
+    connection_name: Mapped[str] = mapped_column(Text, nullable=False)
+    cluster_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_name: Mapped[str] = mapped_column(Text, nullable=False)
+    old_topic_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    new_topic_identity: Mapped[str | None] = mapped_column(Text)
+    kafka_partition: Mapped[int | None] = mapped_column(Integer)
+    offset_start: Mapped[int | None] = mapped_column(BigInteger)
+    offset_end: Mapped[int | None] = mapped_column(BigInteger)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
     )
 
 

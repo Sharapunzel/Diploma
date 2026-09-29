@@ -110,6 +110,7 @@ class KafkaTestResponse(BaseModel):
 class TopicDTO(BaseModel):
     name: str
     partition_count: int
+    is_registered: bool
 
 
 class TopicPage(BaseModel):
@@ -162,6 +163,7 @@ class SourceDTO(BaseModel):
     normalizer_id: UUID | None
     topic_name: str
     is_enabled: bool
+    is_archived: bool
     created_at: datetime
     updated_at: datetime
 

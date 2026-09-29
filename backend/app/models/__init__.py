@@ -8,12 +8,13 @@ from .app import (
     User,
 )
 from .auth import AuthSession
-from .logs import ParsedLog, ProcessedKafkaRecord, ProcessingError
+from .logs import KafkaOperationalEvent, ParsedLog, ProcessedKafkaRecord, ProcessingError
 
 __all__ = [
     "AppSetting",
     "AuthSession",
     "KafkaConnection",
+    "KafkaOperationalEvent",
     "Normalizer",
     "OidcRoleMapping",
     "ParsedLog",

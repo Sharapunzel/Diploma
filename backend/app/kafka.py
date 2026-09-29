@@ -1,6 +1,7 @@
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from threading import RLock
 from typing import Protocol
 
 
@@ -22,6 +23,7 @@ class KafkaMetadata:
     broker_count: int
     topics: tuple[KafkaTopic, ...]
     latency_ms: float
+    cluster_identity: str | None = None
 
 
 class KafkaMetadataError(Exception):
@@ -35,21 +37,36 @@ class KafkaMetadataClient(Protocol):
 
 
 class ConfluentKafkaMetadataClient:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._clients: dict[KafkaConnectionConfig, object] = {}
+        self._cluster_ids: dict[KafkaConnectionConfig, str | None] = {}
+
+    def _client(self, config: KafkaConnectionConfig):
+        from confluent_kafka.admin import AdminClient
+
+        with self._lock:
+            client = self._clients.get(config)
+            if client is None:
+                client = AdminClient(
+                    {
+                        "bootstrap.servers": ",".join(config.bootstrap_servers),
+                        "security.protocol": config.security_protocol,
+                        "allow.auto.create.topics": False,
+                    }
+                )
+                self._clients[config] = client
+            return client
+
     def metadata(self, config: KafkaConnectionConfig, timeout: float) -> KafkaMetadata:
         from time import perf_counter
 
         from confluent_kafka import KafkaError, KafkaException
-        from confluent_kafka.admin import AdminClient, _TopicCollection
+        from confluent_kafka.admin import _TopicCollection
 
         started = perf_counter()
         try:
-            client = AdminClient(
-                {
-                    "bootstrap.servers": ",".join(config.bootstrap_servers),
-                    "security.protocol": config.security_protocol,
-                    "allow.auto.create.topics": False,
-                }
-            )
+            client = self._client(config)
             cluster = client.list_topics(timeout=timeout)
             identities: dict[str, str] = {}
             describe_topics = getattr(client, "describe_topics", None)
@@ -78,10 +95,48 @@ class ConfluentKafkaMetadataClient:
             )
             for name, metadata in cluster.topics.items()
         )
+        cluster_id = getattr(cluster, "cluster_id", None)
+        with self._lock:
+            self._cluster_ids[config] = cluster_id
         return KafkaMetadata(
             broker_count=len(cluster.brokers),
             topics=topics,
             latency_ms=round((perf_counter() - started) * 1000, 3),
+            cluster_identity=cluster_id,
+        )
+
+    def metadata_for_topic(
+        self, config: KafkaConnectionConfig, topic_name: str, timeout: float
+    ) -> KafkaMetadata:
+        from time import perf_counter
+
+        from confluent_kafka import KafkaError, KafkaException
+        from confluent_kafka.admin import _TopicCollection
+
+        with self._lock:
+            cluster_id = self._cluster_ids.get(config)
+        if not cluster_id:
+            return self.metadata(config, timeout)
+        started = perf_counter()
+        try:
+            descriptions = self._client(config).describe_topics(
+                _TopicCollection([topic_name])
+            )
+            description = descriptions[topic_name].result(timeout)
+        except KafkaException as error:
+            code = getattr(error.args[0], "code", lambda: None)() if error.args else None
+            if code == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                return KafkaMetadata(0, (), round((perf_counter() - started) * 1000, 3), cluster_id)
+            raise KafkaMetadataError(
+                "timeout" if code == KafkaError._TIMED_OUT else "unavailable"
+            ) from error
+        except TimeoutError as error:
+            raise KafkaMetadataError("timeout") from error
+        return KafkaMetadata(
+            broker_count=0,
+            topics=(KafkaTopic(topic_name, len(description.partitions), str(description.topic_id)),),
+            latency_ms=round((perf_counter() - started) * 1000, 3),
+            cluster_identity=cluster_id,
         )
 
 

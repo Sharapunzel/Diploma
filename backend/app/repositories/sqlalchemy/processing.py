@@ -23,7 +23,7 @@ class SqlAlchemyProcessingRepository:
         return self.session.scalar(
             select(ProcessedKafkaRecord.result_status).where(
                 ProcessedKafkaRecord.connection_identity == coordinates.connection_id,
-                ProcessedKafkaRecord.kafka_topic == coordinates.topic,
+                ProcessedKafkaRecord.kafka_topic_identity == coordinates.kafka_topic_identity,
                 ProcessedKafkaRecord.kafka_partition == coordinates.partition,
                 ProcessedKafkaRecord.kafka_offset == coordinates.offset,
             )
@@ -50,6 +50,7 @@ class SqlAlchemyProcessingRepository:
             source is None
             or source.connection_id != connection_id
             or not source.is_enabled
+            or source.is_archived
             or source.normalizer_id is None
         ):
             return None
@@ -91,7 +92,13 @@ class SqlAlchemyProcessingRepository:
                 backend_processed_at=record.backend_processed_at,
             )
             .on_conflict_do_nothing(
-                constraint="uq_processed_kafka_record_coordinates"
+                index_elements=[
+                    ProcessedKafkaRecord.connection_identity,
+                    ProcessedKafkaRecord.kafka_topic_identity,
+                    ProcessedKafkaRecord.kafka_partition,
+                    ProcessedKafkaRecord.kafka_offset,
+                ],
+                index_where=ProcessedKafkaRecord.kafka_topic_identity.is_not(None),
             )
             .returning(ProcessedKafkaRecord.id)
         )

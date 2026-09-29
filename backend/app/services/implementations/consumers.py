@@ -7,6 +7,7 @@ from threading import Event, RLock, Thread
 from time import monotonic
 from uuid import UUID
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...kafka import (
@@ -24,7 +25,10 @@ from ...kafka import (
 from ...repositories.protocols.consumers import ConsumerSourceConfig
 from ...repositories.protocols.processing import KafkaCoordinates
 from ...repositories.sqlalchemy import SqlAlchemyUnitOfWork
-from ...repositories.sqlalchemy.consumers import SqlAlchemyConsumerStateRepository
+from ...repositories.sqlalchemy.consumers import (
+    RetentionGapConflict,
+    SqlAlchemyConsumerStateRepository,
+)
 from ...repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from ..protocols.processing import DurableProcessingService
 from .processing import (
@@ -76,6 +80,10 @@ class _SourceWorker:
         self.blocked: dict[int, tuple[KafkaMessage, str, float]] = {}
         self.buffered: dict[int, dict[int, KafkaMessage]] = defaultdict(dict)
         self.expected_offsets: dict[int, int] = {}
+        self.gap_paused: set[int] = set()
+        self.gap_retry_due: dict[int, float] = {}
+        self.sparse_seek_pending: dict[int, int] = {}
+        self.stopped_partitions: dict[int, str] = {}
 
     @property
     def state(self) -> ConsumerWorkerState:
@@ -118,13 +126,16 @@ class _SourceWorker:
             result = callback(repository, session)
             return result
 
-    def _topic_is_safe(self) -> bool:
+    def _topic_is_safe(self, *, full_metadata: bool = False) -> bool:
         try:
-            metadata = self.metadata_client.metadata(
-                KafkaConnectionConfig(
-                    self.config.bootstrap_servers, self.config.security_protocol
-                ),
-                self.metadata_timeout,
+            config = KafkaConnectionConfig(
+                self.config.bootstrap_servers, self.config.security_protocol
+            )
+            targeted = getattr(self.metadata_client, "metadata_for_topic", None)
+            metadata = (
+                targeted(config, self.config.topic_name, self.metadata_timeout)
+                if callable(targeted) and not full_metadata
+                else self.metadata_client.metadata(config, self.metadata_timeout)
             )
         except KafkaMetadataError:
             self._set_state("retrying", "kafka_metadata_unavailable")
@@ -134,15 +145,19 @@ class _SourceWorker:
             None,
         )
         if topic is None:
-            self._set_state("stopped", "topic_not_found")
+            self._set_state("retrying", "topic_not_found")
             return False
         identity = topic.identity
         if not isinstance(identity, str) or not identity.strip():
-            history = self._repository(
-                lambda repository, _: repository.has_durable_history(
-                    self.config.connection_id, self.config.topic_name
+            try:
+                history = self._repository(
+                    lambda repository, _: repository.has_durable_history(
+                        self.config.connection_id, self.config.topic_name
+                    )
                 )
-            )
+            except SQLAlchemyError:
+                self._set_state("retrying", "storage_unavailable")
+                return False
             self._set_state(
                 "stopped",
                 "topic_identity_unavailable_after_history"
@@ -151,12 +166,52 @@ class _SourceWorker:
             )
             return False
         stored = self.config.kafka_topic_identity
-        identities = self._repository(
-            lambda repository, _: repository.durable_topic_identities(
-                self.config.connection_id, self.config.topic_name
+        cluster_id = metadata.cluster_identity
+        if not isinstance(cluster_id, str) or not cluster_id.strip():
+            self._set_state("stopped", "cluster_identity_unavailable")
+            return False
+        try:
+            if not self._repository(
+                lambda repository, _: repository.bind_cluster(
+                    self.config.connection_id, cluster_id
+                )
+            ):
+                self._set_state("stopped", "cluster_identity_conflict")
+                return False
+            if self._repository(
+                lambda repository, _: repository.has_legacy_history(
+                    self.config.connection_id, self.config.topic_name
+                )
+            ):
+                self._set_state("stopped", "legacy_topic_identity_unknown")
+                return False
+            identities = self._repository(
+                lambda repository, _: repository.durable_topic_identities(
+                    self.config.source_id
+                )
             )
-        )
-        if identities and (stored is None or identities != {identity} or stored != identity):
+        except SQLAlchemyError:
+            self._set_state("retrying", "storage_unavailable")
+            return False
+        if stored is not None and stored != identity:
+            try:
+                def archive(repository, session):
+                    changed = repository.archive_recreated(
+                        self.config.source_id, stored, identity
+                    )
+                    if changed:
+                        session.commit()
+                    else:
+                        session.rollback()
+                    return changed
+
+                archived = self._repository(archive)
+            except SQLAlchemyError:
+                self._set_state("retrying", "storage_unavailable")
+                return False
+            self._set_state("stopped", "topic_recreated" if archived else "source_configuration_changed")
+            return False
+        if identities and (stored is None or identities != {identity}):
             self._set_state("stopped", "topic_identity_history_mismatch")
             return False
         if stored == identity:
@@ -172,7 +227,12 @@ class _SourceWorker:
                 session.rollback()
             return changed
 
-        if not self._repository(store_identity):
+        try:
+            changed = self._repository(store_identity)
+        except SQLAlchemyError:
+            self._set_state("retrying", "storage_unavailable")
+            return False
+        if not changed:
             self._set_state("stopped", "source_configuration_changed")
             return False
         self.config = replace(self.config, kafka_topic_identity=identity)
@@ -191,39 +251,115 @@ class _SourceWorker:
         try:
             committed = self.consumer.committed(requested, self.metadata_timeout)
             positions: list[KafkaPartition] = []
+            retry_assignment = False
             for partition, position in zip(requested, committed, strict=True):
+                if partition.partition in self.stopped_partitions:
+                    continue
+                partition_retry = False
                 low, high = self.consumer.watermarks(
                     partition.topic, partition.partition, self.metadata_timeout
                 )
-                if position is None:
-                    history = self._repository(
-                        lambda repository, _, partition_number=partition.partition: repository.has_durable_history(
+                try:
+                    known_end = self._repository(
+                        lambda repository, _, part=partition.partition: repository.known_gap_end(
                             self.config.connection_id,
-                            self.config.topic_name,
-                            partition_number,
+                            self.config.kafka_topic_identity,
+                            part,
                         )
                     )
+                except SQLAlchemyError:
+                    self._set_state("retrying", "retention_history_unavailable")
+                    retry_assignment = True
+                    continue
+                if known_end is not None and low < known_end:
+                    self._stop_partition(partition.partition, "retention_watermark_regressed")
+                    continue
+                if position is None:
+                    try:
+                        history = self._repository(
+                            lambda repository, _, partition_number=partition.partition: repository.has_durable_history(
+                                self.config.connection_id,
+                                self.config.topic_name,
+                                partition_number,
+                                self.config.kafka_topic_identity,
+                            )
+                        )
+                    except SQLAlchemyError:
+                        self._set_state("retrying", "retention_history_unavailable")
+                        retry_assignment = True
+                        continue
                     if history:
-                        self._set_state("stopped", "position_unknown_after_history")
+                        self._stop_partition(partition.partition, "position_unknown_after_history")
+                        continue
+                    position = low
+                if low < 0 or high < low or position > high:
+                    self._stop_partition(partition.partition, "position_outside_available_range")
+                    continue
+                while position < low:
+                    try:
+                        recorded = self._repository(
+                            lambda repository, _, part=partition.partition, start=position, end=low: repository.record_retention_gap(
+                                self.config.source_id,
+                                self.config.kafka_topic_identity,
+                                part,
+                                start,
+                                end,
+                            )
+                        )
+                    except RetentionGapConflict:
+                        self._stop_partition(partition.partition, "retention_watermark_regressed")
+                        break
+                    except SQLAlchemyError:
+                        self._set_state("retrying", "retention_gap_storage_unavailable")
+                        retry_assignment = True
+                        partition_retry = True
+                        break
+                    if not recorded:
+                        self._set_state("stopped", "source_configuration_changed")
                         self.stop_requested.set()
                         return False
                     position = low
-                if position < low or position > high:
-                    self._set_state("stopped", "position_outside_available_range")
-                    self.stop_requested.set()
-                    return False
+                    low, high = self.consumer.watermarks(
+                        partition.topic, partition.partition, self.metadata_timeout
+                    )
+                    if low < 0 or high < low:
+                        self._stop_partition(partition.partition, "position_outside_available_range")
+                        break
+                    if low < position:
+                        self._stop_partition(partition.partition, "retention_watermark_regressed")
+                        break
+                if partition_retry:
+                    continue
+                if partition.partition in self.stopped_partitions:
+                    continue
+                if low < 0 or high < low or position > high:
+                    self._stop_partition(partition.partition, "position_outside_available_range")
+                    continue
                 positions.append(
                     KafkaPartition(partition.topic, partition.partition, position)
                 )
-            self.consumer.assign(tuple(positions))
+            if positions:
+                self.consumer.assign(tuple(positions))
             self.expected_offsets = {
                 item.partition: item.offset for item in positions
             }
-            self._set_state("waiting")
-            return True
+            if not retry_assignment:
+                if not positions and self.stopped_partitions:
+                    self._set_state("stopped", "all_partitions_stopped")
+                    self.stop_requested.set()
+                else:
+                    self._set_state("waiting", "some_partitions_stopped" if self.stopped_partitions else None)
+            return not retry_assignment
         except KafkaConsumerError:
             self._set_state("retrying", "kafka_position_unavailable")
             return False
+
+    def _stop_partition(self, partition: int, reason: str) -> None:
+        self.stopped_partitions[partition] = reason
+        LOGGER.error(
+            "kafka_partition_stopped",
+            extra={"source_id": str(self.config.source_id), "partition": partition, "reason": reason},
+        )
 
     def _block(self, message: KafkaMessage, action: str) -> None:
         assert self.consumer is not None
@@ -247,6 +383,14 @@ class _SourceWorker:
             marker = KafkaPartition(message.topic, partition, message.offset)
             try:
                 if action == "commit":
+                    if not self._topic_is_safe():
+                        if self.state.status == "stopped":
+                            self.stop_requested.set()
+                            return
+                        self.blocked[partition] = (
+                            message, action, monotonic() + self.retry_delay
+                        )
+                        continue
                     self.consumer.commit(
                         (KafkaPartition(message.topic, partition, message.offset + 1),),
                         self.metadata_timeout,
@@ -266,25 +410,125 @@ class _SourceWorker:
                 self._set_state("retrying", "kafka_commit_unavailable")
 
     def _handle_message(self, message: KafkaMessage) -> None:
+        if message.partition in self.stopped_partitions:
+            return
         expected = self.expected_offsets.get(message.partition)
+        if (
+            expected is not None
+            and message.offset > expected
+            and self.sparse_seek_pending.get(message.partition) == expected
+        ):
+            self._stop_partition(message.partition, "offset_missing_within_watermarks")
+            assert self.consumer is not None
+            self.consumer.pause((KafkaPartition(message.topic, message.partition, expected),))
+            self.buffered.pop(message.partition, None)
+            self.sparse_seek_pending.pop(message.partition, None)
+            if len(self.stopped_partitions) == len(self.expected_offsets):
+                self._set_state("stopped", "all_partitions_stopped")
+                self.stop_requested.set()
+            return
+        if expected is not None and message.offset == expected:
+            self.sparse_seek_pending.pop(message.partition, None)
         if expected is None or message.offset > expected or message.partition in self.blocked:
             self.buffered[message.partition][message.offset] = message
+            if expected is not None and message.offset > expected and message.partition not in self.gap_paused:
+                assert self.consumer is not None
+                try:
+                    self.consumer.pause((KafkaPartition(message.topic, message.partition, message.offset),))
+                    self.gap_paused.add(message.partition)
+                except KafkaConsumerError:
+                    self._set_state("retrying", "kafka_pause_unavailable")
             return
         if message.offset < expected:
             return
         self._set_state("processing")
         self._process(message)
 
-    def _drain_buffered(self) -> None:
+    def _drain_buffered(self) -> bool:
         for partition, messages in tuple(self.buffered.items()):
+            if partition in self.stopped_partitions:
+                del self.buffered[partition]
+                continue
             if partition in self.blocked:
                 continue
+            if self.gap_retry_due.get(partition, 0) > monotonic():
+                continue
             expected = self.expected_offsets.get(partition)
+            if expected is not None and messages and min(messages) > expected:
+                if self.sparse_seek_pending.get(partition) == expected:
+                    continue
+                assert self.consumer is not None
+                try:
+                    low, high = self.consumer.watermarks(
+                        self.config.topic_name, partition, self.metadata_timeout
+                    )
+                    known_end = self._repository(
+                        lambda repository, _, part=partition: repository.known_gap_end(
+                            self.config.connection_id,
+                            self.config.kafka_topic_identity,
+                            part,
+                        )
+                    )
+                    if known_end is not None and low < known_end:
+                        self._stop_partition(partition, "retention_watermark_regressed")
+                        self.consumer.pause((KafkaPartition(self.config.topic_name, partition, expected),))
+                        del self.buffered[partition]
+                        if len(self.stopped_partitions) == len(self.expected_offsets):
+                            self._set_state("stopped", "all_partitions_stopped")
+                            self.stop_requested.set()
+                            return False
+                        continue
+                    if low < 0 or high < low or expected > high:
+                        self._stop_partition(partition, "position_outside_available_range")
+                        self.consumer.pause((KafkaPartition(self.config.topic_name, partition, expected),))
+                        del self.buffered[partition]
+                        if len(self.stopped_partitions) == len(self.expected_offsets):
+                            self._set_state("stopped", "all_partitions_stopped")
+                            self.stop_requested.set()
+                            return False
+                        continue
+                    recovered = max(expected, low)
+                    if low > expected:
+                        recorded = self._repository(
+                            lambda repository, _, start=expected, end=low, part=partition: repository.record_retention_gap(
+                                self.config.source_id,
+                                self.config.kafka_topic_identity,
+                                part, start, end,
+                            )
+                        )
+                        if not recorded:
+                            self._set_state("stopped", "source_configuration_changed")
+                            self.stop_requested.set()
+                            return False
+                    else:
+                        self.sparse_seek_pending[partition] = expected
+                    self.consumer.seek(KafkaPartition(self.config.topic_name, partition, recovered))
+                    if partition in self.gap_paused:
+                        self.consumer.resume((KafkaPartition(self.config.topic_name, partition, recovered),))
+                        self.gap_paused.remove(partition)
+                    self.expected_offsets[partition] = recovered
+                    expected = recovered
+                    for old_offset in tuple(messages):
+                        if old_offset < recovered:
+                            del messages[old_offset]
+                    self.gap_retry_due.pop(partition, None)
+                except RetentionGapConflict:
+                    self._stop_partition(partition, "retention_watermark_regressed")
+                    del self.buffered[partition]
+                    continue
+                except (SQLAlchemyError, KafkaConsumerError):
+                    self._set_state("retrying", "gap_recovery_unavailable")
+                    self.gap_retry_due[partition] = monotonic() + self.retry_delay
+                    continue
             message = messages.pop(expected, None) if expected is not None else None
             if message is not None:
+                if not self._topic_is_safe():
+                    messages[message.offset] = message
+                    return False
                 self._handle_message(message)
             if not messages:
                 del self.buffered[partition]
+        return True
 
     def _process(self, message: KafkaMessage) -> None:
         assert self.consumer is not None
@@ -322,6 +566,12 @@ class _SourceWorker:
             self._set_state("retrying", "processing_not_durable")
             self._block(message, "process")
             return
+        if not self._topic_is_safe():
+            if self.state.status == "stopped":
+                self.stop_requested.set()
+            else:
+                self._block(message, "commit")
+            return
         try:
             self.consumer.commit(
                 (KafkaPartition(message.topic, message.partition, message.offset + 1),),
@@ -355,14 +605,32 @@ class _SourceWorker:
                     self._set_state("retrying", "kafka_consumer_unavailable")
                     self.stop_requested.wait(self.retry_delay)
             pending_assignment: KafkaAssignment | None = None
+            assignment_retry_at = monotonic()
+            next_identity_check = monotonic()
             while not self.stop_requested.is_set() and self.consumer is not None:
+                if monotonic() >= next_identity_check:
+                    if not self._topic_is_safe(full_metadata=True):
+                        if self.state.status == "stopped":
+                            return
+                        self.stop_requested.wait(self.retry_delay)
+                        continue
+                    next_identity_check = monotonic() + max(self.poll_timeout, self.retry_delay, 1)
                 self._retry_blocked()
-                self._drain_buffered()
-                if pending_assignment is not None:
+                if not self._drain_buffered():
+                    if self.state.status == "stopped":
+                        return
+                    self.stop_requested.wait(self.retry_delay)
+                    continue
+                if pending_assignment is not None and monotonic() >= assignment_retry_at:
                     if self._assign(pending_assignment):
                         pending_assignment = None
                     elif not self.stop_requested.is_set():
-                        self.stop_requested.wait(self.retry_delay)
+                        assignment_retry_at = monotonic() + self.retry_delay
+                        if not self.expected_offsets:
+                            self.stop_requested.wait(self.retry_delay)
+                    continue
+                if pending_assignment is not None and not self.expected_offsets:
+                    self.stop_requested.wait(self.retry_delay)
                     continue
                 try:
                     event = self.consumer.poll(self.poll_timeout)
@@ -374,17 +642,26 @@ class _SourceWorker:
                     continue
                 if isinstance(event, KafkaAssignment):
                     pending_assignment = event
+                    assignment_retry_at = monotonic()
                 elif isinstance(event, KafkaRevocation):
                     self.blocked.clear()
                     self.buffered.clear()
                     self.expected_offsets.clear()
+                    self.gap_paused.clear()
+                    self.gap_retry_due.clear()
+                    self.sparse_seek_pending.clear()
                     try:
                         self.consumer.unassign()
                     except KafkaConsumerError:
                         self._set_state("retrying", "kafka_revoke_unavailable")
                     self._set_state("waiting")
                 elif isinstance(event, KafkaMessage) and event.topic == self.config.topic_name:
-                    self._handle_message(event)
+                    if self._topic_is_safe():
+                        self._handle_message(event)
+                    elif self.state.status == "stopped":
+                        return
+                    else:
+                        self.buffered[event.partition][event.offset] = event
         except Exception:
             LOGGER.exception(
                 "kafka_consumer_unexpected_failure",

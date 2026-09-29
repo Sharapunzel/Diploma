@@ -194,12 +194,17 @@ class KafkaConnection(TimestampMixin, Base):
         CheckConstraint(
             "jsonb_typeof(extra_config) = 'object'", name="extra_config_object"
         ),
+        Index(
+            "uq_kafka_connections_cluster_identity", "cluster_identity",
+            unique=True, postgresql_where=text("cluster_identity IS NOT NULL"),
+        ),
         {"schema": "app"},
     )
     id: Mapped[UUID] = mapped_column(
         primary_key=True, server_default=text("gen_random_uuid()")
     )
     name: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    cluster_identity: Mapped[str | None] = mapped_column(Text)
     bootstrap_servers: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
     security_protocol: Mapped[str] = mapped_column(
         Text, server_default=text("'PLAINTEXT'"), nullable=False
@@ -212,7 +217,15 @@ class KafkaConnection(TimestampMixin, Base):
 class Source(TimestampMixin, Base):
     __tablename__ = "sources"
     __table_args__ = (
-        UniqueConstraint("connection_id", "topic_name"),
+        Index(
+            "uq_sources_current_connection_topic", "connection_id", "topic_name",
+            unique=True, postgresql_where=text("is_archived = false"),
+        ),
+        Index(
+            "uq_sources_current_topic_identity", "connection_id", "kafka_topic_identity",
+            unique=True,
+            postgresql_where=text("is_archived = false AND kafka_topic_identity IS NOT NULL"),
+        ),
         CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
         CheckConstraint("btrim(topic_name) <> ''", name="topic_name_not_blank"),
         Index("ix_sources_connection_id", "connection_id"),
@@ -231,6 +244,9 @@ class Source(TimestampMixin, Base):
     )
     topic_name: Mapped[str] = mapped_column(Text, nullable=False)
     kafka_topic_identity: Mapped[str | None] = mapped_column(Text)
+    is_archived: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )
     is_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), nullable=False
     )

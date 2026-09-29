@@ -37,20 +37,42 @@ class SqlAlchemyKafkaConnectionRepository:
         return self.session.get(KafkaConnection, connection_id)
 
     def find_by_id_for_update(self, connection_id: UUID) -> KafkaConnection | None:
-        statement = select(KafkaConnection).where(KafkaConnection.id == connection_id).with_for_update()
+        statement = (
+            select(KafkaConnection).where(KafkaConnection.id == connection_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
         return self.session.scalar(statement)
 
     def has_enabled_sources(self, connection_id: UUID) -> bool:
         return bool(
             self.session.scalar(
-                select(Source.id).where(Source.connection_id == connection_id, Source.is_enabled.is_(True)).limit(1)
+            select(Source.id).where(Source.connection_id == connection_id, Source.is_enabled.is_(True)).limit(1)
             )
         )
+
+    def has_sources(self, connection_id: UUID) -> bool:
+        return bool(self.session.scalar(
+            select(Source.id).where(Source.connection_id == connection_id).limit(1)
+        ))
 
     def add(self, connection: KafkaConnection) -> KafkaConnection:
         self.session.add(connection)
         self.session.flush()
         return connection
+
+    def bind_cluster(self, connection: KafkaConnection, cluster_id: str) -> None:
+        if connection.cluster_identity is not None and connection.cluster_identity != cluster_id:
+            raise ValueError("cluster_identity_changed")
+        connection.cluster_identity = cluster_id
+        self.session.flush()
+
+    def current_topic_ids(self, connection_id: UUID) -> dict[str, str | None]:
+        rows = self.session.execute(
+            select(Source.topic_name, Source.kafka_topic_identity).where(
+                Source.connection_id == connection_id, Source.is_archived.is_(False)
+            )
+        )
+        return {topic_name: topic_id for topic_name, topic_id in rows}
 
     def update(self, connection: KafkaConnection, values: Mapping[str, object], at: datetime) -> None:
         for key, value in values.items():
@@ -100,8 +122,29 @@ class SqlAlchemySourceRepository:
         return self.session.get(Source, source_id)
 
     def find_by_id_for_update(self, source_id: UUID) -> Source | None:
-        statement = select(Source).where(Source.id == source_id).with_for_update()
+        statement = (
+            select(Source).where(Source.id == source_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
         return self.session.scalar(statement)
+
+    def find_current_by_topic_for_update(
+        self, connection_id: UUID, topic_name: str
+    ) -> Source | None:
+        return self.session.scalar(
+            select(Source).where(
+                Source.connection_id == connection_id,
+                Source.topic_name == topic_name,
+                Source.is_archived.is_(False),
+            ).with_for_update().execution_options(populate_existing=True)
+        )
+
+    def archive_recreated(self, source_id: UUID, old_id: str, new_id: str) -> bool:
+        from .consumers import SqlAlchemyConsumerStateRepository
+
+        return SqlAlchemyConsumerStateRepository(self.session).archive_recreated(
+            source_id, old_id, new_id
+        )
 
     def add(self, source: Source) -> Source:
         self.session.add(source)

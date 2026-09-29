@@ -283,6 +283,8 @@ class DurableProcessingServiceImpl:
             raise ProcessingConfigurationError("payload_must_be_bytes")
         if (
             not coordinates.topic.strip()
+            or not isinstance(coordinates.kafka_topic_identity, str)
+            or not coordinates.kafka_topic_identity.strip()
             or coordinates.partition < 0
             or coordinates.offset < 0
         ):
@@ -300,6 +302,7 @@ class DurableProcessingServiceImpl:
             context.source_id != source_id
             or context.connection_id != coordinates.connection_id
             or context.topic != coordinates.topic
+            or context.kafka_topic_identity != coordinates.kafka_topic_identity
             or context.normalizer_version < 1
             or not context.connection_name.strip()
             or not context.source_name.strip()
