@@ -47,6 +47,7 @@ from .services.protocols.administration import (
     UserAdministrationService,
 )
 from .services.protocols.connections import KafkaConnectionService, SourceService
+from .services.protocols.consumers import SourceConsumerLifecycle
 from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
 from .services.protocols.processing import DurableProcessingService
@@ -86,6 +87,10 @@ def get_oidc_client(request: Request) -> OidcClient:
 
 def get_kafka_client(request: Request) -> KafkaMetadataClient:
     return request.app.state.kafka_client
+
+
+def get_consumer_lifecycle(request: Request) -> SourceConsumerLifecycle:
+    return request.app.state.kafka_consumer_supervisor
 
 
 def get_ecs_catalog(request: Request) -> EcsCatalog:
@@ -225,18 +230,25 @@ def get_normalizer_admin(
 
 
 def build_connection_service(
-    session: Session, app_settings: Settings, client: KafkaMetadataClient
+    session: Session,
+    app_settings: Settings,
+    client: KafkaMetadataClient,
+    lifecycle: SourceConsumerLifecycle | None = None,
 ) -> KafkaConnectionService:
     return KafkaConnectionServiceImpl(
         SqlAlchemyKafkaConnectionRepository(session),
         SqlAlchemyUnitOfWork(session),
         client,
         app_settings.kafka_metadata_timeout_seconds,
+        lifecycle,
     )
 
 
 def build_source_service(
-    session: Session, app_settings: Settings, client: KafkaMetadataClient
+    session: Session,
+    app_settings: Settings,
+    client: KafkaMetadataClient,
+    lifecycle: SourceConsumerLifecycle | None = None,
 ) -> SourceService:
     return SourceServiceImpl(
         SqlAlchemySourceRepository(session),
@@ -245,20 +257,27 @@ def build_source_service(
         SqlAlchemyUnitOfWork(session),
         client,
         app_settings.kafka_metadata_timeout_seconds,
+        lifecycle,
     )
 
 
 def get_connection_service(
+    request: Request,
     session: Session = Depends(get_session),
     app_settings: Settings = Depends(get_settings),
     client: KafkaMetadataClient = Depends(get_kafka_client),
 ) -> KafkaConnectionService:
-    return build_connection_service(session, app_settings, client)
+    return build_connection_service(
+        session, app_settings, client, get_consumer_lifecycle(request)
+    )
 
 
 def get_source_service(
+    request: Request,
     session: Session = Depends(get_session),
     app_settings: Settings = Depends(get_settings),
     client: KafkaMetadataClient = Depends(get_kafka_client),
 ) -> SourceService:
-    return build_source_service(session, app_settings, client)
+    return build_source_service(
+        session, app_settings, client, get_consumer_lifecycle(request)
+    )

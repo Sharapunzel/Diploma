@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     session_touch_interval_seconds: int = 60
     trusted_hosts: list[str] = []
     kafka_metadata_timeout_seconds: int = 5
+    kafka_consumers_enabled: bool = True
+    kafka_consumer_poll_timeout_seconds: float = 1.0
+    kafka_consumer_retry_delay_seconds: float = 2.0
+    kafka_supervisor_sync_seconds: float = 1.0
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
     @field_validator("cors_origins", "oidc_scopes", "trusted_hosts", mode="before")
@@ -53,6 +57,12 @@ class Settings(BaseSettings):
             raise ValueError("TTL values must be positive")
         if not 1 <= self.kafka_metadata_timeout_seconds <= 30:
             raise ValueError("kafka metadata timeout must be between 1 and 30 seconds")
+        if not 0.1 <= self.kafka_consumer_poll_timeout_seconds <= 30:
+            raise ValueError("kafka consumer poll timeout must be between 0.1 and 30 seconds")
+        if not 0.1 <= self.kafka_consumer_retry_delay_seconds <= 60:
+            raise ValueError("kafka consumer retry delay must be between 0.1 and 60 seconds")
+        if not 0.1 <= self.kafka_supervisor_sync_seconds <= 60:
+            raise ValueError("kafka supervisor sync interval must be between 0.1 and 60 seconds")
         if self.oidc_enabled:
             required = (self.oidc_issuer_url, self.oidc_client_id,
                         self.oidc_client_secret, self.oidc_redirect_uri)

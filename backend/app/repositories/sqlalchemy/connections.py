@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from ...models import KafkaConnection, Source
+from ...models import KafkaConnection, ProcessedKafkaRecord, Source
 
 
 def _like(value: str) -> str:
@@ -115,3 +115,17 @@ class SqlAlchemySourceRepository:
 
     def delete(self, source: Source) -> None:
         self.session.delete(source)
+
+    def has_durable_history(self, connection_id: UUID, topic_name: str) -> bool:
+        from sqlalchemy import exists
+
+        return bool(
+            self.session.scalar(
+                select(
+                    exists().where(
+                        ProcessedKafkaRecord.connection_identity == connection_id,
+                        ProcessedKafkaRecord.kafka_topic == topic_name,
+                    )
+                )
+            )
+        )

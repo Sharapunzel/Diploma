@@ -3,15 +3,17 @@ import time
 from uuid import uuid4
 
 import pytest
-from confluent_kafka import KafkaError, KafkaException
-from confluent_kafka.admin import AdminClient, NewTopic
+from confluent_kafka import KafkaError, KafkaException, Producer, TopicPartition
+from confluent_kafka.admin import AdminClient, NewTopic, _ConsumerGroupTopicPartitions
 from fastapi.testclient import TestClient
-from test_auth_foundation import admin_headers, create_normalizer
+from sqlalchemy import select
+from test_auth_foundation import admin_headers, create_normalizer, login
 
 from app.config import Settings
 from app.db import Database
 from app.kafka import ConfluentKafkaMetadataClient, KafkaConnectionConfig, KafkaMetadataError
 from app.main import create_app
+from app.models import ParsedLog, ProcessedKafkaRecord
 
 
 @pytest.fixture(scope="module")
@@ -118,6 +120,144 @@ def test_real_kafka_api_source_lifecycle(integration_client, integration_databas
                 delete_error = error
         if delete_error is not None:
             raise delete_error
+
+
+def test_real_kafka_consumer_persists_before_offset_commit(integration_database):
+    from test_auth_foundation import clear_auth_state, run_alembic
+
+    bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
+    topic_name = f"diploma-task8-{uuid4().hex}"
+    admin = AdminClient({"bootstrap.servers": bootstrap, "security.protocol": "PLAINTEXT"})
+    admin.create_topics([
+        NewTopic(topic_name, num_partitions=1, replication_factor=1)
+    ])[topic_name].result(10)
+    run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
+    clear_auth_state(integration_database)
+    settings = Settings(
+        environment="test",
+        database_url=os.environ["TEST_DATABASE_URL"],
+        kafka_consumer_poll_timeout_seconds=0.1,
+        kafka_consumer_retry_delay_seconds=0.1,
+        kafka_supervisor_sync_seconds=0.1,
+    )
+    connection_id = None
+    source_id = None
+    consumer_group = None
+    try:
+        with TestClient(
+            create_app(settings, database=integration_database, start_consumers=True)
+        ) as client:
+            headers = admin_headers(client, integration_database)
+            connection = client.post(
+                "/api/v1/kafka-connections",
+                json={"name": f"task8-{uuid4().hex}", "bootstrap_servers": [bootstrap]},
+                headers=headers,
+            )
+            assert connection.status_code == 201, connection.text
+            connection_id = connection.json()["id"]
+            normalizer = create_normalizer(client, headers, f"task8-{uuid4().hex}")
+            source = client.post(
+                "/api/v1/sources",
+                json={
+                    "name": f"task8-source-{uuid4().hex}",
+                    "connection_id": connection_id,
+                    "topic_name": topic_name,
+                },
+                headers=headers,
+            )
+            assert source.status_code == 201, source.text
+            source_id = source.json()["id"]
+            consumer_group = f"diploma-source-{source_id}"
+            assert client.put(
+                f"/api/v1/sources/{source_id}/normalizer",
+                json={"normalizer_id": normalizer["id"]},
+                headers=headers,
+            ).status_code == 200
+            assert client.post(
+                f"/api/v1/sources/{source_id}/enable", headers=headers
+            ).status_code == 200
+            producer = Producer({"bootstrap.servers": bootstrap})
+            producer.produce(
+                topic_name,
+                b'{"timestamp":"2026-03-02T11:59:00Z","log":"real event"}',
+            )
+            assert producer.flush(10) == 0
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                with integration_database.session_factory() as session:
+                    stored = session.scalar(
+                        select(ParsedLog).where(ParsedLog.source_id == source_id)
+                    )
+                    record = session.scalar(
+                        select(ProcessedKafkaRecord).where(
+                            ProcessedKafkaRecord.source_id == source_id
+                        )
+                    )
+                if stored is not None and record is not None:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("Kafka message was not stored durably")
+            assert stored.kafka_offset == 0
+            assert record.result_status in {"complete", "partial"}
+        assert consumer_group is not None
+
+        def committed_offset() -> int:
+            request = _ConsumerGroupTopicPartitions(
+                consumer_group, [TopicPartition(topic_name, 0)]
+            )
+            offsets = admin.list_consumer_group_offsets([request])[consumer_group].result(10)
+            partition = next(
+                item for item in offsets.topic_partitions
+                if item.topic == topic_name and item.partition == 0
+            )
+            return partition.offset
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and committed_offset() != 1:
+            time.sleep(0.1)
+        assert committed_offset() == 1
+
+        with TestClient(
+            create_app(settings, database=integration_database, start_consumers=True)
+        ) as restarted_client:
+            assert login(restarted_client, "admin").status_code == 200
+            restarted_headers = {
+                "X-CSRF-Token": restarted_client.get(
+                    "/api/v1/auth/session"
+                ).json()["csrf_token"]
+            }
+            producer = Producer({"bootstrap.servers": bootstrap})
+            producer.produce(
+                topic_name,
+                b'{"timestamp":"2026-03-02T11:59:00Z","log":"after restart"}',
+            )
+            assert producer.flush(10) == 0
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                with integration_database.session_factory() as session:
+                    resumed = session.scalar(
+                        select(ParsedLog).where(
+                            ParsedLog.source_id == source_id,
+                            ParsedLog.kafka_offset == 1,
+                        )
+                    )
+                if resumed is not None:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("consumer did not resume from confirmed offset")
+            assert restarted_client.post(
+                f"/api/v1/sources/{source_id}/disable", headers=restarted_headers
+            ).status_code == 200
+        assert committed_offset() == 2
+    finally:
+        clear_auth_state(integration_database)
+        try:
+            admin.delete_topics([topic_name])[topic_name].result(10)
+        except KafkaException as error:
+            if error.args[0].code() != KafkaError.UNKNOWN_TOPIC_OR_PART:
+                raise
 
 
 def test_kafka_timeout_and_unexpected_errors_are_classified(monkeypatch):

@@ -18,6 +18,7 @@ from ...schemas.connections import (
     SourceNormalizerUpdate,
     SourcePatch,
 )
+from ..protocols.consumers import SourceConsumerLifecycle
 
 
 def current_time() -> datetime:
@@ -50,8 +51,16 @@ def executable_rule(rule: object) -> bool:
 
 
 class KafkaConnectionServiceImpl:
-    def __init__(self, repository: KafkaConnectionRepository, uow: UnitOfWork, client: KafkaMetadataClient, timeout: int) -> None:
+    def __init__(
+        self,
+        repository: KafkaConnectionRepository,
+        uow: UnitOfWork,
+        client: KafkaMetadataClient,
+        timeout: int,
+        lifecycle: SourceConsumerLifecycle | None = None,
+    ) -> None:
         self.repository, self.uow, self.client, self.timeout = repository, uow, client, timeout
+        self.lifecycle = lifecycle
 
     def list(self, query: str | None, limit: int, offset: int) -> tuple[list[KafkaConnection], int]:
         return self.repository.list(query, limit, offset)
@@ -106,6 +115,8 @@ class KafkaConnectionServiceImpl:
         try:
             self.repository.delete(connection)
             self.uow.commit()
+            if self.lifecycle is not None:
+                self.lifecycle.wake()
         except Exception:
             self.uow.rollback()
             raise
@@ -134,9 +145,19 @@ class KafkaConnectionServiceImpl:
 
 
 class SourceServiceImpl:
-    def __init__(self, sources: SourceRepository, connections: KafkaConnectionRepository, normalizers: NormalizerRepository, uow: UnitOfWork, client: KafkaMetadataClient, timeout: int) -> None:
+    def __init__(
+        self,
+        sources: SourceRepository,
+        connections: KafkaConnectionRepository,
+        normalizers: NormalizerRepository,
+        uow: UnitOfWork,
+        client: KafkaMetadataClient,
+        timeout: int,
+        lifecycle: SourceConsumerLifecycle | None = None,
+    ) -> None:
         self.sources, self.connections, self.normalizers = sources, connections, normalizers
         self.uow, self.client, self.timeout = uow, client, timeout
+        self.lifecycle = lifecycle
 
     def list(self, query, connection_id, normalizer_id, is_enabled, limit, offset):
         return self.sources.list(query, connection_id, normalizer_id, is_enabled, limit, offset)
@@ -153,21 +174,31 @@ class SourceServiceImpl:
             fail("connection_not_found", "Kafka connection not found")
         return connection
 
-    def _check_topic(self, connection: KafkaConnection, topic_name: str) -> None:
+    def _check_topic(self, connection: KafkaConnection, topic_name: str):
         config = KafkaConnectionConfig(tuple(connection.bootstrap_servers), connection.security_protocol)
         self.uow.rollback()
         metadata = metadata_for(self.client, config, self.timeout)
-        if not any(topic.name == topic_name for topic in metadata.topics):
+        topic = next((item for item in metadata.topics if item.name == topic_name), None)
+        if topic is None:
             fail("topic_not_found", "Kafka topic not found", 404)
+        return topic
 
     def create(self, data: SourceCreate) -> Source:
         connection = self._connection(data.connection_id)
         snapshot = (connection.id, tuple(connection.bootstrap_servers), connection.security_protocol, data.topic_name)
-        self._check_topic(connection, data.topic_name)
+        topic = self._check_topic(connection, data.topic_name)
         connection = self.connections.find_by_id_for_update(snapshot[0])
         if connection is None or (connection.id, tuple(connection.bootstrap_servers), connection.security_protocol, data.topic_name) != snapshot:
             fail("source_configuration_changed", "Connection configuration changed during Kafka check", 409)
-        source = Source(id=data.id, name=data.name, connection_id=connection.id, topic_name=data.topic_name, is_enabled=False, normalizer_id=None)
+        source = Source(
+            id=data.id,
+            name=data.name,
+            connection_id=connection.id,
+            topic_name=data.topic_name,
+            kafka_topic_identity=topic.identity,
+            is_enabled=False,
+            normalizer_id=None,
+        )
         try:
             self.sources.add(source)
             self.uow.commit()
@@ -191,7 +222,7 @@ class SourceServiceImpl:
             connection = self._connection(target_connection_id)
             snapshot = (source.id, source.connection_id, source.topic_name, source.is_enabled,
                         connection.id, tuple(connection.bootstrap_servers), connection.security_protocol, target_topic)
-            self._check_topic(connection, target_topic)
+            topic = self._check_topic(connection, target_topic)
             old_connection_id = snapshot[1]
             checked_target_connection_id = snapshot[4]
             connection_ids = sorted(
@@ -213,6 +244,14 @@ class SourceServiceImpl:
                 fail("source_configuration_changed", "Source configuration changed during Kafka check", 409)
             if source.is_enabled:
                 fail("source_enabled", "Enabled source connection or topic cannot change", 409)
+            old_history = self.sources.has_durable_history(
+                source.connection_id, source.topic_name
+            )
+            target_history = self.sources.has_durable_history(
+                target_connection_id, target_topic
+            )
+            if not old_history and not target_history:
+                values["kafka_topic_identity"] = topic.identity
         try:
             self.sources.update(source, values, current_time())
             self.uow.commit()
@@ -230,6 +269,8 @@ class SourceServiceImpl:
         try:
             self.sources.delete(source)
             self.uow.commit()
+            if self.lifecycle is not None:
+                self.lifecycle.stop_source(source_id)
         except Exception:
             self.uow.rollback()
             raise
@@ -278,6 +319,8 @@ class SourceServiceImpl:
         try:
             self.sources.update(source, {"is_enabled": True}, current_time())
             self.uow.commit()
+            if self.lifecycle is not None:
+                self.lifecycle.wake()
             return source
         except Exception:
             self.uow.rollback()
@@ -290,6 +333,8 @@ class SourceServiceImpl:
         try:
             self.sources.update(source, {"is_enabled": False}, current_time())
             self.uow.commit()
+            if self.lifecycle is not None:
+                self.lifecycle.stop_source(source_id)
             return source
         except Exception:
             self.uow.rollback()

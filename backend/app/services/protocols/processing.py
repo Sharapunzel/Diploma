@@ -21,6 +21,6 @@ class DurableProcessingService(Protocol):
         self,
         source_id: UUID,
         coordinates: KafkaCoordinates,
-        payload: bytes,
+        payload: bytes | None,
         received_at: datetime,
     ) -> ProcessMessageResult: ...

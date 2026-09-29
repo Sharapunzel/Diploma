@@ -17,9 +17,14 @@ from .core.errors import DomainError
 from .db import Database
 from .dependencies import build_auth_service, get_settings
 from .ecs import EcsCatalog, PackagedEcsCatalog
-from .kafka import ConfluentKafkaMetadataClient
+from .kafka import (
+    ConfluentKafkaConsumerFactory,
+    ConfluentKafkaMetadataClient,
+    KafkaConsumerFactory,
+)
 from .normalization.engine import NormalizationEngine
 from .oidc import AuthlibOidcClient
+from .services.implementations.consumers import KafkaSourceSupervisor
 
 REQUEST_LOG = logging.getLogger("app.request")
 ERROR_LOG = logging.getLogger("app.error")
@@ -66,24 +71,58 @@ def create_app(
     oidc_client=None,
     kafka_client=None,
     ecs_catalog: EcsCatalog | None = None,
+    consumer_factory: KafkaConsumerFactory | None = None,
+    start_consumers: bool | None = None,
 ) -> FastAPI:
     current = config or settings
     owned_database = database is None
     configured_database = database or Database(current.database_url)
+    configured_kafka_client = kafka_client or ConfluentKafkaMetadataClient()
+    configured_catalog = ecs_catalog if ecs_catalog is not None else PackagedEcsCatalog.load()
+    configured_engine = NormalizationEngine(configured_catalog)
+
+    consumers_enabled = (
+        current.kafka_consumers_enabled and current.environment != "test"
+        if start_consumers is None
+        else start_consumers
+    )
+    supervisor = KafkaSourceSupervisor(
+        configured_database.session_factory,
+        configured_engine,
+        configured_kafka_client,
+        consumer_factory
+        or ConfluentKafkaConsumerFactory(current.kafka_metadata_timeout_seconds),
+        current.kafka_metadata_timeout_seconds,
+        current.kafka_consumer_poll_timeout_seconds,
+        current.kafka_consumer_retry_delay_seconds,
+        current.kafka_supervisor_sync_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        yield
-        if owned_database:
-            configured_database.dispose()
+        if consumers_enabled:
+            await run_in_threadpool(supervisor.start)
+        try:
+            yield
+        finally:
+            consumers_stopped = True
+            if consumers_enabled:
+                consumers_stopped = await run_in_threadpool(supervisor.stop)
+            if not consumers_stopped:
+                raise RuntimeError(
+                    "Kafka consumers are still using application resources; shutdown refused"
+                )
+            if owned_database and consumers_stopped:
+                configured_database.dispose()
 
     app = FastAPI(title="Diploma API", version="1.0.0", lifespan=lifespan)
     app.state.settings = current
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
-    app.state.kafka_client = kafka_client or ConfluentKafkaMetadataClient()
-    app.state.ecs_catalog = ecs_catalog if ecs_catalog is not None else PackagedEcsCatalog.load()
-    app.state.normalization_engine = NormalizationEngine(app.state.ecs_catalog)
+    app.state.kafka_client = configured_kafka_client
+    app.state.ecs_catalog = configured_catalog
+    app.state.normalization_engine = configured_engine
+    app.state.kafka_consumer_supervisor = supervisor
     app.dependency_overrides[get_settings] = lambda: current
     logging.getLogger("app").setLevel(current.log_level.upper())
 

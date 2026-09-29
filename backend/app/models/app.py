@@ -230,6 +230,7 @@ class Source(TimestampMixin, Base):
         ForeignKey("app.normalizers.id", ondelete="SET NULL")
     )
     topic_name: Mapped[str] = mapped_column(Text, nullable=False)
+    kafka_topic_identity: Mapped[str | None] = mapped_column(Text)
     is_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), nullable=False
     )

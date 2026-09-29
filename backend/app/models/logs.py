@@ -128,6 +128,7 @@ class ProcessedKafkaRecord(Base):
     )
     # Immutable UUID scope survives deletion of the mutable connection row.
     connection_identity: Mapped[UUID] = mapped_column(nullable=False)
+    kafka_topic_identity: Mapped[str | None] = mapped_column(Text)
     source_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("app.sources.id", ondelete="SET NULL")
     )

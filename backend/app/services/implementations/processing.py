@@ -75,7 +75,9 @@ def _has_unrepresentable_postgres_text(value: Any) -> bool:
     return False
 
 
-def _decode_envelope(payload: bytes):
+def _decode_envelope(payload: bytes | None):
+    if payload is None:
+        return None, "envelope", _diagnostic("null_payload"), None
     try:
         decoded = payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -122,7 +124,7 @@ class DurableProcessingServiceImpl:
         self,
         source_id: UUID,
         coordinates: KafkaCoordinates,
-        payload: bytes,
+        payload: bytes | None,
         received_at: datetime,
     ) -> ProcessMessageResult:
         self._validate_call(coordinates, payload, received_at)
@@ -178,6 +180,7 @@ class DurableProcessingServiceImpl:
                 id=record_id,
                 connection_id=context.connection_id,
                 connection_identity=context.connection_id,
+                kafka_topic_identity=context.kafka_topic_identity,
                 source_id=context.source_id,
                 normalizer_id=context.normalizer_id,
                 kafka_topic=coordinates.topic,
@@ -199,7 +202,7 @@ class DurableProcessingServiceImpl:
                     kafka_topic=coordinates.topic,
                     kafka_partition=coordinates.partition,
                     kafka_offset=coordinates.offset,
-                    raw_payload=payload,
+                    raw_payload=payload if payload is not None else b"",
                     stage=stage or "normalization",
                     diagnostics=diagnostics,
                     fluent_bit_collected_at=collected_at,
@@ -274,9 +277,9 @@ class DurableProcessingServiceImpl:
 
     @staticmethod
     def _validate_call(
-        coordinates: KafkaCoordinates, payload: bytes, received_at: datetime
+        coordinates: KafkaCoordinates, payload: bytes | None, received_at: datetime
     ) -> None:
-        if not isinstance(payload, bytes):
+        if payload is not None and not isinstance(payload, bytes):
             raise ProcessingConfigurationError("payload_must_be_bytes")
         if (
             not coordinates.topic.strip()

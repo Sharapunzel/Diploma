@@ -14,6 +14,7 @@ class KafkaCoordinates:
     topic: str
     partition: int
     offset: int
+    kafka_topic_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class ProcessingContext:
     source_id: UUID
     source_name: str
     topic: str
+    kafka_topic_identity: str | None
     normalizer_id: UUID
     normalizer_name: str
     normalizer_version: int

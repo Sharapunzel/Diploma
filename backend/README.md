@@ -172,6 +172,52 @@ internal topics beginning with `__` unless `include_internal=true`; it never cre
 source or starts a Kafka consumer. Deleting a connection cascades its sources while
 preserving parsed logs with nullable foreign keys.
 
+## Kafka consumers and durable offsets (TASK-8)
+
+In an ordinary development or production application process, every enabled Kafka source
+is supervised in the background. The supervisor also notices enabled/disabled/deleted
+sources without a restart; API test applications (`ENVIRONMENT=test`) do not start workers
+unless `create_app(..., start_consumers=True)` is explicitly requested. The behaviour is
+configured with these bounded settings:
+
+```dotenv
+KAFKA_CONSUMERS_ENABLED=true
+KAFKA_METADATA_TIMEOUT_SECONDS=5
+KAFKA_CONSUMER_POLL_TIMEOUT_SECONDS=1
+KAFKA_CONSUMER_RETRY_DELAY_SECONDS=2
+KAFKA_SUPERVISOR_SYNC_SECONDS=1
+```
+
+Each source owns a stable Kafka consumer group named `diploma-source-<source UUID>`.
+Auto-commit and automatic offset storage are disabled. On a partition with no committed
+position and no durable history, the worker explicitly starts from the earliest available
+offset. A Kafka commit always stores the *next* offset: after processing `N`, it commits
+`N + 1` only after TASK-7 returned `stored_complete`, `stored_partial`, `stored_failed`,
+or `already_processed` after its PostgreSQL transaction committed. The consumer waits for
+the Kafka commit callback for at most `KAFKA_METADATA_TIMEOUT_SECONDS`; a timeout leaves
+the partition unadvanced and a later delivery is safe through the durable ledger.
+
+Invalid UTF-8, malformed envelopes, empty values and Kafka tombstones are durable error
+outcomes, so they can be committed and do not stop the source. Database, rule,
+configuration and Kafka failures are not committed; the affected partition is paused and
+retried, while other sources can continue. If PostgreSQL succeeded but Kafka commit failed,
+the repeat uses the durable ledger and returns `already_processed` before retrying commit.
+
+At creation and startup the application records and compares the broker topic UUID. A
+source with durable history stops safely rather than accepting a missing or changed topic
+identity, an unknown committed position, or a committed offset outside Kafka's currently
+available `[low, high]` range (for example after retention). It never silently seeks to
+`latest` or resets such history. A position equal to `high` waits for new records.
+
+Shutdown asks workers to finish their current durable operation and close their Kafka
+consumer. Workers are non-daemon threads. If a worker exceeds the bounded shutdown wait,
+the application raises an explicit shutdown error and keeps its database resources alive;
+it does not report a successful shutdown while a worker can still use them.
+
+The lifecycle is intentionally single-process: run exactly one API worker/process that has
+Kafka consumers enabled for a given source. Multi-process ownership and HA coordination are
+outside this task. No consumer state or processing-error HTTP endpoint is exposed yet.
+
 ## Parsed logs and ECS catalog
 
 The API vendors the generated Elastic Common Schema artifact from the immutable
