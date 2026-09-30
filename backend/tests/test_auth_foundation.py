@@ -1,3 +1,4 @@
+import base64
 import getpass
 import os
 import subprocess
@@ -22,7 +23,7 @@ from fastapi.testclient import TestClient
 from joserfc import jwt
 from joserfc.jwk import RSAKey
 from pydantic import ValidationError
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -51,9 +52,12 @@ from app.models import (
     AppSetting,
     AuthSession,
     KafkaConnection,
+    KafkaOperationalEvent,
     Normalizer,
     OidcRoleMapping,
     ParsedLog,
+    ProcessedKafkaRecord,
+    ProcessingError,
     Role,
     Source,
     User,
@@ -72,6 +76,7 @@ from app.repositories.sqlalchemy.administration import (
     SqlAlchemySettingRepository,
 )
 from app.repositories.sqlalchemy.consumers import SqlAlchemyConsumerStateRepository
+from app.repositories.sqlalchemy.diagnostics import SqlAlchemyDiagnosticsRepository
 from app.repositories.sqlalchemy.parsed_logs import _filter_expression
 from app.schemas.administration import NormalizerPatch
 from app.schemas.parsed_logs import ParsedLogBulkDeleteRequest, ParsedLogSearchRequest
@@ -80,7 +85,9 @@ from app.services.implementations.administration import (
     SettingAdministration,
 )
 from app.services.implementations.auth import AuthService
+from app.services.implementations.consumers import ConsumerWorkerState
 from app.services.implementations.cursor import SignedParsedLogCursorCodec
+from app.services.implementations.diagnostics import DiagnosticsServiceImpl
 from app.services.implementations.parsed_logs import ParsedLogServiceImpl
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -2442,6 +2449,225 @@ def test_kafka_connections_topics_and_source_lifecycle(client, auth_database):
         f"/api/v1/sources/{source_id}/normalizer", json={"normalizer_id": None}, headers=headers
     ).status_code == 200
     assert client.delete(f"/api/v1/sources/{source_id}", headers=headers).status_code == 204
+
+
+def test_diagnostics_read_access_raw_payload_boundary_and_openapi(client, auth_database):
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/api/v1/diagnostics/sources" in paths
+    assert "/api/v1/diagnostics/processing-errors/{error_id}/raw" in paths
+    assert client.get("/api/v1/diagnostics/overview").status_code == 401
+
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    assert client.get("/api/v1/diagnostics/overview").status_code == 200
+    assert client.get("/api/v1/diagnostics/processing-errors/not-a-uuid").status_code == 422
+    guest_raw = client.get(f"/api/v1/diagnostics/processing-errors/{uuid4()}/raw")
+    assert guest_raw.status_code == 403
+    assert guest_raw.json()["code"] == "permission_denied"
+
+    add_admin_user(auth_database)
+    csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+    admin_login = client.post(
+        "/api/v1/auth/local/login",
+        json={"username": "admin", "password": "correct-password"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert admin_login.status_code == 200
+    headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
+    missing = client.get(f"/api/v1/diagnostics/processing-errors/{uuid4()}/raw", headers=headers)
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "processing_error_not_found"
+
+
+def test_diagnostics_error_and_event_snapshots_survive_source_deletion(client, auth_database):
+    now = datetime.now(UTC)
+    source_id = uuid4()
+    connection_id = uuid4()
+    record_id = uuid4()
+    error_id = uuid4()
+    payload = b"\xff\x00diagnostic-payload"
+    with auth_database.session_factory() as session:
+        session.add(KafkaConnection(
+            id=connection_id, name="diagnostic-connection", bootstrap_servers=["localhost:9092"],
+            security_protocol="PLAINTEXT", extra_config={},
+        ))
+        session.flush()
+        session.add(Source(
+            id=source_id, name="diagnostic-source", connection_id=connection_id,
+            topic_name="diagnostic-topic", kafka_topic_identity="topic-id",
+            is_enabled=False, is_archived=True,
+        ))
+        session.add(ProcessedKafkaRecord(
+            id=record_id, connection_id=connection_id, connection_identity=connection_id,
+            kafka_topic_identity="topic-id", source_id=source_id, normalizer_id=None,
+            kafka_topic="diagnostic-topic", kafka_partition=2, kafka_offset=17,
+            result_status="failed", backend_received_at=now, backend_processed_at=now,
+        ))
+        session.flush()
+        session.add(ProcessingError(
+            id=error_id, processed_record_id=record_id, connection_id=connection_id,
+            source_id=source_id, source_identity=source_id, normalizer_id=None,
+            connection_name="diagnostic-connection", source_name="diagnostic-source",
+            normalizer_name="deleted-normalizer", normalizer_version=3,
+            kafka_topic="diagnostic-topic", kafka_partition=2, kafka_offset=17,
+            raw_payload=payload, stage="decode", diagnostics=[{"code": "invalid_utf8"}],
+            fluent_bit_collected_at=None, backend_received_at=now, backend_processed_at=now,
+        ))
+        session.add(KafkaOperationalEvent(
+            kind="retention_gap", reason_code="retention_gap_detected", source_id=source_id,
+            source_identity=source_id, source_name="diagnostic-source",
+            connection_id=connection_id, connection_identity=connection_id,
+            connection_name="diagnostic-connection", cluster_identity="cluster-id",
+            topic_name="diagnostic-topic", old_topic_identity="topic-id",
+            new_topic_identity=None, kafka_partition=2, offset_start=18, offset_end=23,
+        ))
+        session.commit()
+
+    assert client.get(f"/api/v1/diagnostics/processing-errors?source_id={source_id}").status_code == 401
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    source_list = client.get("/api/v1/diagnostics/sources", params={"limit": 100})
+    assert source_list.status_code == 200
+    listed_source = next(
+        item for item in source_list.json()["items"] if item["source_id"] == str(source_id)
+    )
+    assert listed_source["connection_id"] == str(connection_id)
+    assert listed_source["connection_name"] == "diagnostic-connection"
+    source_detail = client.get(f"/api/v1/diagnostics/sources/{source_id}")
+    assert source_detail.status_code == 200
+    assert source_detail.json()["connection_name"] == "diagnostic-connection"
+    errors = client.get("/api/v1/diagnostics/processing-errors", params={"source_id": str(source_id)})
+    assert errors.status_code == 200 and errors.json()["total"] == 1
+    assert "raw_payload" not in errors.json()["items"][0]
+    assert "diagnostic-payload" not in errors.text
+    guest_raw = client.get(f"/api/v1/diagnostics/processing-errors/{error_id}/raw")
+    assert guest_raw.status_code == 403
+
+    overview = client.get("/api/v1/diagnostics/overview")
+    assert overview.status_code == 200
+    assert overview.json()["worker_counts_scope"] == "application_process"
+    assert overview.json()["recent_errors"][0]["connection_name"] == "diagnostic-connection"
+    assert overview.json()["recent_events"][0]["connection_name"] == "diagnostic-connection"
+
+    add_admin_user(auth_database)
+    csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+    admin_login = client.post(
+        "/api/v1/auth/local/login",
+        json={"username": "admin", "password": "correct-password"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert admin_login.status_code == 200
+    headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
+    detail = client.get(f"/api/v1/diagnostics/processing-errors/{error_id}", headers=headers)
+    assert detail.status_code == 200 and "raw_payload" not in detail.json()
+    raw = client.get(f"/api/v1/diagnostics/processing-errors/{error_id}/raw", headers=headers)
+    assert raw.status_code == 200 and base64.b64decode(raw.json()["data"]) == payload
+    events = client.get("/api/v1/diagnostics/kafka-events", params={"source_id": str(source_id)}, headers=headers)
+    event = events.json()["items"][0]
+    assert events.json()["total"] == 1
+    assert event["offset_start"] == 18 and event["offset_end"] == 23
+    assert event["offset_range_semantics"] == "unavailable_kafka_positions_not_message_count"
+
+    with auth_database.session_factory() as session:
+        session.delete(session.get(Source, source_id))
+        session.commit()
+    detached_error = client.get(f"/api/v1/diagnostics/processing-errors/{error_id}", headers=headers)
+    detached_event = client.get("/api/v1/diagnostics/kafka-events",
+        params={"source_id": str(source_id)}, headers=headers)
+    assert detached_error.json()["source_id"] == str(source_id)
+    assert detached_event.json()["total"] == 1
+
+
+def test_diagnostics_overview_aggregates_large_source_set_without_loading_source_rows(
+    auth_database,
+):
+    connection_id = uuid4()
+    with auth_database.session_factory() as session:
+        session.add(KafkaConnection(
+            id=connection_id, name="overview-connection", bootstrap_servers=["localhost:9092"],
+            security_protocol="PLAINTEXT", extra_config={},
+        ))
+        session.flush()
+        sources = [
+            Source(
+                id=uuid4(), name=f"overview-source-{index}", connection_id=connection_id,
+                topic_name=f"overview-topic-{index}",
+                is_enabled=index in (0, 1), is_archived=False,
+            )
+            for index in range(1000)
+        ]
+        session.add_all(sources)
+        session.commit()
+
+    running_id, stopped_id = sources[0].id, sources[1].id
+
+    class OverviewSupervisor:
+        def diagnostic_overview_snapshots(self):
+            return {
+                running_id: (ConsumerWorkerState("waiting"), False, True),
+                stopped_id: (ConsumerWorkerState("waiting"), True, True),
+            }
+
+    statements = []
+
+    def record_query(_conn, _cursor, statement, _parameters, _context, _many):
+        if "app.sources" in statement:
+            statements.append(" ".join(statement.lower().split()))
+
+    event.listen(auth_database.engine, "before_cursor_execute", record_query)
+    try:
+        with auth_database.session_factory() as session:
+            result = DiagnosticsServiceImpl(
+                SqlAlchemyDiagnosticsRepository(session), OverviewSupervisor()
+            ).overview(10)
+    finally:
+        event.remove(auth_database.engine, "before_cursor_execute", record_query)
+
+    assert result.registered_sources == 1000
+    assert result.enabled_sources == 2
+    assert result.worker_counts == {
+        "running": 1, "retrying": 0, "stopped": 1,
+        "not_running": 998, "unknown": 0,
+    }
+    assert result.worker_counts_scope == "application_process"
+    assert any("count(app.sources.id)" in statement for statement in statements)
+    assert any("select app.sources.id from app.sources" in statement for statement in statements)
+    assert not any("select app.sources.id, app.sources.name" in statement for statement in statements)
+
+
+def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_database_url):
+    run_alembic(auth_database_url, "upgrade", "head")
+    url = make_url(auth_database_url).set(drivername="postgresql").render_as_string(
+        hide_password=False
+    )
+    with psycopg.connect(url) as connection:
+        before = {
+            row[0]: (row[1], set(row[2]))
+            for row in connection.execute(
+                "SELECT id, name, permissions FROM app.roles WHERE id IN (%s, %s)",
+                (ADMIN_ID, GUEST_ID),
+            )
+        }
+    assert "processing_errors.raw.read" in before[ADMIN_ID][1]
+    assert "processing_errors.raw.read" not in before[GUEST_ID][1]
+    run_alembic(auth_database_url, "downgrade", "-1")
+    with psycopg.connect(url) as connection:
+        downgraded = {
+            row[0]: (row[1], set(row[2]))
+            for row in connection.execute(
+                "SELECT id, name, permissions FROM app.roles WHERE id IN (%s, %s)",
+                (ADMIN_ID, GUEST_ID),
+            )
+        }
+    for role_id in (ADMIN_ID, GUEST_ID):
+        assert downgraded[role_id][0] == before[role_id][0]
+        assert downgraded[role_id][1] == before[role_id][1] - {"processing_errors.raw.read"}
+    run_alembic(auth_database_url, "upgrade", "head")
+    with psycopg.connect(url) as connection:
+        upgraded = connection.execute(
+            "SELECT permissions FROM app.roles WHERE id = %s", (ADMIN_ID,)
+        ).fetchone()[0]
+    assert "processing_errors.raw.read" in upgraded
 
 
 def test_archived_topic_generation_requires_explicit_new_source(client, auth_database):

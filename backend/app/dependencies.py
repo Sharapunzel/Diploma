@@ -24,6 +24,7 @@ from .repositories.sqlalchemy.connections import (
     SqlAlchemyKafkaConnectionRepository,
     SqlAlchemySourceRepository,
 )
+from .repositories.sqlalchemy.diagnostics import SqlAlchemyDiagnosticsRepository
 from .repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from .services.implementations.administration import (
     MappingAdministration,
@@ -35,6 +36,7 @@ from .services.implementations.administration import (
 from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.implementations.cursor import SignedParsedLogCursorCodec
+from .services.implementations.diagnostics import DiagnosticsServiceImpl
 from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
 from .services.implementations.processing import DurableProcessingServiceImpl
@@ -48,6 +50,7 @@ from .services.protocols.administration import (
 )
 from .services.protocols.connections import KafkaConnectionService, SourceService
 from .services.protocols.consumers import SourceConsumerLifecycle
+from .services.protocols.diagnostics import DiagnosticsService
 from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
 from .services.protocols.processing import DurableProcessingService
@@ -132,6 +135,15 @@ def get_parsed_log_service(
         SqlAlchemyUnitOfWork(session),
         catalog,
         cursor_codec,
+    )
+
+
+def get_diagnostics_service(
+    request: Request,
+    session: Session = Depends(get_session),
+) -> DiagnosticsService:
+    return DiagnosticsServiceImpl(
+        SqlAlchemyDiagnosticsRepository(session), request.app.state.kafka_consumer_supervisor
     )
 
 

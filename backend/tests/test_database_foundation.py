@@ -26,6 +26,7 @@ ADMIN_PERMISSIONS = [
     "normalizers.write",
     "events.read",
     "events.delete",
+    "processing_errors.raw.read",
 ]
 GUEST_PERMISSIONS = [
     "users.read",

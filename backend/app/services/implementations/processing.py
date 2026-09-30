@@ -194,6 +194,7 @@ class DurableProcessingServiceImpl:
                 error = ProcessingError(
                     connection_id=context.connection_id,
                     source_id=context.source_id,
+                    source_identity=context.source_id,
                     normalizer_id=context.normalizer_id,
                     connection_name=context.connection_name,
                     source_name=context.source_name,

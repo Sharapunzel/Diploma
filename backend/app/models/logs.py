@@ -219,6 +219,7 @@ class ProcessingError(Base):
         CheckConstraint("jsonb_typeof(diagnostics) = 'array'", name="diagnostics_array"),
         CheckConstraint("backend_processed_at >= backend_received_at", name="processing_after_receipt"),
         Index("ix_processing_errors_source_received", "source_id", "backend_received_at"),
+        Index("ix_processing_errors_source_identity_processed", "source_identity", "backend_processed_at"),
         Index("ix_processing_errors_connection_id", "connection_id"),
         Index("ix_processing_errors_normalizer_id", "normalizer_id"),
         {"schema": "logs"},
@@ -236,6 +237,7 @@ class ProcessingError(Base):
     source_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("app.sources.id", ondelete="SET NULL")
     )
+    source_identity: Mapped[UUID | None] = mapped_column()
     normalizer_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("app.normalizers.id", ondelete="SET NULL")
     )

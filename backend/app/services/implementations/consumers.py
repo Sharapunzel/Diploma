@@ -90,6 +90,29 @@ class _SourceWorker:
         with self._state_lock:
             return self._state
 
+    def diagnostic_snapshot(
+        self,
+    ) -> tuple[ConsumerWorkerState, tuple[tuple[int, str], ...], tuple[int, ...]]:
+        with self._state_lock:
+            return (self._state, tuple(sorted(self.stopped_partitions.items())),
+                    tuple(sorted(set(self.expected_offsets) | set(self.stopped_partitions))))
+
+    def diagnostic_overview_snapshot(self) -> tuple[ConsumerWorkerState, bool, bool]:
+        with self._state_lock:
+            return self._state, bool(self.stopped_partitions), self.thread.is_alive()
+
+    def _set_expected_offset(self, partition: int, offset: int) -> None:
+        with self._state_lock:
+            self.expected_offsets[partition] = offset
+
+    def _replace_expected_offsets(self, offsets: dict[int, int]) -> None:
+        with self._state_lock:
+            self.expected_offsets = offsets
+
+    def _clear_expected_offsets(self) -> None:
+        with self._state_lock:
+            self.expected_offsets.clear()
+
     def _set_state(self, status: str, reason: str | None = None) -> None:
         with self._state_lock:
             self._state = ConsumerWorkerState(status, reason)
@@ -340,9 +363,9 @@ class _SourceWorker:
                 )
             if positions:
                 self.consumer.assign(tuple(positions))
-            self.expected_offsets = {
+            self._replace_expected_offsets({
                 item.partition: item.offset for item in positions
-            }
+            })
             if not retry_assignment:
                 if not positions and self.stopped_partitions:
                     self._set_state("stopped", "all_partitions_stopped")
@@ -355,7 +378,8 @@ class _SourceWorker:
             return False
 
     def _stop_partition(self, partition: int, reason: str) -> None:
-        self.stopped_partitions[partition] = reason
+        with self._state_lock:
+            self.stopped_partitions[partition] = reason
         LOGGER.error(
             "kafka_partition_stopped",
             extra={"source_id": str(self.config.source_id), "partition": partition, "reason": reason},
@@ -395,7 +419,7 @@ class _SourceWorker:
                         (KafkaPartition(message.topic, partition, message.offset + 1),),
                         self.metadata_timeout,
                     )
-                    self.expected_offsets[partition] = message.offset + 1
+                    self._set_expected_offset(partition, message.offset + 1)
                 else:
                     self.consumer.seek(marker)
                 self.consumer.resume((marker,))
@@ -506,7 +530,7 @@ class _SourceWorker:
                     if partition in self.gap_paused:
                         self.consumer.resume((KafkaPartition(self.config.topic_name, partition, recovered),))
                         self.gap_paused.remove(partition)
-                    self.expected_offsets[partition] = recovered
+                    self._set_expected_offset(partition, recovered)
                     expected = recovered
                     for old_offset in tuple(messages):
                         if old_offset < recovered:
@@ -577,7 +601,7 @@ class _SourceWorker:
                 (KafkaPartition(message.topic, message.partition, message.offset + 1),),
                 self.metadata_timeout,
             )
-            self.expected_offsets[message.partition] = message.offset + 1
+            self._set_expected_offset(message.partition, message.offset + 1)
             self._set_state("waiting")
         except KafkaConsumerError:
             self._set_state("retrying", "kafka_commit_unavailable")
@@ -646,7 +670,7 @@ class _SourceWorker:
                 elif isinstance(event, KafkaRevocation):
                     self.blocked.clear()
                     self.buffered.clear()
-                    self.expected_offsets.clear()
+                    self._clear_expected_offsets()
                     self.gap_paused.clear()
                     self.gap_retry_due.clear()
                     self.sparse_seek_pending.clear()
@@ -722,6 +746,29 @@ class KafkaSourceSupervisor:
         if worker is not None:
             worker.stop(lifecycle=True)
         self.wake()
+
+    def diagnostic_snapshots(
+        self,
+    ) -> dict[UUID, tuple[ConsumerWorkerState, tuple[tuple[int, str], ...], tuple[int, ...], bool]] | None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive() or self._stop.is_set():
+                return None
+            workers = tuple(self._workers.items())
+        return {source_id: (*worker.diagnostic_snapshot(), worker.is_alive)
+                for source_id, worker in workers}
+
+    def diagnostic_overview_snapshots(
+        self,
+    ) -> dict[UUID, tuple[ConsumerWorkerState, bool, bool]] | None:
+        """Return compact current-process states; one entry per supervised source."""
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive() or self._stop.is_set():
+                return None
+            workers = tuple(self._workers.items())
+        return {
+            source_id: worker.diagnostic_overview_snapshot()
+            for source_id, worker in workers
+        }
 
     def stop(self) -> bool:
         self._stop.set()
