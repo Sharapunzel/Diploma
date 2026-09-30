@@ -9,28 +9,30 @@ cd backend
 python -m pip install -e ".[test]"
 ```
 
-Для проверок создайте отдельную базу без удаления development volume. Команды ниже
-направляют и Pytest, и ручные команды Alembic именно в `diploma_test`:
+Для локальных тестов используйте только выделенную базу `diploma_test`, отдельно от
+`diploma_db`. Единая команда каждый раз пересоздаёт `diploma_test`, запускает полный
+набор и после него оставляет пустую согласованную схему на Alembic head. Данные в
+`diploma_test` не сохраняются; одновременно запускать на ней два набора нельзя.
+Нужны запущенный PostgreSQL и права пользователя на создание баз:
 
 ```powershell
-docker exec diploma-postgres createdb -U diploma_user diploma_test
 $env:TEST_DATABASE_URL = "postgresql+psycopg://diploma_user:diploma_password@localhost:5432/diploma_test"
-$env:DATABASE_URL = $env:TEST_DATABASE_URL
-python -m pytest -q
-python -m alembic upgrade head
-python -m alembic check
-python -m alembic downgrade base
+python scripts/run_tests.py --shared
 ```
 
-После проверок тестовую базу можно безопасно удалить, не затрагивая `diploma_db`
-или именованный Compose volume:
+Для независимого ревью или параллельного запуска используйте временную БД с уникальным
+именем. Команда удалит её после завершения; постоянную `diploma_test` не затронет:
 
 ```powershell
-docker exec diploma-postgres dropdb -U diploma_user --if-exists --force diploma_test
+python scripts/run_tests.py --temporary
 ```
 
-Тестовая fixture разбирает URL и аварийно завершает запуск, если имя базы равно
-`diploma_db`, в том числе при наличии query-параметров в URL.
+Runner принимает в `TEST_DATABASE_URL` только имя `diploma_test`, а в режиме
+`--temporary` сам создаёт безопасное уникальное имя. Он не выполняет `DROP DATABASE`
+с принудительным отключением сеансов: если БД уже используется, запуск остановится.
+Не запускайте тесты или ручной `alembic downgrade` на `diploma_db`. Прямой вызов
+`pytest` предназначен лишь для специальных проверок с отдельно подготовленной БД;
+обычный путь — runner выше. Тестовые fixtures также отвергают `diploma_db`.
 
 Схема `app` содержит пользователей, роли, настройки и конфигурацию источников.
 Схема `logs` содержит нормализованные события, ошибки обработки и durable-ledger
@@ -141,14 +143,11 @@ Invoke-RestMethod http://localhost:8000/api/v1/users -Method Post -WebSession $w
 зарегистрированные keys. Поле `rule` normalizer является JSONB-объектом v1;
 его структура и ECS-совместимость проверяются перед созданием или заменой.
 
-Полный набор проверок запускается на отдельной БД:
+Полный набор проверок запускается через единый test runner:
 
 ```powershell
 $env:TEST_DATABASE_URL = "postgresql+psycopg://diploma_user:diploma_password@localhost:5432/diploma_test"
-$env:DATABASE_URL = $env:TEST_DATABASE_URL
-python -m pytest -q
-python -m alembic upgrade head
-python -m alembic check
+python scripts/run_tests.py --shared
 ```
 
 ## Kafka connections and sources
