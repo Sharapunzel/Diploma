@@ -467,3 +467,29 @@ offset)`, исходным payload в байтах и временем полу�
 `complete` и пустой список причин, поскольку более точная классификация для них
 недоступна. Автоматический replay учтённых ошибок не выполняется. Политики retention
 и смены поколения топика описаны в разделе Kafka consumers выше.
+# External OpenSearch-compatible sources (TASK-10)
+
+External connections use Basic Auth over verified HTTPS. Create a persistent Fernet key outside PostgreSQL and the repository:
+
+```shell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Pass the result as `EXTERNAL_SECRET_KEY` through the deployment secret manager or a private environment file. Keep the same key across restarts and backups. Losing it makes existing connection passwords unreadable; a missing or wrong key causes an explicit error and never stores plaintext. To rotate a connection password, PATCH `password`; omitting it preserves the current encrypted value. To rotate the encryption key, stop the API, back up the database and old key, set `DATABASE_URL`, `EXTERNAL_OLD_KEY` and `EXTERNAL_NEW_KEY` privately, then run `python scripts/rotate_external_key.py`. It re-encrypts all rows in one transaction and rolls back if any cannot be decrypted. Start the API with `EXTERNAL_SECRET_KEY` set to the new key; keep the old key until all connections are verified. Do not change the key variable alone.
+
+`/api/v1/external-connections` manages indexer connections. `PUT /{id}/ca` accepts a raw PEM CA chain as `application/x-pem-file` with a 1–65536 byte limit; `DELETE /{id}/ca` removes it. Public system roots remain trusted. Uploading a CA affects only that connection. Connection or CA changes disable its sources until revalidated. The connection DTO reports `has_password` and `has_ca`, without returning either value. `POST /{id}/test` and `GET /{id}/indices` require `connections.write`; the latter exposes up to 100 concrete index names per page. Other connection writes require `connections.write`. Registered metadata can be read with `connections.read`.
+
+`/api/v1/external-sources` manages external sources with `sources.write`; read access uses `sources.read`. Set `target_type` explicitly to `index`, `index_pattern`, `data_stream`, or `data_stream_pattern`, and provide exactly its paired field: `index_name`, `index_pattern`, `data_stream_name`, or `data_stream_pattern`. Names use lowercase ASCII letters, digits, `.`, `_`, `-` and cannot start with `.` or `_`. Patterns additionally permit `*` and `?`, and must contain one of these wildcards. Commas, API paths and query DSL are rejected. Patterns are globs over concrete logical names. Sources start disabled; enabling checks that at least one accessible target of the same type matches. This grants application reading only; no indexer mutation or Kafka consumer starts. `/sources` continues to list Kafka sources only, now with `source_type: "kafka"`; external sources have their own list with `source_type: "external"`. Existing Kafka source URLs and operations remain unchanged.
+
+The indexer account needs permission to list open indices and to resolve data streams via `GET /_resolve/index/*`. On the official Wazuh `5.0.0-beta5` image, the built-in `readall` role permitted `_resolve/index/*` but `_cat/indices` also required read-only actions `indices:monitor/settings/get`, `indices:monitor/stats`, `cluster:monitor/state`, and `cluster:monitor/health`. Grant these metadata actions to the indexer account if index listing or `POST /test` returns 403. `GET /external-connections/{id}/indices` lists concrete indices, while `GET /external-connections/{id}/data-streams` lists logical data streams. Backing `.ds-*` indices are not offered as logical stream names. Metadata calls use a five-second network timeout and fifteen-second overall read deadline, at most 1 MiB of response and 10,000 discovered names. Redirects are refused.
+
+For a separate Wazuh smoke, use the official [Wazuh `v5.0.0-beta5` release](https://github.com/wazuh/wazuh/releases/tag/v5.0.0-beta5) on a test installation with HTTPS and a test CA. Provision the concrete index `diploma-task10-smoke-v1-000001` in that indexer using its administrative account, then add one harmless document:
+
+```shell
+curl --cacert test-ca.pem --user indexer-admin -X PUT "$INDEXER_URL/diploma-task10-smoke-v1-000001"
+curl --cacert test-ca.pem --user indexer-admin -H "Content-Type: application/json" -X PUT "$INDEXER_URL/diploma-task10-smoke-v1-000001/_doc/1" -d '{"@timestamp":"2026-09-30T00:00:00Z","event":{"kind":"event"},"message":"TASK-10 smoke"}'
+```
+
+Give a separate test account read-only metadata permission. As an authenticated application administrator, create an external connection to the indexer HTTPS base URL with that account and upload `test-ca.pem` through `PUT /api/v1/external-connections/{id}/ca` using `Content-Type: application/x-pem-file`. `GET /{id}/indices` should include `diploma-task10-smoke-v1-000001`; create and enable sources with `target_type: "index", index_name: "diploma-task10-smoke-v1-000001"` and `target_type: "index_pattern", index_pattern: "diploma-task10-smoke-v1-*"`. This ordinary index checks only the index path, not Wazuh findings.
+
+For Wazuh findings, create a test finding using the official Wazuh data stream setup. `GET /{id}/data-streams` must expose the logical `wazuh-findings-v5-security` stream; `_cat/indices` may show only its `.ds-*` backing index. Create and enable `target_type: "data_stream", data_stream_name: "wazuh-findings-v5-security"` and `target_type: "data_stream_pattern", data_stream_pattern: "wazuh-findings-v5-*"`. Confirm `parsed_logs` gains no row. Document retrieval belongs to TASK-12.

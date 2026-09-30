@@ -96,7 +96,7 @@ class SqlAlchemySourceRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[Source], int]:
-        statement = select(Source)
+        statement = select(Source).where(Source.source_type == "kafka")
         conditions = []
         if query:
             pattern = _like(query)

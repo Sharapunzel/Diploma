@@ -176,7 +176,7 @@ class SourceServiceImpl:
 
     def get(self, source_id: UUID) -> Source:
         source = self.sources.find_by_id(source_id)
-        if source is None:
+        if source is None or source.source_type != "kafka":
             fail("source_not_found", "Source not found")
         return source
 
@@ -330,7 +330,7 @@ class SourceServiceImpl:
 
     def set_normalizer(self, source_id: UUID, data: SourceNormalizerUpdate) -> Source:
         source = self.sources.find_by_id_for_update(source_id)
-        if source is None:
+        if source is None or source.source_type != "kafka":
             fail("source_not_found", "Source not found")
         if source.is_archived:
             fail("source_archived", "Archived source cannot be changed", 409)
@@ -401,7 +401,7 @@ class SourceServiceImpl:
 
     def disable(self, source_id: UUID) -> Source:
         source = self.sources.find_by_id_for_update(source_id)
-        if source is None:
+        if source is None or source.source_type != "kafka":
             fail("source_not_found", "Source not found")
         try:
             self.sources.update(source, {"is_enabled": False}, current_time())

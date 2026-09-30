@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from .config import Settings, settings
 from .db import get_session
 from .ecs import EcsCatalog
+from .indexer import IndexerMetadataAdapter
 from .kafka import KafkaMetadataClient
 from .normalization.engine import NormalizationEngine
 from .repositories.protocols import OidcClient, ReadinessRepository
@@ -25,6 +26,7 @@ from .repositories.sqlalchemy.connections import (
     SqlAlchemySourceRepository,
 )
 from .repositories.sqlalchemy.diagnostics import SqlAlchemyDiagnosticsRepository
+from .repositories.sqlalchemy.external import SqlAlchemyExternalRepository
 from .repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from .services.implementations.administration import (
     MappingAdministration,
@@ -37,6 +39,7 @@ from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.implementations.cursor import SignedParsedLogCursorCodec
 from .services.implementations.diagnostics import DiagnosticsServiceImpl
+from .services.implementations.external import ExternalServiceImpl
 from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
 from .services.implementations.processing import DurableProcessingServiceImpl
@@ -51,6 +54,7 @@ from .services.protocols.administration import (
 from .services.protocols.connections import KafkaConnectionService, SourceService
 from .services.protocols.consumers import SourceConsumerLifecycle
 from .services.protocols.diagnostics import DiagnosticsService
+from .services.protocols.external import ExternalService
 from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
 from .services.protocols.processing import DurableProcessingService
@@ -90,6 +94,21 @@ def get_oidc_client(request: Request) -> OidcClient:
 
 def get_kafka_client(request: Request) -> KafkaMetadataClient:
     return request.app.state.kafka_client
+
+
+def get_indexer_adapter(request: Request) -> IndexerMetadataAdapter:
+    return request.app.state.indexer_adapter
+
+
+def get_external_service(
+    session: Session = Depends(get_session),
+    app_settings: Settings = Depends(get_settings),
+    adapter: IndexerMetadataAdapter = Depends(get_indexer_adapter),
+) -> ExternalService:
+    key = app_settings.external_secret_key
+    return ExternalServiceImpl(SqlAlchemyExternalRepository(session),
+                               SqlAlchemyUnitOfWork(session), adapter,
+                               key.get_secret_value() if key else None)
 
 
 def get_consumer_lifecycle(request: Request) -> SourceConsumerLifecycle:

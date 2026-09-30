@@ -17,6 +17,7 @@ from .core.errors import DomainError
 from .db import Database
 from .dependencies import build_auth_service, get_settings
 from .ecs import EcsCatalog, PackagedEcsCatalog
+from .indexer import HttpIndexerMetadataAdapter
 from .kafka import (
     ConfluentKafkaConsumerFactory,
     ConfluentKafkaMetadataClient,
@@ -120,6 +121,7 @@ def create_app(
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
     app.state.kafka_client = configured_kafka_client
+    app.state.indexer_adapter = HttpIndexerMetadataAdapter()
     app.state.ecs_catalog = configured_catalog
     app.state.normalization_engine = configured_engine
     app.state.kafka_consumer_supervisor = supervisor

@@ -1,5 +1,6 @@
 from .app import (
     AppSetting,
+    ExternalConnection,
     KafkaConnection,
     Normalizer,
     OidcRoleMapping,
@@ -13,6 +14,7 @@ from .logs import KafkaOperationalEvent, ParsedLog, ProcessedKafkaRecord, Proces
 __all__ = [
     "AppSetting",
     "AuthSession",
+    "ExternalConnection",
     "KafkaConnection",
     "KafkaOperationalEvent",
     "Normalizer",

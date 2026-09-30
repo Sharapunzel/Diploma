@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     kafka_consumer_poll_timeout_seconds: float = 1.0
     kafka_consumer_retry_delay_seconds: float = 2.0
     kafka_supervisor_sync_seconds: float = 1.0
+    external_secret_key: SecretStr | None = None
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
     @field_validator("cors_origins", "oidc_scopes", "trusted_hosts", mode="before")

@@ -214,6 +214,22 @@ class KafkaConnection(TimestampMixin, Base):
     )
 
 
+class ExternalConnection(TimestampMixin, Base):
+    __tablename__ = "external_connections"
+    __table_args__ = (
+        CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
+        CheckConstraint("btrim(base_url) <> ''", name="base_url_not_blank"),
+        CheckConstraint("btrim(username) <> ''", name="username_not_blank"),
+        {"schema": "app"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    name: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    username: Mapped[str] = mapped_column(Text, nullable=False)
+    encrypted_password: Mapped[str] = mapped_column(Text, nullable=False)
+    ca_pem: Mapped[str | None] = mapped_column(Text)
+
+
 class Source(TimestampMixin, Base):
     __tablename__ = "sources"
     __table_args__ = (
@@ -227,8 +243,39 @@ class Source(TimestampMixin, Base):
             postgresql_where=text("is_archived = false AND kafka_topic_identity IS NOT NULL"),
         ),
         CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
-        CheckConstraint("btrim(topic_name) <> ''", name="topic_name_not_blank"),
+        CheckConstraint("topic_name IS NULL OR btrim(topic_name) <> ''", name="topic_name_not_blank"),
+        CheckConstraint("index_name IS NULL OR btrim(index_name) <> ''", name="index_name_not_blank"),
+        CheckConstraint("index_pattern IS NULL OR btrim(index_pattern) <> ''", name="index_pattern_not_blank"),
+        CheckConstraint("data_stream_name IS NULL OR btrim(data_stream_name) <> ''", name="data_stream_name_not_blank"),
+        CheckConstraint("data_stream_pattern IS NULL OR btrim(data_stream_pattern) <> ''", name="data_stream_pattern_not_blank"),
+        CheckConstraint(
+            "(source_type = 'kafka' AND connection_id IS NOT NULL AND "
+            "external_connection_id IS NULL AND topic_name IS NOT NULL AND "
+            "target_type IS NULL AND index_name IS NULL AND index_pattern IS NULL AND "
+            "data_stream_name IS NULL AND data_stream_pattern IS NULL) OR "
+            "(source_type = 'external' AND connection_id IS NULL AND "
+            "external_connection_id IS NOT NULL AND target_type IS NOT NULL AND topic_name IS NULL AND "
+            "kafka_topic_identity IS NULL AND normalizer_id IS NULL AND "
+            "is_archived = false AND ((target_type = 'index' AND index_name IS NOT NULL AND "
+            "index_pattern IS NULL AND data_stream_name IS NULL AND data_stream_pattern IS NULL) OR "
+            "(target_type = 'index_pattern' AND index_name IS NULL AND index_pattern IS NOT NULL AND "
+            "data_stream_name IS NULL AND data_stream_pattern IS NULL) OR "
+            "(target_type = 'data_stream' AND index_name IS NULL AND index_pattern IS NULL AND "
+            "data_stream_name IS NOT NULL AND data_stream_pattern IS NULL) OR "
+            "(target_type = 'data_stream_pattern' AND index_name IS NULL AND index_pattern IS NULL AND "
+            "data_stream_name IS NULL AND data_stream_pattern IS NOT NULL)))",
+            name="source_type_fields",
+        ),
+        Index("uq_sources_external_index", "external_connection_id", "index_name", unique=True,
+              postgresql_where=text("source_type = 'external' AND index_name IS NOT NULL")),
+        Index("uq_sources_external_pattern", "external_connection_id", "index_pattern", unique=True,
+              postgresql_where=text("source_type = 'external' AND index_pattern IS NOT NULL")),
+        Index("uq_sources_external_data_stream", "external_connection_id", "data_stream_name", unique=True,
+              postgresql_where=text("source_type = 'external' AND data_stream_name IS NOT NULL")),
+        Index("uq_sources_external_data_stream_pattern", "external_connection_id", "data_stream_pattern", unique=True,
+              postgresql_where=text("source_type = 'external' AND data_stream_pattern IS NOT NULL")),
         Index("ix_sources_connection_id", "connection_id"),
+        Index("ix_sources_external_connection_id", "external_connection_id"),
         Index("ix_sources_normalizer_id", "normalizer_id"),
         {"schema": "app"},
     )
@@ -236,13 +283,22 @@ class Source(TimestampMixin, Base):
         primary_key=True, server_default=text("gen_random_uuid()")
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    connection_id: Mapped[UUID] = mapped_column(
-        ForeignKey("app.kafka_connections.id", ondelete="CASCADE"), nullable=False
+    source_type: Mapped[str] = mapped_column(Text, server_default=text("'kafka'"), nullable=False)
+    connection_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("app.kafka_connections.id", ondelete="CASCADE")
     )
+    external_connection_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("app.external_connections.id", ondelete="CASCADE")
+    )
+    index_name: Mapped[str | None] = mapped_column(Text)
+    index_pattern: Mapped[str | None] = mapped_column(Text)
+    target_type: Mapped[str | None] = mapped_column(Text)
+    data_stream_name: Mapped[str | None] = mapped_column(Text)
+    data_stream_pattern: Mapped[str | None] = mapped_column(Text)
     normalizer_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("app.normalizers.id", ondelete="SET NULL")
     )
-    topic_name: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_name: Mapped[str | None] = mapped_column(Text)
     kafka_topic_identity: Mapped[str | None] = mapped_column(Text)
     is_archived: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), nullable=False

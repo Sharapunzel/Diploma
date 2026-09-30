@@ -12,14 +12,14 @@ class SqlAlchemyDiagnosticsRepository:
         self.session = session
 
     def sources(self, limit: int, offset: int):
-        total = self.session.scalar(select(func.count()).select_from(Source)) or 0
+        total = self.session.scalar(select(func.count()).select_from(Source).where(Source.source_type == "kafka")) or 0
         rows = self.session.scalars(
-            select(Source).order_by(Source.id).limit(limit).offset(offset)
+            select(Source).where(Source.source_type == "kafka").order_by(Source.id).limit(limit).offset(offset)
         ).all()
         return list(rows), total
 
     def source(self, source_id: UUID):
-        return self.session.get(Source, source_id)
+        return self.session.scalar(select(Source).where(Source.id == source_id, Source.source_type == "kafka"))
 
     def connection_names(self, connection_ids: list[UUID]) -> dict[UUID, str]:
         if not connection_ids:
@@ -101,12 +101,12 @@ class SqlAlchemyDiagnosticsRepository:
                 func.count(Source.id),
                 func.count(Source.id).filter(Source.is_enabled.is_(True)),
                 func.count(Source.id).filter(Source.is_archived.is_(True)),
-            )
+            ).where(Source.source_type == "kafka")
         ).one()
         enabled_worker_ids = (
             set(self.session.scalars(
                 select(Source.id).where(
-                    Source.is_enabled.is_(True), Source.id.in_(worker_source_ids)
+                    Source.source_type == "kafka", Source.is_enabled.is_(True), Source.id.in_(worker_source_ids)
                 )
             ).all())
             if worker_source_ids

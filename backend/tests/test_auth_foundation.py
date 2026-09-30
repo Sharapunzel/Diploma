@@ -369,6 +369,7 @@ def clear_auth_state(auth_database):
         connection.execute(text("DELETE FROM app.auth_sessions"))
         connection.execute(text("DELETE FROM app.oidc_role_mappings"))
         connection.execute(text("DELETE FROM app.sources"))
+        connection.execute(text("DELETE FROM app.external_connections"))
         connection.execute(text("DELETE FROM app.kafka_connections"))
         connection.execute(text("DELETE FROM app.normalizers"))
         connection.execute(text("DELETE FROM app.app_settings"))
@@ -2650,7 +2651,7 @@ def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_
         }
     assert "processing_errors.raw.read" in before[ADMIN_ID][1]
     assert "processing_errors.raw.read" not in before[GUEST_ID][1]
-    run_alembic(auth_database_url, "downgrade", "-1")
+    run_alembic(auth_database_url, "downgrade", "0007_kafka_generations_and_gaps")
     with psycopg.connect(url) as connection:
         downgraded = {
             row[0]: (row[1], set(row[2]))
@@ -3845,3 +3846,338 @@ def test_parsed_log_migration_backfills_normalizer_snapshots(auth_database_url, 
             )).scalars()) == {"historical-normalizer", "legacy-unknown"}
     finally:
         run_alembic(auth_database_url, "upgrade", "head")
+
+
+def test_external_api_permissions_and_secret_dto(client, auth_database, auth_settings):
+    from cryptography.fernet import Fernet
+    from pydantic import SecretStr
+
+    class Metadata:
+        def indices(self, base_url, username, password, ca_pem):
+            assert password == "indexer-password"
+            return ["logs-2026", "logs-2027"]
+
+    auth_settings.external_secret_key = SecretStr(Fernet.generate_key().decode())
+    client.app.state.indexer_adapter = Metadata()
+    add_local_user(auth_database, "reader")
+    assert login(client, "reader").status_code == 200
+    assert client.get("/api/v1/external-connections").status_code == 200
+    assert client.get("/api/v1/external-sources").status_code == 200
+    assert client.get("/api/v1/external-connections/00000000-0000-0000-0000-000000000000/indices").status_code == 403
+    client.cookies.clear()
+    headers = admin_headers(client, auth_database)
+    created = client.post("/api/v1/external-connections", json={
+        "name": "indexer", "base_url": "https://indexer.local:9200",
+        "username": "reader", "password": "indexer-password",
+    }, headers=headers)
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["has_password"] and not payload["has_ca"]
+    assert "password" not in payload and "ca_pem" not in payload
+    connection_id = payload["id"]
+    assert client.post(f"/api/v1/external-connections/{connection_id}/test",
+                       headers=headers).json() == {"status": "ok"}
+    assert client.get(f"/api/v1/external-connections/{connection_id}/indices?limit=1",
+                      headers=headers).json()["items"] == ["logs-2026"]
+    assert client.get("/api/v1/external-sources").json()["total"] == 0
+    source = client.post("/api/v1/external-sources", json={
+        "name": "logs", "external_connection_id": connection_id,
+        "target_type": "index_pattern", "index_pattern": "logs-*",
+    }, headers=headers)
+    assert source.status_code == 201 and not source.json()["is_enabled"]
+    source_id = source.json()["id"]
+    assert client.post(f"/api/v1/external-sources/{source_id}/enable",
+                       headers=headers).json()["is_enabled"]
+    assert client.get("/api/v1/sources").json()["total"] == 0
+    changed = client.patch(f"/api/v1/external-connections/{connection_id}",
+                           json={"name": "renamed"}, headers=headers)
+    assert changed.status_code == 200 and "password" not in changed.json()
+    assert not client.get(f"/api/v1/external-sources/{source_id}").json()["is_enabled"]
+    missing = client.post("/api/v1/external-sources", json={
+        "name": "missing", "external_connection_id": connection_id,
+        "target_type": "index", "index_name": "absent-2026",
+    }, headers=headers)
+    assert missing.status_code == 201
+    unavailable = client.post(f"/api/v1/external-sources/{missing.json()['id']}/enable",
+                              headers=headers)
+    assert unavailable.status_code == 409
+    assert unavailable.json()["code"] == "index_not_found"
+
+
+def external_admin(client, auth_database, auth_settings, adapter=None):
+    from cryptography.fernet import Fernet
+    from pydantic import SecretStr
+
+    auth_settings.external_secret_key = SecretStr(Fernet.generate_key().decode())
+    if adapter is not None:
+        client.app.state.indexer_adapter = adapter
+    return admin_headers(client, auth_database)
+
+
+def external_connection(client, headers, name="indexer", password="private-password"):
+    response = client.post("/api/v1/external-connections", json={
+        "name": name,
+        "base_url": "https://indexer.local:9200",
+        "username": "reader",
+        "password": password,
+    }, headers=headers)
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
+def ca_material(common_name):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name)
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    leaf = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name)
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    private_key = key.private_bytes(serialization.Encoding.PEM,
+                                    serialization.PrivateFormat.TraditionalOpenSSL,
+                                    serialization.NoEncryption())
+    return (certificate.public_bytes(serialization.Encoding.PEM),
+            leaf.public_bytes(serialization.Encoding.PEM), private_key)
+
+
+def test_external_ca_http_upload_replace_delete_and_safe_errors(client, auth_database,
+                                                                auth_settings):
+    ca_one, leaf, private_key = ca_material("Test One")
+    ca_two, _, _ = ca_material("Test Two")
+    add_local_user(auth_database, "ca-guest")
+    assert login(client, "ca-guest").status_code == 200
+    guest_headers = {"Content-Type": "application/x-pem-file",
+                     "X-CSRF-Token": client.get("/api/v1/auth/session").json()["csrf_token"]}
+    nonexistent = "00000000-0000-0000-0000-000000000000"
+    denied = client.put(f"/api/v1/external-connections/{nonexistent}/ca",
+                        content=ca_one, headers=guest_headers)
+    assert denied.status_code == 403 and denied.json()["code"] == "permission_denied"
+    assert client.delete(f"/api/v1/external-connections/{nonexistent}/ca",
+                         headers=guest_headers).status_code == 403
+    client.cookies.clear()
+    headers = external_admin(client, auth_database, auth_settings)
+    identity = external_connection(client, headers)
+    url = f"/api/v1/external-connections/{identity}/ca"
+    upload_headers = {**headers, "Content-Type": "application/x-pem-file"}
+    for invalid in (b"", b"ordinary file", leaf, private_key, b"x" * 65537):
+        result = client.put(url, content=invalid, headers=upload_headers)
+        assert result.status_code == 422
+        assert result.json()["code"] == "invalid_ca"
+        assert result.json()["request_id"]
+        assert ca_one.decode() not in result.text
+        assert "private-password" not in result.text
+    wrong_media = client.put(url, content=ca_one,
+                             headers={**headers, "Content-Type": "text/plain"})
+    assert wrong_media.status_code == 422
+    assert wrong_media.json()["code"] == "invalid_ca_media_type"
+    assert client.put(url, content=ca_one, headers=upload_headers).status_code == 204
+    dto = client.get(f"/api/v1/external-connections/{identity}").json()
+    assert dto["has_ca"] and dto["has_password"]
+    assert ca_one.decode() not in str(dto) and "private-password" not in str(dto)
+    with auth_database.session_factory() as session:
+        from app.models import ExternalConnection
+        assert session.get(ExternalConnection, UUID(identity)).ca_pem == ca_one.decode()
+    assert client.put(url, content=ca_two, headers=upload_headers).status_code == 204
+    with auth_database.session_factory() as session:
+        assert session.get(ExternalConnection, UUID(identity)).ca_pem == ca_two.decode()
+    assert client.delete(url, headers=headers).status_code == 204
+    assert not client.get(f"/api/v1/external-connections/{identity}").json()["has_ca"]
+
+
+def test_external_http_target_password_connection_and_cascade(client, auth_database,
+                                                              auth_settings):
+    class Metadata:
+        def indices(self, base_url, username, password, ca_pem):
+            assert password in {"private-password", "rotated-password"}
+            return ["logs-2026", "logs-2027"]
+
+        def data_streams(self, base_url, username, password, ca_pem):
+            assert password in {"private-password", "rotated-password"}
+            return ["wazuh-findings-v5-security", "wazuh-findings-v5-vulnerability"]
+
+    headers = external_admin(client, auth_database, auth_settings, Metadata())
+    first = external_connection(client, headers)
+    second = external_connection(client, headers, name="second")
+    streams = client.get(f"/api/v1/external-connections/{first}/data-streams", headers=headers)
+    assert streams.status_code == 200 and streams.json()["total"] == 2
+    wrong_kind = client.post("/api/v1/external-sources", json={
+        "name": "stream-as-index", "external_connection_id": first,
+        "target_type": "index", "index_name": "wazuh-findings-v5-security",
+    }, headers=headers)
+    assert wrong_kind.status_code == 201
+    assert client.post(f"/api/v1/external-sources/{wrong_kind.json()['id']}/enable",
+                       headers=headers).status_code == 409
+    for target_type, field, value in (
+        ("data_stream", "data_stream_name", "wazuh-findings-v5-security"),
+        ("data_stream_pattern", "data_stream_pattern", "wazuh-findings-v5-*"),
+    ):
+        stream = client.post("/api/v1/external-sources", json={
+            "name": target_type, "external_connection_id": first,
+            "target_type": target_type, field: value,
+        }, headers=headers)
+        assert stream.status_code == 201 and not stream.json()["is_enabled"]
+        assert client.post(f"/api/v1/external-sources/{stream.json()['id']}/enable",
+                           headers=headers).json()["is_enabled"]
+    created = client.post("/api/v1/external-sources", json={
+        "name": "exact", "external_connection_id": first, "target_type": "index", "index_name": "logs-2026",
+    }, headers=headers)
+    assert created.status_code == 201
+    identity = created.json()["id"]
+    duplicate = client.post("/api/v1/external-sources", json={
+        "name": "duplicate", "external_connection_id": first, "target_type": "index", "index_name": "logs-2026",
+    }, headers=headers)
+    assert duplicate.status_code == 409
+    assert client.post(f"/api/v1/external-sources/{identity}/enable",
+                       headers=headers).json()["is_enabled"]
+    changed = client.patch(f"/api/v1/external-sources/{identity}",
+                           json={"target_type": "index_pattern", "index_pattern": "logs-*"}, headers=headers)
+    assert changed.status_code == 200
+    assert changed.json()["index_name"] is None and not changed.json()["is_enabled"]
+    duplicate_pattern = client.post("/api/v1/external-sources", json={
+        "name": "duplicate mask", "external_connection_id": first,
+        "target_type": "index_pattern", "index_pattern": "logs-*",
+    }, headers=headers)
+    assert duplicate_pattern.status_code == 409
+    assert client.post(f"/api/v1/external-sources/{identity}/enable",
+                       headers=headers).json()["is_enabled"]
+    changed = client.patch(f"/api/v1/external-sources/{identity}",
+                           json={"target_type": "index", "index_name": "logs-2027"}, headers=headers)
+    assert changed.status_code == 200
+    assert changed.json()["index_pattern"] is None and not changed.json()["is_enabled"]
+    assert client.post(f"/api/v1/external-sources/{identity}/enable",
+                       headers=headers).json()["is_enabled"]
+    switched = client.patch(f"/api/v1/external-sources/{identity}",
+                            json={"external_connection_id": second}, headers=headers)
+    assert switched.status_code == 200 and not switched.json()["is_enabled"]
+    assert switched.json()["external_connection_id"] == second
+    assert client.post(f"/api/v1/external-sources/{identity}/enable",
+                       headers=headers).json()["is_enabled"]
+    rotated = client.patch(f"/api/v1/external-connections/{second}",
+                           json={"password": "rotated-password"}, headers=headers)
+    assert rotated.status_code == 200
+    assert "password" not in rotated.json() and "rotated-password" not in rotated.text
+    assert not client.get(f"/api/v1/external-sources/{identity}").json()["is_enabled"]
+    assert client.post(f"/api/v1/external-connections/{second}/test",
+                       headers=headers).json() == {"status": "ok"}
+    assert client.delete(f"/api/v1/external-connections/{first}",
+                         headers=headers).status_code == 204
+    assert client.get(f"/api/v1/external-sources/{identity}").status_code == 200
+    assert client.delete(f"/api/v1/external-connections/{second}",
+                         headers=headers).status_code == 204
+    assert client.get(f"/api/v1/external-sources/{identity}").status_code == 404
+
+
+def test_external_http_indexer_error_mapping(client, auth_database, auth_settings):
+    from app.indexer import IndexerError
+
+    class FailingMetadata:
+        kind = "access_denied"
+
+        def indices(self, base_url, username, password, ca_pem):
+            raise IndexerError(self.kind)
+
+    adapter = FailingMetadata()
+    headers = external_admin(client, auth_database, auth_settings, adapter)
+    identity = external_connection(client, headers)
+    expected = {
+        "access_denied": (403, "indexer_access_denied"),
+        "untrusted_certificate": (502, "indexer_untrusted_certificate"),
+        "hostname_mismatch": (502, "indexer_hostname_mismatch"),
+        "timeout": (504, "indexer_timeout"),
+        "unavailable": (503, "indexer_unavailable"),
+        "invalid_response": (502, "indexer_invalid_response"),
+    }
+    for kind, (status, code) in expected.items():
+        adapter.kind = kind
+        result = client.post(f"/api/v1/external-connections/{identity}/test",
+                             headers=headers)
+        assert result.status_code == status
+        assert result.json()["code"] == code
+        assert result.json()["request_id"] == result.headers["X-Request-ID"]
+        assert "private-password" not in result.text
+        assert "indexer.local" not in result.text
+
+
+def test_external_openapi_contract(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    root = "/api/v1/external-connections/{identity}"
+    checked = paths[root + "/test"]["post"]
+    assert checked["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ExternalTestResponse")
+    assert set(checked["responses"]) >= {"200", "401", "403", "404",
+                                         "422", "502", "503", "504"}
+    ca = paths[root + "/ca"]["put"]
+    body = ca["requestBody"]
+    assert body["required"]
+    schema = body["content"]["application/x-pem-file"]["schema"]
+    assert schema["type"] == "string" and schema["format"] == "binary"
+    assert "65536" in schema["description"]
+    assert root + "/data-streams" in paths
+    source_schema = client.get("/openapi.json").json()["components"]["schemas"]["ExternalSourceCreate"]
+    assert "target_type" in source_schema["required"]
+    for operation in (checked, ca, paths["/api/v1/external-sources/{identity}/enable"]["post"]):
+        for status, response in operation["responses"].items():
+            if status not in {"200", "204"}:
+                assert response["content"]["application/json"]["schema"]["$ref"].endswith(
+                    "/ErrorResponse")
+
+
+@pytest.mark.skipif(not os.getenv("WAZUH_SMOKE_URL"), reason="isolated live Wazuh smoke only")
+def test_external_live_wazuh_smoke(client, auth_database, auth_settings):
+    from cryptography.fernet import Fernet
+    from pydantic import SecretStr
+
+    auth_settings.external_secret_key = SecretStr(Fernet.generate_key().decode())
+    headers = admin_headers(client, auth_database)
+    created = client.post("/api/v1/external-connections", json={
+        "name": "wazuh-smoke", "base_url": os.environ["WAZUH_SMOKE_URL"],
+        "username": os.environ["WAZUH_SMOKE_USERNAME"],
+        "password": os.environ["WAZUH_SMOKE_PASSWORD"],
+    }, headers=headers)
+    assert created.status_code == 201, created.text
+    connection_id = created.json()["id"]
+    ca = Path(os.environ["WAZUH_SMOKE_CA"]).read_bytes()
+    uploaded = client.put(f"/api/v1/external-connections/{connection_id}/ca",
+                          content=ca, headers={**headers, "Content-Type": "application/x-pem-file"})
+    assert uploaded.status_code == 204, uploaded.text
+    streams = client.get(f"/api/v1/external-connections/{connection_id}/data-streams?limit=100",
+                         headers=headers)
+    assert streams.status_code == 200, streams.text
+    assert "wazuh-findings-v5-security" in streams.json()["items"]
+    indices = client.get(f"/api/v1/external-connections/{connection_id}/indices?limit=100",
+                         headers=headers)
+    assert indices.status_code == 200, indices.text
+    assert "wazuh-findings-v5-security" not in indices.json()["items"]
+    with auth_database.engine.connect() as connection:
+        before = connection.scalar(text("SELECT count(*) FROM logs.parsed_logs"))
+    for target_type, field, value in (
+        ("data_stream", "data_stream_name", "wazuh-findings-v5-security"),
+        ("data_stream_pattern", "data_stream_pattern", "wazuh-findings-v5-*"),
+    ):
+        source = client.post("/api/v1/external-sources", json={
+            "name": target_type, "external_connection_id": connection_id,
+            "target_type": target_type, field: value,
+        }, headers=headers)
+        assert source.status_code == 201 and not source.json()["is_enabled"], source.text
+        enabled = client.post(f"/api/v1/external-sources/{source.json()['id']}/enable",
+                              headers=headers)
+        assert enabled.status_code == 200 and enabled.json()["is_enabled"], enabled.text
+    with auth_database.engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM logs.parsed_logs")) == before

@@ -158,6 +158,7 @@ class SourceNormalizerUpdate(BaseModel):
 class SourceDTO(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
+    source_type: Literal["kafka"]
     name: str
     connection_id: UUID
     normalizer_id: UUID | None
