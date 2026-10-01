@@ -42,6 +42,7 @@ from .services.implementations.diagnostics import DiagnosticsServiceImpl
 from .services.implementations.events import EventQueryServiceImpl, PostgreSqlEventQueryProvider
 from .services.implementations.external import ExternalServiceImpl
 from .services.implementations.normalization import NormalizerPreviewServiceImpl
+from .services.implementations.opensearch_events import OpenSearchEventQueryProvider
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
 from .services.implementations.processing import DurableProcessingServiceImpl
 from .services.protocols import AuthenticationService
@@ -160,6 +161,7 @@ def get_parsed_log_service(
 
 
 def get_event_query_service(
+    request: Request,
     session: Session = Depends(get_session),
     app_settings: Settings = Depends(get_settings),
     catalog: EcsCatalog = Depends(get_ecs_catalog),
@@ -172,7 +174,15 @@ def get_event_query_service(
         catalog,
         app_settings.oidc_state_secret.get_secret_value(),
     )
-    return EventQueryServiceImpl(repository, {provider.source_type: provider})
+    secret = app_settings.external_secret_key
+    providers = {provider.source_type: provider}
+    providers["external"] = OpenSearchEventQueryProvider(
+        repository,
+        request.app.state.indexer_adapter,
+        secret.get_secret_value() if secret else None,
+        app_settings.oidc_state_secret.get_secret_value(),
+    )
+    return EventQueryServiceImpl(repository, providers)
 
 
 def get_diagnostics_service(

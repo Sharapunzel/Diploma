@@ -4167,10 +4167,14 @@ def test_external_live_wazuh_smoke(client, auth_database, auth_settings):
     assert "wazuh-findings-v5-security" not in indices.json()["items"]
     with auth_database.engine.connect() as connection:
         before = connection.scalar(text("SELECT count(*) FROM logs.parsed_logs"))
-    for target_type, field, value in (
+    targets = (
+        ("index", "index_name", "task12-concrete"),
+        ("index_pattern", "index_pattern", "task12-logs-*"),
         ("data_stream", "data_stream_name", "wazuh-findings-v5-security"),
         ("data_stream_pattern", "data_stream_pattern", "wazuh-findings-v5-*"),
-    ):
+    )
+    registered = []
+    for target_type, field, value in targets:
         source = client.post("/api/v1/external-sources", json={
             "name": target_type, "external_connection_id": connection_id,
             "target_type": target_type, field: value,
@@ -4179,10 +4183,95 @@ def test_external_live_wazuh_smoke(client, auth_database, auth_settings):
         enabled = client.post(f"/api/v1/external-sources/{source.json()['id']}/enable",
                               headers=headers)
         assert enabled.status_code == 200 and enabled.json()["is_enabled"], enabled.text
+        registered.append(source.json()["id"])
+
+    search_body = {
+        "timestamp_from": "2026-06-15T12:00:00Z",
+        "timestamp_to": "2026-06-15T12:04:00Z",
+        "sort": "asc",
+        "filters": [{"field": "wazuh.agent.name", "operator": "eq", "value": "agent-0"}],
+        "limit": 1,
+    }
+    card_event_ids = {}
+    for (target_type, _, _), source_id in zip(targets, registered, strict=True):
+        fields = client.get(
+            f"/api/v1/events/sources/{source_id}/fields?q=wazuh.agent.name",
+            headers=headers,
+        )
+        assert fields.status_code == 200, f"{target_type}: {fields.text}"
+        assert any(item["name"] == "wazuh.agent.name" for item in fields.json()["items"])
+        first = client.post(
+            f"/api/v1/events/sources/{source_id}/search", json=search_body, headers=headers
+        )
+        assert first.status_code == 200, first.text
+        result = first.json()
+        assert result["items"] and result["items"][0]["source_type"] == "external"
+        assert result["has_more"] and result["next_cursor"]
+        assert result["items"][0]["fields"]["wazuh"]["agent"]["name"] == "agent-0"
+        card_event_ids[source_id] = result["items"][0]["id"]
+        card = client.get(
+            f"/api/v1/events/sources/{source_id}/events/{result['items'][0]['id']}",
+            headers=headers,
+        )
+        assert card.status_code == 200, card.text
+        assert card.json()["fields"]["wazuh"]["agent"]["name"] == "agent-0"
+        second = client.post(
+            f"/api/v1/events/sources/{source_id}/search",
+            json={**search_body, "cursor": result["next_cursor"]},
+            headers=headers,
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["items"]
+        assert second.json()["items"][0]["id"] != result["items"][0]["id"]
+
+    numeric_time = client.post(
+        f"/api/v1/events/sources/{registered[2]}/search",
+        json={"timestamp_from": "2026-06-15T11:59:00Z",
+              "timestamp_to": "2026-06-15T12:01:00Z", "limit": 10,
+              "filters": [{"field": "event.sequence", "operator": "eq", "value": 20}]},
+        headers=headers,
+    )
+    assert numeric_time.status_code == 200, numeric_time.text
+    assert len(numeric_time.json()["items"]) == 1
+    assert numeric_time.json()["items"][0]["fields"]["@timestamp"] == 1781524800000
+    assert numeric_time.json()["items"][0]["event_timestamp"].startswith("2026-06-15T12:00:00")
+
+    assert client.post("/api/v1/auth/logout", headers=headers).status_code == 200
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    guest_headers = events_headers(client)
+    guest_search = client.post(
+        f"/api/v1/events/sources/{registered[2]}/search",
+        json={"limit": 1}, headers=guest_headers,
+    )
+    assert guest_search.status_code == 200, guest_search.text
+    guest_card = client.get(
+        f"/api/v1/events/sources/{registered[2]}/events/{card_event_ids[registered[2]]}",
+        headers=guest_headers,
+    )
+    assert guest_card.status_code == 200, guest_card.text
+
+    assert client.post("/api/v1/auth/logout", headers=guest_headers).status_code == 200
+    assert login(client, "admin").status_code == 200
+    admin_session = client.get("/api/v1/auth/session").json()
+    disabled = client.post(
+        f"/api/v1/external-sources/{registered[0]}/disable",
+        headers={"X-CSRF-Token": admin_session["csrf_token"]},
+    )
+    assert disabled.status_code == 200 and not disabled.json()["is_enabled"]
+    disabled_read = client.post(
+        f"/api/v1/events/sources/{registered[0]}/search", json={},
+        headers={"X-CSRF-Token": admin_session["csrf_token"]},
+    )
+    assert disabled_read.status_code == 409 and disabled_read.json()["code"] == "source_disabled"
     with auth_database.engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM logs.parsed_logs")) == before
+        assert connection.scalar(text("SELECT count(*) FROM logs.processed_kafka_records")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM logs.kafka_operational_events")) == 0
 
 def test_source_scoped_event_query_api(client, auth_database):
+    # Local event query dependencies must not require the optional external credential key.
+    client.app.state.settings.external_secret_key = None
     add_local_user(auth_database)
     assert login(client).status_code == 200
     headers = events_headers(client)

@@ -291,6 +291,8 @@ class EventQueryServiceImpl:
         if source is None:
             raise DomainError("source_not_found", "Source not found", 404)
         source_type, is_enabled = source
+        if source_type == "external" and not is_enabled:
+            raise DomainError("source_disabled", "Source is disabled", 409)
         provider = self.providers.get(source_type)
         if provider is None:
             if source_type == "external":
@@ -298,8 +300,6 @@ class EventQueryServiceImpl:
                     "event_source_unavailable", "Reading external sources is not implemented", 501
                 )
             raise DomainError("event_source_unsupported", "Source type is not supported", 422)
-        if source_type == "external" and not is_enabled:
-            raise DomainError("source_disabled", "Source is disabled", 409)
         return provider
 
     def fields(self, source_id: UUID, q: str | None, limit: int, offset: int) -> EventFieldPage:

@@ -116,12 +116,14 @@ def test_external_source_fails_explicitly_and_disabled_kafka_remains_readable(ca
     )
     with pytest.raises(DomainError) as error:
         service.fields(uuid4(), None, 20, 0)
-    assert error.value.status_code == 501
-    assert error.value.code == "event_source_unavailable"
+    assert error.value.status_code == 409
+    assert error.value.code == "source_disabled"
 
     local_repository = Repository(kind="kafka")
     local = local_service(local_repository, catalog)
     assert local.fields(uuid4(), "source.ip", 20, 0).total >= 1
+
+
 
 
 @pytest.mark.parametrize("value", [True, 3.5, "not-an-ip"])

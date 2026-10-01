@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB
 from sqlalchemy.orm import Session
 
 from ...ecs import EcsField
-from ...models import ParsedLog, Source
+from ...models import ExternalConnection, ParsedLog, Source
 
 
 def _path(field: EcsField):
@@ -213,6 +213,13 @@ class SqlAlchemyEventQueryRepository:
             select(Source.source_type, Source.is_enabled).where(Source.id == source_id)
         ).one_or_none()
         return row
+
+    def external_source(self, source_id: UUID):
+        return self.session.execute(
+            select(Source, ExternalConnection)
+            .join(ExternalConnection, Source.external_connection_id == ExternalConnection.id)
+            .where(Source.id == source_id, Source.source_type == "external")
+        ).one_or_none()
 
     def snapshot_boundary(self) -> datetime:
         return self.session.scalar(select(func.current_timestamp()))

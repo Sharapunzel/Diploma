@@ -1,0 +1,28 @@
+name: diploma-task12-wazuh5
+
+services:
+  indexer:
+    image: wazuh/wazuh-indexer@sha256:70d7c42518e4e295a73947ef916fc26e67f81658dd0c892d7032018b296607ce
+    container_name: diploma-task12-wazuh5-indexer
+    restart: unless-stopped
+    environment:
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - 127.0.0.1:19200:9200
+    volumes:
+      - ./opensearch.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
+      - ./runtime/certs:/usr/share/wazuh-indexer/config/certs:ro
+      - task12_wazuh_indexer_data:/var/lib/wazuh-indexer
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /usr/share/wazuh-indexer/config/certs/root-ca.pem https://localhost:9200/)\" = 401"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 90s
+
+volumes:
+  task12_wazuh_indexer_data:
