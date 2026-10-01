@@ -39,6 +39,7 @@ from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.implementations.cursor import SignedParsedLogCursorCodec
 from .services.implementations.diagnostics import DiagnosticsServiceImpl
+from .services.implementations.events import EventQueryServiceImpl, PostgreSqlEventQueryProvider
 from .services.implementations.external import ExternalServiceImpl
 from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
@@ -54,6 +55,7 @@ from .services.protocols.administration import (
 from .services.protocols.connections import KafkaConnectionService, SourceService
 from .services.protocols.consumers import SourceConsumerLifecycle
 from .services.protocols.diagnostics import DiagnosticsService
+from .services.protocols.events import EventQueryService
 from .services.protocols.external import ExternalService
 from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
@@ -155,6 +157,22 @@ def get_parsed_log_service(
         catalog,
         cursor_codec,
     )
+
+
+def get_event_query_service(
+    session: Session = Depends(get_session),
+    app_settings: Settings = Depends(get_settings),
+    catalog: EcsCatalog = Depends(get_ecs_catalog),
+) -> EventQueryService:
+    from .repositories.sqlalchemy.events import SqlAlchemyEventQueryRepository
+
+    repository = SqlAlchemyEventQueryRepository(session)
+    provider = PostgreSqlEventQueryProvider(
+        repository,
+        catalog,
+        app_settings.oidc_state_secret.get_secret_value(),
+    )
+    return EventQueryServiceImpl(repository, {provider.source_type: provider})
 
 
 def get_diagnostics_service(

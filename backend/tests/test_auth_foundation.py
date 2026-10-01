@@ -4181,3 +4181,313 @@ def test_external_live_wazuh_smoke(client, auth_database, auth_settings):
         assert enabled.status_code == 200 and enabled.json()["is_enabled"], enabled.text
     with auth_database.engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM logs.parsed_logs")) == before
+
+def test_source_scoped_event_query_api(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    headers = events_headers(client)
+    _, sources = add_source_pair(auth_database)
+    source_id, _ = sources[0]
+    other_source_id, _ = sources[1]
+    add_parsed_log(
+        auth_database,
+        timestamp=datetime(2026, 1, 2, tzinfo=UTC),
+        source_id=source_id,
+        raw="login event",
+        ecs_data={
+            "@timestamp": "2026-01-02T12:00:00Z",
+            "event": {
+                "action": "login",
+                "duration": 500,
+                "created": "2026-01-02T11:00:00Z",
+            },
+            "source": {"ip": "192.0.2.10"},
+            "file": {"code_signature": {"valid": True}},
+            "tags": ["prod", "secure"],
+        },
+    )
+    add_parsed_log(
+        auth_database,
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        source_id=source_id,
+        raw="logout event",
+        ecs_data={
+            "@timestamp": "2026-01-01T12:00:00Z",
+            "event": {
+                "action": "logout",
+                "duration": 700,
+                "created": "2026-01-01T11:00:00Z",
+            },
+            "source": {"ip": "192.0.2.11"},
+            "file": {"code_signature": {"valid": False}},
+            "tags": ["prod", "secure"],
+        },
+    )
+    add_parsed_log(
+        auth_database,
+        source_id=other_source_id,
+        ecs_data={"@timestamp": "2026-01-03T12:00:00Z", "event": {"action": "login"}},
+    )
+    add_parsed_log(
+        auth_database,
+        source_id=source_id,
+        ecs_data={"@timestamp": "historically-invalid", "event": {"action": "login"}},
+    )
+
+    fields = client.get(
+        f"/api/v1/events/sources/{source_id}/fields?q=event.action", headers=headers
+    )
+    assert fields.status_code == 200
+    assert any(item["name"] == "event.action" for item in fields.json()["items"])
+
+    first = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"limit": 1},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    result = first.json()
+    assert result["has_more"] is True
+    assert result["items"][0]["event_timestamp"] == "2026-01-02T12:00:00Z"
+    assert result["items"][0]["id"] != str(uuid4())
+    assert not result["items"][0]["id"].startswith(str(source_id))
+
+    card = client.get(
+        f"/api/v1/events/sources/{source_id}/events/{result['items'][0]['id']}",
+        headers=headers,
+    )
+    assert card.status_code == 200, card.text
+    assert card.json()["source_type"] == "kafka"
+    assert card.json()["details"]["raw"] == "login event"
+    assert "normalization_diagnostics" in card.json()["details"]["metadata"]
+    assert (
+        client.get(
+            f"/api/v1/events/sources/{other_source_id}/events/{result['items'][0]['id']}",
+            headers=headers,
+        ).status_code
+        == 404
+    )
+
+    second = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"limit": 1, "cursor": result["next_cursor"]},
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["items"][0]["event_timestamp"] == "2026-01-01T12:00:00Z"
+
+    for condition in (
+        {"field": "event.action", "operator": "eq", "value": "login"},
+        {"field": "event.action", "operator": "in", "value": ["login", "logout"]},
+        {"field": "event.action", "operator": "exists"},
+        {"field": "source.ip", "operator": "eq", "value": "192.0.2.10"},
+        {"field": "source.ip", "operator": "in", "value": ["192.0.2.10"]},
+        {"field": "event.duration", "operator": "gt", "value": 600},
+        {"field": "event.duration", "operator": "gte", "value": 700},
+        {"field": "event.duration", "operator": "lt", "value": 600},
+        {"field": "event.duration", "operator": "lte", "value": 500},
+        {"field": "event.duration", "operator": "neq", "value": 500},
+        {"field": "event.action", "operator": "contains", "value": "out"},
+        {"field": "event.action", "operator": "contains", "value": "%"},
+        {"field": "event.action", "operator": "contains", "value": "LOG"},
+        {"field": "event.action", "operator": "starts_with", "value": "log"},
+        {"field": "event.action", "operator": "ends_with", "value": "out"},
+        {"field": "event.created", "operator": "eq", "value": "2026-01-02T11:00:00Z"},
+        {"field": "event.created", "operator": "gt", "value": "2025-12-31T11:00:00Z"},
+        {"field": "file.code_signature.valid", "operator": "in", "value": [True]},
+        {"field": "tags", "operator": "in", "value": ["prod"]},
+        {"field": "tags", "operator": "contains", "value": "cur"},
+        {"field": "host.name", "operator": "not_exists"},
+        {"field": "event.action", "operator": "neq", "value": "login"},
+    ):
+        response = client.post(
+            f"/api/v1/events/sources/{source_id}/search",
+            json={"filters": [condition]},
+            headers=headers,
+        )
+        assert response.status_code == 200, (condition, response.text)
+        if condition["operator"] == "contains" and condition.get("value") in {"%", "LOG"}:
+            expected_count = 0
+        else:
+            expected_count = (
+                2
+                if condition["operator"] in {"starts_with", "not_exists", "exists"}
+                or condition["field"] == "tags"
+                or (condition["field"] == "event.action" and condition["operator"] == "in")
+                or (condition["field"] == "event.created" and condition["operator"] == "gt")
+                else 1
+            )
+        assert len(response.json()["items"]) == expected_count, condition
+
+    bounded = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={
+            "timestamp_from": "2026-01-02T12:00:00+00:00",
+            "timestamp_to": "2026-01-03T12:00:00+00:00",
+        },
+        headers=headers,
+    )
+    assert bounded.status_code == 200 and len(bounded.json()["items"]) == 1
+
+    filtered = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"filters": [{"field": "event.action", "operator": "in", "value": ["login"]}]},
+        headers=headers,
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert len(filtered.json()["items"]) == 1
+    tampered = result["next_cursor"][:8] + "A" + result["next_cursor"][9:]
+    rejected = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"limit": 1, "cursor": tampered},
+        headers=headers,
+    )
+    assert rejected.status_code == 422 and rejected.json()["code"] == "invalid_cursor"
+    changed_query = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"limit": 1, "sort": "asc", "cursor": result["next_cursor"]},
+        headers=headers,
+    )
+    assert changed_query.status_code == 422 and changed_query.json()["code"] == "invalid_cursor"
+    assert (
+        client.get(f"/api/v1/events/sources/{uuid4()}/fields", headers=headers).status_code == 404
+    )
+    legacy_catalog = client.get("/api/v1/ecs/fields/event.action", headers=headers).json()
+    assert not ({"in", "starts_with", "ends_with"} & set(legacy_catalog["operators"]))
+    for operator, value in (("in", ["login"]), ("starts_with", "log"), ("ends_with", "out")):
+        legacy = client.post(
+            "/api/v1/parsed-logs/search",
+            json={"ecs_filters": [{"field": "event.action", "operator": operator, "value": value}]},
+            headers=headers,
+        )
+        assert legacy.status_code == 422
+        assert legacy.json()["code"] == "ecs_filter_invalid"
+    assert client.post("/api/v1/auth/logout", headers=headers).status_code == 200
+    assert client.get(f"/api/v1/events/sources/{source_id}/fields").status_code == 401
+
+
+def test_event_query_null_presence_neq_ties_sort_and_guest_permissions(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    headers = events_headers(client)
+    _, sources = add_source_pair(auth_database)
+    source_id = sources[0][0]
+    records = [
+        {"@timestamp": "2026-01-01T00:00:00Z", "tags": ["safe"], "event": {"duration": 100, "created": "invalid-date"}},
+        {"@timestamp": "2026-01-01T05:00:00+05:00", "tags": [], "event": {"action": None, "duration": 200, "created": "2026-01-01T00:00:00Z"}},
+        {"@timestamp": "2026-01-02T00:00:00Z", "tags": ["other"], "event": {"action": "", "duration": 300, "created": "2026-01-02T00:00:00Z"}},
+        {"@timestamp": "2026-01-03T00:00:00Z", "event": {"action": "ok", "duration": 400, "created": "2026-01-03T00:00:00Z"}},
+    ]
+    for document in records:
+        add_parsed_log(auth_database, source_id=source_id, ecs_data=document)
+
+    def query(filters):
+        response = client.post(
+            f"/api/v1/events/sources/{source_id}/search",
+            json={"filters": filters},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["items"]
+
+    assert len(query([{"field": "event.action", "operator": "exists"}])) == 3
+    assert len(query([{"field": "event.action", "operator": "not_exists"}])) == 1
+    assert len(query([{"field": "event.action", "operator": "eq", "value": ""}])) == 1
+    assert len(query([{"field": "event.action", "operator": "neq", "value": "ok"}])) == 1
+    assert len(query([{"field": "tags", "operator": "neq", "value": "safe"}])) == 2
+    assert len(query([{"field": "event.duration", "operator": "in", "value": [100, 400]}])) == 2
+    assert len(query([{"field": "event.created", "operator": "gt", "value": "2025-12-31T00:00:00Z"}])) == 3
+    assert len(query([{"field": "event.action", "operator": "eq", "value": "ok"},
+                      {"field": "event.duration", "operator": "eq", "value": 400}])) == 1
+    assert len(query([{"field": "event.action", "operator": "eq", "value": "ok"},
+                      {"field": "event.duration", "operator": "eq", "value": 300}])) == 0
+
+    tied = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"timestamp_from": "2026-01-01T00:00:00Z",
+              "timestamp_to": "2026-01-02T00:00:00Z", "limit": 1, "sort": "asc"},
+        headers=headers,
+    ).json()
+    assert tied["has_more"] is True
+    tied_next = client.post(
+        f"/api/v1/events/sources/{source_id}/search",
+        json={"timestamp_from": "2026-01-01T00:00:00Z",
+              "timestamp_to": "2026-01-02T00:00:00Z", "limit": 1,
+              "sort": "asc", "cursor": tied["next_cursor"]},
+        headers=headers,
+    ).json()
+    assert tied_next["items"][0]["event_timestamp"] == tied["items"][0]["event_timestamp"]
+    assert tied_next["items"][0]["id"] != tied["items"][0]["id"]
+
+    descending = client.post(
+        f"/api/v1/events/sources/{source_id}/search", json={"sort": "desc"}, headers=headers
+    ).json()["items"]
+    ascending = client.post(
+        f"/api/v1/events/sources/{source_id}/search", json={"sort": "asc"}, headers=headers
+    ).json()["items"]
+    assert descending[0]["event_timestamp"] > descending[-1]["event_timestamp"]
+    assert ascending[0]["event_timestamp"] < ascending[-1]["event_timestamp"]
+
+    for condition in (
+        {"field": "source.ip", "operator": "eq", "value": "not-an-ip"},
+        {"field": "event.duration", "operator": "contains", "value": "100"},
+        {"field": "wazuh.fake.field", "operator": "eq", "value": "bad"},
+        {"field": "event.duration", "operator": "in", "value": []},
+    ):
+        invalid = client.post(
+            f"/api/v1/events/sources/{source_id}/search",
+            json={"filters": [condition]},
+            headers=headers,
+        )
+        assert invalid.status_code == 422, (condition, invalid.text)
+
+    with auth_database.session_factory() as session:
+        guest = session.get(Role, GUEST_ID)
+        original_permissions = list(guest.permissions)
+        guest.permissions = [permission for permission in original_permissions if permission != "events.read"]
+        session.commit()
+    try:
+        denied = client.post(
+            f"/api/v1/events/sources/{source_id}/search", json={}, headers=headers
+        )
+        assert denied.status_code == 403
+    finally:
+        with auth_database.session_factory() as session:
+            guest = session.get(Role, GUEST_ID)
+            guest.permissions = original_permissions
+            session.commit()
+
+
+def test_event_cursor_excludes_later_inserts_and_skips_deleted_rows(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    headers = events_headers(client)
+    _, sources = add_source_pair(auth_database)
+    source_id = sources[0][0]
+    identities = [
+        add_parsed_log(
+            auth_database,
+            source_id=source_id,
+            timestamp=datetime(2026, 1, day, tzinfo=UTC),
+            ecs_data={"@timestamp": f"2026-01-{day:02d}T00:00:00Z", "event": {"action": str(day)}},
+        )
+        for day in (1, 2, 3)
+    ]
+    route = f"/api/v1/events/sources/{source_id}/search"
+    first = client.post(route, json={"limit": 1}, headers=headers).json()
+    assert first["has_more"] is True
+    inserted = add_parsed_log(
+        auth_database,
+        source_id=source_id,
+        timestamp=datetime(2026, 1, 4, tzinfo=UTC),
+        ecs_data={"@timestamp": "2026-01-04T00:00:00Z", "event": {"action": "late"}},
+    )
+    with auth_database.session_factory() as session:
+        session.delete(session.get(ParsedLog, identities[1]))
+        session.commit()
+    second = client.post(
+        route, json={"limit": 1, "cursor": first["next_cursor"]}, headers=headers
+    ).json()
+    assert [item["fields"]["@timestamp"] for item in second["items"]] == ["2026-01-01T00:00:00Z"]
+    assert second["has_more"] is False
+    assert all(item["id"] != str(inserted) for item in second["items"])

@@ -339,6 +339,65 @@ snapshots (using `legacy-unknown` only when the old relation cannot provide a na
 adds a GIN trigram index for raw substring search. Apply it with the normal
 `python -m alembic upgrade head` workflow.
 
+## Source-scoped event query API
+
+The common read-only event API operates on one source at a time. Local Kafka sources use
+the PostgreSQL `parsed_logs.ecs_data` document; external sources return
+`501 event_source_unavailable` until the OpenSearch adapter is implemented in TASK-12. A missing
+or deleted source returns `404 source_not_found`. Existing local events remain readable
+when their Kafka source is disabled. The legacy `/parsed-logs/*` API above retains its
+existing request and response contract.
+
+* `GET /api/v1/events/sources/{source_id}/fields?q=source.ip&limit=50&offset=0` returns
+  searchable ECS 9.4.0 fields from the packaged catalog, not a scan of stored events.
+* `POST /api/v1/events/sources/{source_id}/search` filters one field per condition; conditions
+  combine with AND and `in` is OR within one field. It sorts by `@timestamp` and supports
+  half-open timezone-aware bounds. Missing or malformed historical timestamps are excluded.
+* `GET /api/v1/events/sources/{source_id}/events/{event_id}` returns event fields and a
+  source-specific typed extension. The common card does not require raw logs or Kafka
+  metadata; those are provided by the local variant. Event IDs are provider-defined opaque
+  strings and work only with their matching source.
+
+Search request example:
+
+```json
+{
+  "timestamp_from": "2026-01-01T00:00:00Z",
+  "timestamp_to": "2026-02-01T00:00:00Z",
+  "sort": "desc",
+  "filters": [
+    {"field": "event.action", "operator": "in", "value": ["login", "logout"]},
+    {"field": "source.ip", "operator": "eq", "value": "192.0.2.10"}
+  ],
+  "limit": 50,
+  "cursor": null
+}
+```
+
+String comparisons are case-sensitive and literal: `contains`, `starts_with` and `ends_with`
+escape SQL LIKE metacharacters. Supported operators are published per field in the field
+catalog. Filter count is capped at 20, `in` at 20 values, string values at 512 characters,
+page size at 100 and cursors at 4096 characters. Values are type-checked before parameterized
+JSONB queries; clients cannot send SQL, JSONPath or OpenSearch DSL. Value comparisons against
+malformed or wrongly typed stored values do not match. The API does not scan all documents
+for field discovery or compute a total event count.
+
+For JSON field presence, `exists` is true when the key is present even if its value is JSON
+`null`; `not_exists` is true only when the key is absent. JSON `null` is not a valid typed
+comparison value, so it matches neither `eq` nor `neq`. An empty string is present and is a
+valid string value: it matches `eq` with `""`, while `neq` compares it normally.
+
+Provider registration is keyed by source type behind the unchanged router and query DTOs.
+Each provider supplies its own searchable field catalog, event IDs and continuation state;
+the common protocol requires cursors to bind source, filters, time range, sort direction and
+a stable provider snapshot boundary. PostgreSQL uses an encrypted signed cursor with a
+database `created_at` cutoff and last `(event timestamp, UUID)` position. Normal inserts committed
+after the cutoff are excluded; as with the existing search API, this is not a long-lived
+MVCC snapshot, so late commits with an earlier `created_at` can still appear and deletions
+can remove rows between pages. JSONB field filtering and timestamp conversion are evaluated
+in PostgreSQL. The existing GIN index on `ecs_data` supports containment predicates; arbitrary
+field/range combinations and timestamp casts do not have a constant-time guarantee.
+
 ```http
 DELETE /api/v1/parsed-logs/7ca4e014-175a-4bfe-8e3f-5de190868647
 X-CSRF-Token: <session csrf token>
