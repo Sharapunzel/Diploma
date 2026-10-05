@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -28,20 +30,43 @@ class Settings(BaseSettings):
     session_idle_ttl_seconds: int = 1800
     session_touch_interval_seconds: int = 60
     trusted_hosts: list[str] = []
+    forwarded_allow_ips: list[str] = ["127.0.0.1"]
     kafka_metadata_timeout_seconds: int = 5
     kafka_consumers_enabled: bool = True
     kafka_consumer_poll_timeout_seconds: float = 1.0
     kafka_consumer_retry_delay_seconds: float = 2.0
     kafka_supervisor_sync_seconds: float = 1.0
     external_secret_key: SecretStr | None = None
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="", extra="ignore", enable_decoding=False
+    )
 
-    @field_validator("cors_origins", "oidc_scopes", "trusted_hosts", mode="before")
+    @field_validator("cors_origins", "oidc_scopes", "trusted_hosts", "forwarded_allow_ips", mode="before")
     @classmethod
     def split_csv(cls, value):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def read_file_secrets(cls, values):
+        if not isinstance(values, dict):
+            return values
+        for field_name in (
+            "database_url",
+            "oidc_state_secret",
+            "oidc_client_secret",
+            "external_secret_key",
+        ):
+            file_value = os.getenv(f"{field_name.upper()}_FILE")
+            if not file_value:
+                continue
+            try:
+                values[field_name] = Path(file_value).read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise ValueError(f"cannot read {field_name} secret file") from error
+        return values
 
     @model_validator(mode="after")
     def validate_security(self):
@@ -85,17 +110,29 @@ class Settings(BaseSettings):
                 parsed.scheme in {"http", "https"} and parsed.netloc
             )):
                 raise ValueError(f"{field_name} must be relative or an absolute HTTP(S) URL")
+            if self.environment == "production" and parsed.netloc and parsed.scheme != "https":
+                raise ValueError(f"{field_name} absolute production URL must use HTTPS")
         if self.session_cookie_samesite == "none" and not self.session_cookie_secure:
             raise ValueError("SameSite=None requires Secure cookies")
         if self.environment == "production" and (
             not self.session_cookie_secure
+            or not self.trusted_hosts
+            or "*" in self.trusted_hosts
+            or not self.forwarded_allow_ips
+            or self.external_secret_key is None
             or len(self.oidc_state_secret.get_secret_value().encode()) < 32
             or self.oidc_state_secret.get_secret_value()
             == "development-only-change-me-please-32-bytes"
         ):
             raise ValueError(
-                "production requires secure cookies and a unique 32-byte OIDC secret"
+                "production requires secure cookies, trusted proxy/host settings and a unique 32-byte OIDC secret"
             )
+        if self.environment == "production" and self.oidc_enabled and self.oidc_client_secret is None:
+            raise ValueError("production OIDC requires its client secret")
+        if self.environment == "production" and self.oidc_enabled and (
+            not self.oidc_redirect_uri or not self.oidc_redirect_uri.startswith("https://")
+        ):
+            raise ValueError("production OIDC_REDIRECT_URI must use public HTTPS")
         return self
 
 

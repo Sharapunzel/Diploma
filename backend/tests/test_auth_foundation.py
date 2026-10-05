@@ -1309,6 +1309,49 @@ def test_settings_security_validation():
         Settings(environment="production", session_cookie_secure=True)
 
 
+def test_openapi_http_routes_follow_environment():
+    development = create_app(Settings(environment="development"))
+    production = create_app(Settings(
+        environment="production",
+        session_cookie_secure=True,
+        oidc_state_secret="unique-production-secret-value-at-least-32-bytes",
+        external_secret_key="FjzCZG1bo4T5WBYB_oBUrhyoSEkbxsOgCwMsNXCEsVw=",
+        trusted_hosts=["example.test"],
+        forwarded_allow_ips=["172.30.0.10"],
+    ))
+    try:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert any(getattr(route, "path", None) == path for route in development.routes)
+            assert not any(getattr(route, "path", None) == path for route in production.routes)
+        assert production.openapi()["paths"]
+    finally:
+        development.state.database.dispose()
+        production.state.database.dispose()
+
+
+def test_production_secret_files_are_loaded(tmp_path, monkeypatch):
+    secrets = {
+        "DATABASE_URL_FILE": "postgresql+psycopg://app:protected@db:5432/diploma_db",
+        "OIDC_STATE_SECRET_FILE": "a-unique-production-state-secret-with-32-bytes",
+        "OIDC_CLIENT_SECRET_FILE": "oidc-client-secret",
+        "EXTERNAL_SECRET_KEY_FILE": "FjzCZG1bo4T5WBYB_oBUrhyoSEkbxsOgCwMsNXCEsVw=",
+    }
+    for name, value in secrets.items():
+        path = tmp_path / name.lower()
+        path.write_text(value, encoding="utf-8")
+        monkeypatch.setenv(name, str(path))
+    configured = Settings(
+        environment="production",
+        session_cookie_secure=True,
+        trusted_hosts=["example.test"],
+        forwarded_allow_ips=["172.30.0.10"],
+    )
+    assert configured.database_url == secrets["DATABASE_URL_FILE"]
+    assert configured.oidc_state_secret.get_secret_value() == secrets["OIDC_STATE_SECRET_FILE"]
+    assert configured.oidc_client_secret.get_secret_value() == secrets["OIDC_CLIENT_SECRET_FILE"]
+    assert configured.external_secret_key.get_secret_value() == secrets["EXTERNAL_SECRET_KEY_FILE"]
+
+
 def test_openapi_declares_auth_paths_success_and_error_dtos(client):
     schema = client.get("/openapi.json").json()
     for path in (

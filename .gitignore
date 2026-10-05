@@ -8,3 +8,20 @@ __pycache__/
 .venv/
 backend/*.egg-info/
 .env
+/.env.production
+/.env.*
+/.task13-smoke/
+# Local secret material: keep only the explicit, non-secret dev template tracked.
+.dev/*
+*secret*
+*password*
+*credential*
+*.secret
+*.secret.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+!.dev/postgres_password.example

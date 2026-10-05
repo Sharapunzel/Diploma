@@ -116,7 +116,15 @@ def create_app(
             if owned_database and consumers_stopped:
                 configured_database.dispose()
 
-    app = FastAPI(title="Diploma API", version="1.0.0", lifespan=lifespan)
+    expose_schema = current.environment != "production"
+    app = FastAPI(
+        title="Diploma API",
+        version="1.0.0",
+        lifespan=lifespan,
+        docs_url="/docs" if expose_schema else None,
+        redoc_url="/redoc" if expose_schema else None,
+        openapi_url="/openapi.json" if expose_schema else None,
+    )
     app.state.settings = current
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
