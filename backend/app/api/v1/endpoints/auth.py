@@ -9,7 +9,13 @@ from ....config import Settings
 from ....core.errors import DomainError
 from ....dependencies import get_auth_service, get_oidc_client, get_settings
 from ....repositories.protocols import OidcClient
-from ....schemas.auth import ErrorResponse, LocalLoginRequest, PrincipalDTO, SessionResponse
+from ....schemas.auth import (
+    AuthMethodsResponse,
+    ErrorResponse,
+    LocalLoginRequest,
+    PrincipalDTO,
+    SessionResponse,
+)
 from ....services.protocols import AuthenticationService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -73,6 +79,14 @@ def clear_auth_cookies(response: Response, settings: Settings):
         path="/",
         secure=settings.session_cookie_secure,
         samesite=settings.session_cookie_samesite,
+    )
+
+
+@router.get("/methods", response_model=AuthMethodsResponse)
+def auth_methods(settings: Settings = Depends(get_settings)):
+    return AuthMethodsResponse(
+        local_enabled=settings.local_auth_enabled,
+        oidc_enabled=settings.oidc_enabled,
     )
 
 

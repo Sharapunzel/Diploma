@@ -53,6 +53,7 @@ def test_dev_compose_passes_external_key_and_oidc_settings():
     assert config["name"] == project
     assert {item["name"] for item in config["volumes"].values()} == {
         f"{project}_postgres_data", f"{project}_kafka_data",
+        f"{project}_frontend_node_modules",
     }
     for key, value in expected.items():
         assert api[key] == value

@@ -95,6 +95,25 @@ ADMIN_ID = UUID("00000000-0000-4000-8000-000000000001")
 GUEST_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 
+@pytest.mark.parametrize("local_enabled,oidc_enabled", [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_public_auth_methods_flags(local_enabled, oidc_enabled, auth_settings):
+    configured = auth_settings.model_copy(update={
+        "local_auth_enabled": local_enabled,
+        "oidc_enabled": oidc_enabled,
+    })
+    with TestClient(create_app(configured, start_consumers=False)) as client:
+        response = client.get("/api/v1/auth/methods")
+        assert response.status_code == 200
+        assert response.json() == {
+            "local_enabled": local_enabled,
+            "oidc_enabled": oidc_enabled,
+        }
+        schema = client.get("/openapi.json").json()
+        assert "/api/v1/auth/methods" in schema["paths"]
+
+
 def simple_normalizer_rule():
     return {
         "format_version": 1,

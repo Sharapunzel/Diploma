@@ -1,0 +1,82 @@
+.statusPage {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  overflow: auto;
+  padding: 76px 20px 52px;
+}
+
+.statusPage::before {
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  background: rgb(0 0 0 / 5%);
+  content: "";
+  pointer-events: none;
+}
+
+.statusCard {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: min(100%, 460px);
+  min-height: 120px;
+  place-items: center;
+  padding: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-surface);
+  box-shadow: var(--color-shadow);
+  backdrop-filter: blur(18px);
+}
+
+.statusCard > :global(.ant-spin-nested-loading) {
+  width: 100%;
+}
+
+.errorCard {
+  width: min(100%, 420px);
+  padding: 28px 24px;
+}
+
+.statusVersion {
+  position: fixed;
+  z-index: 2;
+  right: 0;
+  bottom: 12px;
+  left: 0;
+  color: var(--color-text-secondary);
+  font-size: 0.76rem;
+  text-align: center;
+  pointer-events: none;
+}
+
+.theme {
+  position: fixed;
+  z-index: 2;
+  top: 18px;
+  right: 18px;
+  width: 44px;
+}
+
+@media (max-width: 480px) {
+  .statusPage {
+    padding: 68px 12px 48px;
+  }
+
+  .statusCard {
+    padding: 20px 16px;
+  }
+
+  .theme {
+    top: 10px;
+    right: 10px;
+    width: 44px;
+  }
+}

@@ -1,0 +1,192 @@
+:root {
+  font-family: Play, "Segoe UI", sans-serif;
+  font-size: 15px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --page-gradient:
+    radial-gradient(ellipse at 12% 14%, var(--gradient-green), transparent 38%),
+    radial-gradient(ellipse at 82% 20%, var(--gradient-blue), transparent 36%),
+    radial-gradient(ellipse at 72% 88%, var(--gradient-violet), transparent 42%);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-page: #eef5f2;
+  --color-surface: rgb(250 253 252 / 68%);
+  --color-surface-raised: rgb(255 255 255 / 86%);
+  --color-surface-solid: #fbfdfc;
+  --color-input: #fbfdfc;
+  --color-input-hover: #f2f8f4;
+  --color-input-autofill: #e7f4eb;
+  --color-text: #1c2924;
+  --color-text-secondary: #566760;
+  --color-border: rgb(43 83 65 / 20%);
+  --color-border-strong: rgb(43 115 78 / 36%);
+  --color-shadow: 0 20px 56px rgb(25 57 42 / 12%);
+  --color-accent: #64f86a;
+  --color-accent-hover: #45df4d;
+  --color-accent-strong: #1b6928;
+  --color-accent-soft: rgb(100 248 106 / 18%);
+  --color-focus: #64f86a;
+  --color-focus-contrast: #15351a;
+  --color-danger: #b42335;
+  --color-danger-hover: #941c2a;
+  --color-info: #23677b;
+  --color-success: #247445;
+  --color-warning: #805500;
+  --color-scroll-track: rgb(211 227 218 / 70%);
+  --color-scroll-thumb: #8ca99a;
+  --color-scroll-thumb-hover: #648675;
+  --gradient-green: rgb(71 180 103 / 7%);
+  --gradient-blue: rgb(63 150 176 / 5%);
+  --gradient-violet: rgb(126 118 190 / 4%);
+  --brand-mark-bg: #203d2d;
+  --brand-mark-fg: #77e0a1;
+  --color-on-accent: #102013;
+  --color-danger-text: #ffffff;
+  --color-modal-mask: rgb(13 28 21 / 42%);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-page: #111a17;
+  --color-surface: rgb(28 40 35 / 68%);
+  --color-surface-raised: rgb(36 50 44 / 86%);
+  --color-surface-solid: #202b26;
+  --color-input: #17221d;
+  --color-input-hover: #202e27;
+  --color-input-autofill: #25392e;
+  --color-text: #edf5f0;
+  --color-text-secondary: #b2c2b9;
+  --color-border: rgb(147 194 166 / 23%);
+  --color-border-strong: rgb(117 211 151 / 43%);
+  --color-shadow: 0 22px 60px rgb(0 0 0 / 34%);
+  --color-accent: #64f86a;
+  --color-accent-hover: #8cff8f;
+  --color-accent-strong: #64f86a;
+  --color-accent-soft: rgb(100 248 106 / 20%);
+  --color-focus: #64f86a;
+  --color-focus-contrast: #07100a;
+  --color-danger: #ff8590;
+  --color-danger-hover: #ffabb2;
+  --color-info: #67d7f5;
+  --color-success: #78e39a;
+  --color-warning: #ffd166;
+  --color-scroll-track: rgb(15 27 21 / 76%);
+  --color-scroll-thumb: #557463;
+  --color-scroll-thumb-hover: #759d85;
+  --gradient-green: rgb(52 160 82 / 6%);
+  --gradient-blue: rgb(59 130 155 / 5%);
+  --gradient-violet: rgb(105 98 175 / 4%);
+  --brand-mark-bg: #d8f2e1;
+  --brand-mark-fg: #257f4e;
+  --color-on-accent: #102013;
+  --color-danger-text: #ffffff;
+  --color-modal-mask: rgb(2 8 5 / 66%);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  min-width: 320px;
+  min-height: 100%;
+  margin: 0;
+}
+
+html {
+  overflow: hidden;
+  background: var(--color-page);
+  color: var(--color-text);
+  scrollbar-color: var(--color-scroll-thumb) var(--color-scroll-track);
+  scrollbar-width: thin;
+}
+
+body {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--color-page);
+  background-image: var(--page-gradient);
+  background-attachment: fixed;
+  color: var(--color-text);
+  font-family: Play, "Segoe UI", sans-serif;
+  font-size: 15px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  isolation: isolate;
+}
+
+button,
+input,
+select,
+textarea,
+.ant-typography,
+.ant-btn,
+.ant-input,
+.ant-select,
+.ant-menu,
+.ant-modal,
+.ant-popover {
+  font-family: Play, "Segoe UI", sans-serif;
+}
+
+:focus-visible {
+  outline: 3px solid var(--color-focus) !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}
+
+:where(
+  .ant-btn,
+  .ant-menu-item,
+  .ant-input,
+  .ant-input-affix-wrapper,
+  .ant-drawer-close,
+  .ant-modal-close
+):focus-visible {
+  outline: 3px solid var(--color-focus) !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}
+
+* {
+  scrollbar-color: var(--color-scroll-thumb) var(--color-scroll-track);
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--color-scroll-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--color-scroll-thumb);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-scroll-thumb-hover);
+  background-clip: padding-box;
+}
+
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 2px solid Highlight;
+  }
+}

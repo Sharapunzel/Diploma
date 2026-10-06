@@ -1,0 +1,6 @@
+FROM node:20.19.5-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci && sha256sum package-lock.json | cut -d ' ' -f 1 > node_modules/.lock-hash
+COPY . .
+CMD ["sh","scripts/start-dev.sh"]

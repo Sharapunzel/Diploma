@@ -1,0 +1,226 @@
+.page {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  align-items: stretch;
+  justify-content: center;
+  padding: clamp(12px, 3vw, 32px);
+}
+
+.theme {
+  position: absolute;
+  z-index: 2;
+  top: clamp(12px, 3vw, 30px);
+  right: clamp(12px, 3vw, 30px);
+  width: 44px;
+}
+
+.scrollArea {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 54px 12px 24px;
+}
+
+.card {
+  width: min(100%, 400px);
+  min-width: 0;
+  margin: auto;
+  padding: clamp(20px, 4vw, 30px);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 16px;
+  background: var(--color-surface);
+  box-shadow: var(--color-shadow);
+  backdrop-filter: blur(22px);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .card {
+    background: var(--color-surface-solid);
+  }
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-text);
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+.title {
+  margin: 22px 0 4px !important;
+  color: var(--color-text) !important;
+  font-size: clamp(1.35rem, 3vw, 1.65rem) !important;
+  letter-spacing: -0.035em;
+}
+
+.intro {
+  margin: 0 0 18px;
+  color: var(--color-text-secondary);
+  font-size: 0.94rem;
+  line-height: 1.6;
+}
+
+.form :global(.ant-form-item-label > label) {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.form :global(.ant-input),
+.form :global(.ant-input-affix-wrapper) {
+  min-height: 40px;
+  padding: 6px 10px;
+  border-color: var(--color-border-strong);
+  background: var(--color-input) !important;
+  color: var(--color-text) !important;
+  caret-color: var(--color-accent);
+  color-scheme: inherit;
+}
+
+.form :global(.ant-input-affix-wrapper input.ant-input) {
+  border: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+  min-height: auto;
+  padding: 0 !important;
+  background: transparent !important;
+}
+
+.form :global(.ant-input:focus-visible),
+.form :global(.ant-input-affix-wrapper:focus-within) {
+  outline: 3px solid var(--color-accent) !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}
+
+.form :global(.ant-input::placeholder) {
+  color: var(--color-text-secondary);
+}
+
+.form :global(.ant-input:hover),
+.form :global(.ant-input-affix-wrapper:hover) {
+  border-color: var(--color-accent);
+  background: var(--color-input-hover) !important;
+}
+
+.form :global(.ant-input:focus),
+.form :global(.ant-input-affix-wrapper-focused) {
+  border-color: var(--color-focus);
+  background: var(--color-input-hover) !important;
+  box-shadow: 0 0 0 3px var(--color-accent-soft);
+}
+
+.form :global(input:-webkit-autofill),
+.form :global(input:-webkit-autofill:hover),
+.form :global(input:-webkit-autofill:focus),
+.form :global(input:-webkit-autofill:active) {
+  border-radius: 8px;
+  -webkit-box-shadow: 0 0 0 1000px var(--color-input-autofill) inset;
+  -webkit-text-fill-color: var(--color-text);
+  caret-color: var(--color-accent);
+}
+
+.form :global(input:autofill) {
+  border-radius: 8px;
+  background: var(--color-input-autofill);
+  color: var(--color-text);
+  caret-color: var(--color-accent);
+  box-shadow: 0 0 0 1000px var(--color-input-autofill) inset;
+}
+
+.form :global(.ant-input-affix-wrapper input:-webkit-autofill),
+.form :global(.ant-input-affix-wrapper input:-webkit-autofill:hover),
+.form :global(.ant-input-affix-wrapper input:-webkit-autofill:focus) {
+  -webkit-box-shadow: 0 0 0 1000px var(--color-input-autofill) inset;
+}
+
+.form :global(.ant-input-password-icon) {
+  color: var(--color-text-secondary);
+}
+
+.submit {
+  min-height: 40px;
+  margin-top: 6px;
+  font-weight: 700;
+}
+
+.oidcButton {
+  min-height: 44px;
+  margin-top: 12px;
+  color: var(--color-text) !important;
+}
+
+.oidcButton:hover {
+  color: var(--color-text) !important;
+}
+
+.oidcError,
+.info {
+  margin-bottom: 16px;
+  border-color: var(--color-border);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+}
+
+.loadingSpace {
+  height: 92px;
+}
+
+@media (max-height: 600px) {
+  .theme {
+    top: 8px;
+    right: 8px;
+    width: 44px;
+  }
+
+  .scrollArea {
+    align-items: flex-start;
+    padding: 50px 8px 12px;
+  }
+
+  .card {
+    margin-block: 0;
+    padding-block: 22px;
+  }
+
+  .title {
+    margin-top: 18px !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .page {
+    padding: 8px;
+  }
+
+  .theme {
+    top: 10px;
+    right: 10px;
+    width: 44px;
+  }
+
+  .scrollArea {
+    padding: 48px 2px 12px;
+  }
+
+  .card {
+    padding: 20px 16px;
+  }
+
+  .form :global(.ant-input),
+  .form :global(.ant-input-affix-wrapper),
+  .form :global(.ant-input-affix-wrapper input.ant-input) {
+    font-size: 16px;
+  }
+}

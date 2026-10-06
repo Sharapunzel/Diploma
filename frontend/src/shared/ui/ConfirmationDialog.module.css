@@ -1,0 +1,54 @@
+.root :global(.ant-modal-mask) {
+  background: var(--color-modal-mask);
+}
+
+.content {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 18px;
+  background: var(--color-surface);
+  box-shadow: var(--color-shadow);
+  backdrop-filter: blur(30px) saturate(150%);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .content {
+    background: var(--color-surface-solid);
+  }
+}
+
+.header,
+.body {
+  background: transparent;
+  color: var(--color-text);
+}
+
+.header :global(.ant-modal-title) {
+  color: var(--color-text);
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.body {
+  min-width: 0;
+}
+
+.message {
+  color: var(--color-text-secondary);
+  line-height: 1.65;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.confirm {
+  background: var(--color-danger);
+  color: var(--color-danger-text);
+}
+
+.confirm:hover {
+  background: var(--color-danger-hover) !important;
+  color: var(--color-danger-text) !important;
+}

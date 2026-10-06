@@ -25,6 +25,11 @@ class SessionResponse(BaseModel):
     csrf_token: str | None = None
 
 
+class AuthMethodsResponse(BaseModel):
+    local_enabled: bool
+    oidc_enabled: bool
+
+
 class ErrorResponse(BaseModel):
     code: str
     message: str

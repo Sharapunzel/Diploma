@@ -1,0 +1,171 @@
+.anchor {
+  position: relative;
+  z-index: 5;
+  min-width: 0;
+  flex: none;
+}
+
+.trigger {
+  max-width: min(38vw, 330px);
+  min-height: 44px;
+  border-color: var(--color-border-strong);
+  border-radius: 12px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  backdrop-filter: blur(18px);
+}
+
+.trigger:hover {
+  border-color: var(--color-accent) !important;
+  background: var(--color-surface-raised) !important;
+  color: var(--color-text) !important;
+}
+
+.trigger:focus-visible {
+  outline: 3px solid var(--color-accent) !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}
+
+.triggerName {
+  display: block;
+  max-width: min(28vw, 260px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  display: flex;
+  width: min(248px, calc(100vw - 16px));
+  max-height: min(78dvh, 620px);
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 14px;
+  background: var(--color-surface);
+  box-shadow: var(--color-shadow);
+  backdrop-filter: blur(28px) saturate(145%);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .panel {
+    background: var(--color-surface-solid);
+  }
+}
+
+.title {
+  margin: 0 0 7px;
+  color: var(--color-text);
+  font-size: 1.08rem;
+  font-weight: 700;
+  text-align: right;
+}
+
+.identity {
+  display: grid;
+  min-width: 0;
+  gap: 0;
+  margin: 0;
+}
+
+.identity div,
+.preference {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(82px, 0.75fr) minmax(0, 1fr);
+  align-items: start;
+  column-gap: 10px;
+  padding-block: 5px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.identity dt,
+.preferenceLabel {
+  color: var(--color-text);
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.identity dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-secondary);
+  font-size: 0.85rem;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: right;
+}
+
+.preference {
+  align-items: center;
+}
+
+.preference > :global(button) {
+  align-self: center;
+  justify-self: end;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  border-radius: 9px;
+}
+
+.logout {
+  align-self: stretch;
+  min-height: 34px;
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.logout:hover {
+  border-color: var(--color-danger-hover) !important;
+  color: var(--color-danger-hover) !important;
+}
+
+.logout:focus-visible {
+  outline: 3px solid var(--color-accent) !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}
+
+@media (max-width: 480px) {
+  .trigger {
+    width: 44px;
+    min-width: 44px;
+    padding-inline: 0;
+  }
+
+  .triggerName {
+    display: none;
+  }
+
+  .panel {
+    right: -2px;
+    padding: 10px;
+  }
+
+  .preference > :global(button) {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+  }
+}
+
+@media (min-width: 481px) and (max-width: 900px) {
+  .trigger {
+    max-width: 164px;
+  }
+
+  .triggerName {
+    max-width: 118px;
+  }
+}

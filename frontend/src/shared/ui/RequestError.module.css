@@ -1,0 +1,90 @@
+.alert {
+  border-color: var(--color-danger);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+}
+
+.alert :global(.ant-alert-message),
+.alert :global(.ant-alert-description) {
+  color: var(--color-text);
+}
+
+.details {
+  margin-top: 8px;
+  color: var(--color-text-secondary);
+}
+
+.details summary {
+  width: fit-content;
+  color: var(--color-text);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.requestId {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.requestId code {
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+}
+
+.copyState {
+  flex-basis: 100%;
+}
+
+.pageError {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--color-text);
+  text-align: center;
+}
+
+.pageIcon {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 12px;
+  background: rgb(180 35 53 / 12%);
+  color: var(--color-danger);
+  font-size: 24px;
+}
+
+.pageError h2 {
+  margin: 0;
+  font-size: 1.25rem;
+  line-height: 1.35;
+}
+
+.pageError p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.pageError > :global(.ant-btn) {
+  min-width: 132px;
+  margin-top: 6px;
+}
+
+.pageDetails {
+  max-width: 100%;
+  color: var(--color-text-secondary);
+  font-size: 0.86rem;
+  text-align: left;
+}
+
+.pageDetails summary {
+  cursor: pointer;
+}

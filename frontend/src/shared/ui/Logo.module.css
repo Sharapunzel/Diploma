@@ -1,0 +1,10 @@
+.logo {
+  display: block;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  padding: 4px;
+  border-radius: 8px;
+  background: #e8f8eb;
+  object-fit: contain;
+}

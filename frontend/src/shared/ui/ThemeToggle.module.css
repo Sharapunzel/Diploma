@@ -1,0 +1,26 @@
+.button {
+  display: inline-flex;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-color: var(--color-border-strong);
+  border-radius: 12px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 18px;
+  backdrop-filter: blur(14px);
+}
+
+.button:hover {
+  border-color: var(--color-accent) !important;
+  background: var(--color-surface-raised) !important;
+  color: var(--color-text) !important;
+}
+
+.button:focus-visible {
+  outline: 3px solid var(--color-accent) !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}

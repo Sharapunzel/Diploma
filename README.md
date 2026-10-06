@@ -1,11 +1,12 @@
 # Система анализа событий
 
-Система принимает логи через Kafka, нормализует их в ECS, сохраняет результаты в PostgreSQL и предоставляет API через FastAPI. Внешние ECS-ориентированные события в OpenSearch-совместимом индексере читаются отдельным адаптером. React и полноценный UI запланированы для следующей задачи; TASK-13 его не включает.
+Система принимает логи через Kafka, нормализует их в ECS, сохраняет результаты в PostgreSQL и предоставляет API через FastAPI. Внешние ECS-ориентированные события в OpenSearch-совместимом индексере читаются отдельным адаптером. Каркас React предоставляет вход, темы и маршруты. Предметные страницы пока показывают заглушки.
 
 ## Сервисы и сетевые границы
 
 ```text
 Браузер ── HTTP (разработка) / HTTPS (production) ──> Nginx ──> FastAPI
+                                                       └──> Vite (только разработка)
 Fluent Bit ── PLAINTEXT (разработка) / TLS (production) ──> Kafka
                                                    FastAPI ──> PostgreSQL, Kafka
 ```
@@ -22,7 +23,7 @@ Compose размещает PostgreSQL и Kafka в закрытой bridge-сет
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Для OIDC через dev proxy дополните **корневой** `.env` значениями `OIDC_ENABLED=true`, `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_SCOPES` и при необходимости `OIDC_SUCCESS_REDIRECT_URL`, `OIDC_ERROR_REDIRECT_URL`, `OIDC_STATE_SECRET`. Секрет IdP не храните в отслеживаемых файлах. Зарегистрируйте у IdP callback публичного адреса proxy, по умолчанию `http://localhost:8080/api/v1/auth/oidc/callback`; при другом порту `PROXY_BIND` задайте соответствующий `OIDC_REDIRECT_URI`. Успешное и ошибочное перенаправления по умолчанию относительные (`/` и `/login?error=oidc`) и остаются на том же адресе proxy. OIDC по умолчанию выключен, локальный вход в dev Compose остаётся включённым и при активации OIDC. Production требует HTTPS и отдельные защищённые файлы секретов, описанные ниже.
+Для OIDC через dev proxy дополните **корневой** `.env` значениями `OIDC_ENABLED=true`, `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_SCOPES` и при необходимости `OIDC_SUCCESS_REDIRECT_URL`, `OIDC_ERROR_REDIRECT_URL`, `OIDC_STATE_SECRET`. Секрет IdP не храните в отслеживаемых файлах. Зарегистрируйте у IdP callback публичного адреса proxy, по умолчанию `http://localhost:8080/api/v1/auth/oidc/callback`; при другом порту `PROXY_BIND` задайте соответствующий `OIDC_REDIRECT_URI` и `HMR_CLIENT_PORT` равный внешнему порту proxy. Успешное и ошибочное перенаправления по умолчанию относительные (`/` и `/login?error=oidc`) и остаются на том же адресе proxy. OIDC по умолчанию выключен, локальный вход в dev Compose остаётся включённым и при активации OIDC. Production требует HTTPS и отдельные защищённые файлы секретов, описанные ниже.
 
 Из корня репозитория запустите:
 
@@ -30,7 +31,15 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
 ```
 
-Dev proxy доступен по `http://localhost:8080`; маршруты API имеют префикс `/api/v1`, Swagger — `/docs`, OpenAPI — `/openapi.json`. PostgreSQL публикуется только на loopback-порту 5432. PLAINTEXT listener Kafka для агентов публикуется на порту 9092 для локальной отладки. Корневой путь возвращает 404 до появления фронтенда. `backend/.env.example` настроен на браузерный адрес proxy. Для прямого запуска FastAPI без Compose задайте `DATABASE_URL` с `localhost:5432`, `CORS_ORIGINS=http://localhost:5173`, OIDC callback `http://localhost:8000/api/v1/auth/oidc/callback` и перенаправления `http://localhost:5173/` и `/login?error=oidc`. Для Compose используйте callback через proxy. При создании Kafka-подключения приложения указывайте внутренний адрес `kafka:9092`; `localhost` внутри backend-контейнера указывает на него самого.
+Dev proxy доступен по `http://localhost:8080`; frontend, глубокие маршруты SPA и HMR идут через этот адрес без второго публичного порта. Этот HTTP адрес предназначен только для локальной отладки: реальные пароли нельзя передавать по недоверенной сети без HTTPS. Решение о сохранении учётных данных принимает браузер или установленный менеджер паролей; приложение не хранит историю логинов и пароли. Маршруты API имеют префикс `/api/v1`, Swagger — `/docs`, OpenAPI — `/openapi.json`. PostgreSQL публикуется только на loopback-порту 5432. PLAINTEXT listener Kafka для агентов публикуется на порту 9092 для локальной отладки. `backend/.env.example` настроен на браузерный адрес proxy. Для прямого запуска FastAPI без Compose задайте `DATABASE_URL` с `localhost:5432`, `CORS_ORIGINS=http://localhost:5173`, OIDC callback `http://localhost:8000/api/v1/auth/oidc/callback` и перенаправления `http://localhost:5173/` и `/login?error=oidc`. Для Compose используйте callback через proxy. При создании Kafka-подключения приложения указывайте внутренний адрес `kafka:9092`; `localhost` внутри backend-контейнера указывает на него самого.
+
+Для локальной работы с фронтендом нужна Node.js 20.19.5 (эта же версия используется в `frontend/Dockerfile.dev`). В `frontend/` выполните `npm ci`, затем `npm run typecheck`, `npm run lint`, `npm run format:check`, `npm run test`, `npm run build`. `npm run dev` запускает Vite; штатный браузерный адрес при Compose — proxy на порту 8080. Файлы `node_modules` на хосте и в контейнере разделены. При каждом запуске frontend-контейнер сравнивает хэш `package-lock.json` с установленными зависимостями в своём volume и запускает `npm ci`, если lockfile изменился. После изменения зависимостей выполните `docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d frontend`; общие тома PostgreSQL/Kafka удалять не требуется. Правки исходников подхватываются через HMR без пересборки.
+
+Полную браузерную приёмку на Windows запускайте из корня командой `powershell -File backend/tests/run_frontend_smoke.ps1` после установки зависимостей через `npm ci` в `frontend/`. Скрипт проверяет отдельные имя Compose-проекта, БД, тома, подсеть и свободные порты до `up`, поднимает синтетический IdP с подписанным ID token, создаёт тестовый аккаунт с длинным именем и переименованной ролью, проверяет чистый и повторный запуск frontend-volume при изменении lockfile, затем выполняет Playwright через proxy. В `finally` он восстанавливает lockfile, останавливает свой IdP и удаляет только собственные smoke-контейнеры и тома. По умолчанию заняты порты 18094/15494/19094/19095 и подсеть `172.31.94.0/24`; если они уже используются, передайте параметры `-ProxyPort`, `-PostgresPort`, `-KafkaPort`, `-IdpPort`, `-Subnet`, `-ProxyIp` и при необходимости `-ChromePath`. Скрипт не использует `diploma_db`.
+
+При ручном запуске Playwright необходимы `PLAYWRIGHT_BASE_URL`, `PLAYWRIGHT_USERNAME`, `PLAYWRIGHT_PASSWORD`, `PLAYWRIGHT_OIDC=1` и Chromium (`npx playwright install chromium`) либо `PLAYWRIGHT_CHROME_PATH` к установленному Chrome. Критические сценарии local/OIDC/HMR не пропускаются при отсутствии настройки, а завершаются понятной ошибкой.
+
+На `/login` сервер сообщает доступные способы входа. Локальная форма и OIDC могут отображаться одновременно; OIDC требует настройки IdP и `OIDC_REDIRECT_URI` с фактическим портом proxy. После входа серверная сессия хранится в HttpOnly cookie. Тема по умолчанию следует системе; ручной выбор светлой или тёмной сохраняется в localStorage. Разделы подключений, источников, нормализаторов, событий, диагностики, администрирования и настроек пока являются заглушками без запросов к предметным API. Production-поставка собранного frontend относится к TASK-19.
 
 Проверьте `http://localhost:8080/api/v1/health/live` и `http://localhost:8080/api/v1/health/ready`. Одноразовый сервис `migrate` применяет миграции Alembic до запуска API; при ошибке API не стартует. Первого администратора создавайте интерактивно:
 

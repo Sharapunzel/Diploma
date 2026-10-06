@@ -1,0 +1,27 @@
+.overlay {
+  position: fixed;
+  z-index: 4;
+  inset: 0 0 0 var(--workspace-sidebar-width, 0px);
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 7%);
+  pointer-events: none;
+}
+
+.overlay :global(.ant-spin) {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  background: var(--color-surface-solid);
+  box-shadow: var(--color-shadow);
+  transform: translateY(-10vh);
+}
+
+@media (max-width: 900px) {
+  .overlay {
+    left: 0;
+  }
+}
