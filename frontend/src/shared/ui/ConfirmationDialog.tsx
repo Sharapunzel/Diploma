@@ -1,10 +1,11 @@
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { Button, Modal } from "antd";
 import styles from "./ConfirmationDialog.module.css";
 
 export function ConfirmationDialog({
   open,
   pending = false,
+  confirmDisabled = false,
   title,
   message,
   confirmText,
@@ -15,6 +16,7 @@ export function ConfirmationDialog({
 }: {
   open: boolean;
   pending?: boolean;
+  confirmDisabled?: boolean;
   title: string;
   message: string;
   confirmText: string;
@@ -23,6 +25,18 @@ export function ConfirmationDialog({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const openerRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
+  useLayoutEffect(() => {
+    if (open && !wasOpenRef.current) {
+      openerRef.current =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+    }
+    wasOpenRef.current = open;
+  }, [open]);
+
   return (
     <Modal
       classNames={{
@@ -38,7 +52,7 @@ export function ConfirmationDialog({
           </Button>
           <Button
             className={styles.confirm}
-            disabled={pending}
+            disabled={pending || confirmDisabled}
             loading={pending}
             onClick={onConfirm}
             danger={danger}
@@ -51,6 +65,11 @@ export function ConfirmationDialog({
       keyboard={!pending}
       maskClosable={!pending}
       onCancel={onCancel}
+      afterOpenChange={(visible) => {
+        if (!visible && wasOpenRef.current === false) {
+          requestAnimationFrame(() => openerRef.current?.focus());
+        }
+      }}
       open={open}
       rootClassName={styles.root}
       title={title}

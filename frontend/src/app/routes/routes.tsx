@@ -25,6 +25,16 @@ const PlaceholderPage = lazy(() =>
     default: PlaceholderPage,
   })),
 );
+const ConnectionsPage = lazy(() =>
+  import("../../pages/resources/ConnectionsPage").then(
+    ({ ConnectionsPage }) => ({ default: ConnectionsPage }),
+  ),
+);
+const SourcesPage = lazy(() =>
+  import("../../pages/resources/SourcesPage").then(({ SourcesPage }) => ({
+    default: SourcesPage,
+  })),
+);
 
 function LoadingStatus() {
   return (
@@ -134,7 +144,13 @@ export function AppRoutes() {
               path={page.path}
               element={
                 <Protected permission={page.permission}>
-                  <PlaceholderPage name={page.label} />
+                  {page.path === "/connections" ? (
+                    <ConnectionsPage />
+                  ) : page.path === "/sources" ? (
+                    <SourcesPage />
+                  ) : (
+                    <PlaceholderPage name={page.label} />
+                  )}
                 </Protected>
               }
             />

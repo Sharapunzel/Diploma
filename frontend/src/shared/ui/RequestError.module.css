@@ -50,6 +50,14 @@
   text-align: center;
 }
 
+.pageError p,
+.pageDetails,
+.pageDetails summary {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .pageIcon {
   display: grid;
   width: 48px;

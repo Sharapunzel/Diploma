@@ -177,6 +177,47 @@ function abortError() {
 
 export function errorText(error: unknown): string {
   if (!(error instanceof ApiError)) return "Не удалось выполнить запрос.";
+  const known: Record<string, string> = {
+    kafka_timeout: "Время ожидания Kafka истекло.",
+    kafka_unavailable: "Kafka недоступна.",
+    source_enabled: "Сначала выключите источник, затем измените его настройки.",
+    source_exists:
+      "У подключения есть зарегистрированные источники. Изменить адреса брокеров или параметры безопасности нельзя.",
+    source_archived: "Архивный источник нельзя включить или изменить.",
+    source_normalizer_required: "Для включения назначьте готовый нормализатор.",
+    source_topic_conflict: "Топик уже зарегистрирован для текущего поколения.",
+    topic_recreated: "Топик был пересоздан. Зарегистрируйте новый источник.",
+    topic_identity_changed:
+      "Идентичность топика изменилась. Обновите сведения.",
+    topic_identity_history_unknown:
+      "Историю топика не удалось подтвердить. Обновите сведения.",
+    normalizer_legacy_incompatible:
+      "Правило нормализатора несовместимо с текущим форматом.",
+    cluster_connection_conflict: "Этот кластер Kafka уже подключён.",
+    external_source_conflict: "Эта внешняя цель уже зарегистрирована.",
+    source_configuration_changed:
+      "Настройки подключения изменились. Обновите состояние перед повтором.",
+    external_configuration_changed:
+      "Настройки внешнего источника изменились во время проверки. Обновите состояние перед повтором.",
+    external_conflict: "Внешнее подключение с такими данными уже существует.",
+    external_key_unavailable: "Ключ внешних подключений недоступен.",
+    external_key_mismatch:
+      "Ключ внешних подключений не соответствует сохранённым данным.",
+    indexer_access_denied:
+      "Индексер отказал в доступе. Проверьте его учётные данные и права.",
+    indexer_untrusted_certificate:
+      "Сертификат индексера не доверен. Проверьте CA.",
+    indexer_hostname_mismatch:
+      "Имя хоста не совпадает с сертификатом индексера.",
+    indexer_timeout: "Время ожидания индексера истекло.",
+    indexer_unavailable: "Индексер недоступен.",
+    indexer_response_too_large: "Ответ индексера слишком велик.",
+    indexer_invalid_response: "Индексер вернул некорректный ответ.",
+    index_not_found: "Цель не найдена в индексере.",
+    invalid_ca: "CA не прошёл проверку. Загрузите публичный PEM сертификат.",
+    invalid_ca_media_type: "Для CA требуется PEM файл.",
+  };
+  if (known[error.code]) return known[error.code];
   let message: string;
   if (error.code === "invalid_response")
     message = "Получен некорректный ответ сервера. Повторите попытку.";
@@ -184,7 +225,9 @@ export function errorText(error: unknown): string {
     message = "Сессия изменилась. Повторите действие.";
   else if (error.code === "invalid_credentials")
     message = "Неверное имя пользователя или пароль.";
-  else if (error.status === 0) message = "Нет соединения с сервером.";
+  else if (error.status === 0)
+    message =
+      "Нет соединения с сервером. Если выполнялось изменение, обновите состояние перед повтором: результат неизвестен.";
   else if (error.status === 401)
     message = "Сессия истекла. Войдите в систему снова.";
   else if (error.status === 403) message = "Недостаточно прав для действия.";

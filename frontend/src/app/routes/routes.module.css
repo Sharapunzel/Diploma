@@ -43,6 +43,7 @@
 .errorCard {
   width: min(100%, 420px);
   padding: 28px 24px;
+  transform: translateY(-10vh);
 }
 
 .statusVersion {

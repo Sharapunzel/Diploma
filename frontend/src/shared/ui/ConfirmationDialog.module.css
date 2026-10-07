@@ -5,9 +5,9 @@
 .content {
   border: 1px solid var(--color-border-strong);
   border-radius: 18px;
-  background: var(--color-surface);
+  background: var(--color-modal-surface);
   box-shadow: var(--color-shadow);
-  backdrop-filter: blur(30px) saturate(150%);
+  backdrop-filter: blur(14px) saturate(125%);
 }
 
 @supports not (backdrop-filter: blur(1px)) {

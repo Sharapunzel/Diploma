@@ -143,4 +143,26 @@ describe("ApiClient", () => {
     });
     expect(ApiError).toBeDefined();
   });
+
+  it("localizes the exact resource domain error codes", () => {
+    const codes = [
+      "source_normalizer_required",
+      "source_topic_conflict",
+      "topic_identity_changed",
+      "topic_identity_history_unknown",
+      "source_configuration_changed",
+      "external_configuration_changed",
+    ];
+    for (const code of codes) {
+      const text = errorText(new ApiError(409, code));
+      expect(text).not.toBe("Конфликт данных. Обновите страницу.");
+      expect(text.length).toBeGreaterThan(20);
+    }
+    expect(errorText(new ApiError(409, "source_exists"))).toContain(
+      "зарегистрированные источники",
+    );
+    expect(errorText(new ApiError(403, "indexer_access_denied"))).toContain(
+      "Индексер",
+    );
+  });
 });

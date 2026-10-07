@@ -11,6 +11,7 @@ backend/*.egg-info/
 /.env.production
 /.env.*
 /.task13-smoke/
+/.task15-smoke/
 # Local secret material: keep only the explicit, non-secret dev template tracked.
 .dev/*
 *secret*

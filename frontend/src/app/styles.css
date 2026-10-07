@@ -44,7 +44,8 @@
   --brand-mark-fg: #77e0a1;
   --color-on-accent: #102013;
   --color-danger-text: #ffffff;
-  --color-modal-mask: rgb(13 28 21 / 42%);
+  --color-modal-mask: rgb(13 28 21 / 30%);
+  --color-modal-surface: rgb(250 253 252 / 92%);
 }
 
 :root[data-theme="dark"] {
@@ -82,7 +83,8 @@
   --brand-mark-fg: #257f4e;
   --color-on-accent: #102013;
   --color-danger-text: #ffffff;
-  --color-modal-mask: rgb(2 8 5 / 66%);
+  --color-modal-mask: rgb(2 8 5 / 46%);
+  --color-modal-surface: rgb(36 50 44 / 92%);
 }
 
 *,
@@ -144,6 +146,46 @@ textarea,
   outline: 3px solid var(--color-focus) !important;
   outline-offset: 2px;
   box-shadow: 0 0 0 2px var(--color-focus-contrast) !important;
+}
+
+.ant-modal-mask {
+  background: var(--color-modal-mask);
+  backdrop-filter: blur(2px);
+}
+
+.ant-modal {
+  top: 9vh;
+  padding-bottom: 0;
+}
+
+.ant-modal .ant-modal-content {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 18px;
+  background: var(--color-modal-surface);
+  box-shadow: var(--color-shadow);
+  backdrop-filter: blur(14px) saturate(125%);
+}
+
+.ant-modal .ant-modal-header,
+.ant-modal .ant-modal-body,
+.ant-modal .ant-modal-footer {
+  background: transparent;
+}
+
+.ant-modal .ant-modal-title,
+.ant-modal .ant-modal-close {
+  color: var(--color-text);
+}
+
+.ant-modal .ant-modal-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .ant-modal .ant-modal-content {
+    background: var(--color-surface-solid);
+  }
 }
 
 :where(
