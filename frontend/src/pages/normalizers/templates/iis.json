@@ -1,0 +1,59 @@
+{
+  "format_version": 1,
+  "variants": [
+    {
+      "key": "iis_w3c",
+      "priority": 10,
+      "when": { "kind": "regex", "value": "^[0-9]{4}-[0-9]{2}-[0-9]{2} " },
+      "blocks": [
+        {
+          "key": "columns",
+          "kind": "columns",
+          "candidates": [
+            {
+              "delimiter": " ",
+              "columns": [
+                "date",
+                "time",
+                "server_ip",
+                "method",
+                "path",
+                "query",
+                "port",
+                "username",
+                "client_ip",
+                "agent",
+                "referer",
+                "status",
+                "substatus",
+                "win32",
+                "duration"
+              ]
+            }
+          ]
+        },
+        {
+          "key": "client",
+          "kind": "map_ecs",
+          "target": "source.ip",
+          "source": { "ref": "columns.client_ip" },
+          "required": true
+        },
+        {
+          "key": "method",
+          "kind": "map_ecs",
+          "target": "http.request.method",
+          "source": { "ref": "columns.method" },
+          "required": true
+        },
+        {
+          "key": "status",
+          "kind": "map_ecs",
+          "target": "http.response.status_code",
+          "source": { "ref": "columns.status" },
+          "required": true
+        }
+      ]
+    }
+  ]
+}

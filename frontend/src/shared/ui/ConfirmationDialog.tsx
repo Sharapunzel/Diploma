@@ -13,6 +13,7 @@ export function ConfirmationDialog({
   children,
   onCancel,
   onConfirm,
+  zIndex,
 }: {
   open: boolean;
   pending?: boolean;
@@ -24,6 +25,7 @@ export function ConfirmationDialog({
   children?: ReactNode;
   onCancel: () => void;
   onConfirm: () => void;
+  zIndex?: number;
 }) {
   const openerRef = useRef<HTMLElement | null>(null);
   const wasOpenRef = useRef(false);
@@ -73,6 +75,7 @@ export function ConfirmationDialog({
       open={open}
       rootClassName={styles.root}
       title={title}
+      zIndex={zIndex}
     >
       <div className={styles.message}>{message}</div>
       {children}

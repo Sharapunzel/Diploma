@@ -16,6 +16,9 @@ export const Navigation = observer(
   }) => {
     const { session, layout } = useStores();
     const location = useLocation();
+    const selectedPath = location.pathname.startsWith("/normalizers/")
+      ? "/normalizers"
+      : location.pathname;
     const groups = availableNavigationGroups((permission) =>
       session.has(permission),
     );
@@ -38,9 +41,7 @@ export const Navigation = observer(
               )}
               {group.pages.map((page) => (
                 <Link
-                  aria-current={
-                    location.pathname === page.path ? "page" : undefined
-                  }
+                  aria-current={selectedPath === page.path ? "page" : undefined}
                   aria-label={page.label}
                   className={styles.compactLink}
                   key={page.path}
@@ -91,7 +92,7 @@ export const Navigation = observer(
       >
         <Menu
           className={styles.menu}
-          selectedKeys={[location.pathname]}
+          selectedKeys={[selectedPath]}
           items={links}
           mode="inline"
         />

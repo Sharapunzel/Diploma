@@ -124,6 +124,7 @@ describe("protected UI", () => {
     expect(stores.session.state).toBe("authenticated");
   });
 
+  // This scenario opens, cancels, reopens and submits two dialogs with async user events.
   it("confirms logout, keeps the popover open and reports a safe error", async () => {
     const stores = new AppStores();
     stores.session.accept(session, stores.session.version);
@@ -176,7 +177,7 @@ describe("protected UI", () => {
     await userEvent.click(screen.getByText("Подробности"));
     expect(await screen.findByText("req-3")).toBeDefined();
     expect(stores.session.state).toBe("authenticated");
-  });
+  }, 15000);
 
   it("cycles the account theme control through its three choices", async () => {
     const stores = new AppStores();

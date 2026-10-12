@@ -35,6 +35,16 @@ const SourcesPage = lazy(() =>
     default: SourcesPage,
   })),
 );
+const NormalizersPage = lazy(() =>
+  import("../../pages/normalizers/NormalizersPage").then(
+    ({ NormalizersPage }) => ({ default: NormalizersPage }),
+  ),
+);
+const NormalizerEditor = lazy(() =>
+  import("../../pages/normalizers/NormalizerEditor").then(
+    ({ NormalizerEditor }) => ({ default: NormalizerEditor }),
+  ),
+);
 
 function LoadingStatus() {
   return (
@@ -148,6 +158,8 @@ export function AppRoutes() {
                     <ConnectionsPage />
                   ) : page.path === "/sources" ? (
                     <SourcesPage />
+                  ) : page.path === "/normalizers" ? (
+                    <NormalizersPage />
                   ) : (
                     <PlaceholderPage name={page.label} />
                   )}
@@ -155,6 +167,30 @@ export function AppRoutes() {
               }
             />
           ))}
+          <Route
+            path="/normalizers/new"
+            element={
+              <Protected permission="normalizers.write">
+                <NormalizerEditor />
+              </Protected>
+            }
+          />
+          <Route
+            path="/normalizers/:id/edit"
+            element={
+              <Protected permission="normalizers.write">
+                <NormalizerEditor />
+              </Protected>
+            }
+          />
+          <Route
+            path="/normalizers/:id"
+            element={
+              <Protected permission="normalizers.read">
+                <NormalizerEditor />
+              </Protected>
+            }
+          />
           <Route
             path="*"
             element={

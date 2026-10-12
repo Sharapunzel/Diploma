@@ -114,26 +114,49 @@
 
 .header {
   position: relative;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
   min-width: 0;
   height: 58px;
   min-height: 58px;
   flex: none;
   align-items: center;
-  justify-content: flex-end;
   gap: 12px;
   padding: 8px 14px;
   line-height: normal;
   background: transparent;
 }
 
+.headerLeading,
+.headerTrailing {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.headerLeading {
+  gap: 10px;
+}
+
+.headerTrailing {
+  justify-content: flex-end;
+}
+
+.titleGroup {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.headerHelpPopover {
+  max-width: min(360px, calc(100vw - 24px));
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .pageTitle {
-  position: absolute;
-  z-index: 2;
-  top: 50%;
-  left: 50%;
-  width: min(30vw, 540px, calc(100% - 180px));
-  transform: translate(-50%, -50%);
+  min-width: 0;
   margin: 0;
   overflow: hidden;
   color: var(--color-text);
@@ -143,7 +166,28 @@
   text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
-  pointer-events: none;
+}
+
+.headerBack {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.titleGroup > :global(.ant-btn) {
+  flex: none;
+}
+
+.headerBack:hover {
+  color: var(--color-accent);
+  border-color: var(--color-border-strong);
 }
 
 .content {
@@ -236,6 +280,10 @@
     justify-content: center;
   }
 
+  .header {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
   .content {
     padding: 8px 10px 12px;
   }
@@ -250,8 +298,14 @@
   }
 
   .pageTitle {
-    width: calc(100vw - 140px);
     font-size: 0.94rem;
+  }
+  .headerBack {
+    padding: 6px;
+    font-size: 0.76rem;
+  }
+  .backLabel {
+    display: none;
   }
 
   .content {

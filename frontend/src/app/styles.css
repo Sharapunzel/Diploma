@@ -87,6 +87,18 @@
   --color-modal-surface: rgb(36 50 44 / 92%);
 }
 
+:root[data-theme="light"] .ant-alert {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-solid);
+  color: var(--color-text);
+}
+
+:root[data-theme="light"] .ant-alert-message,
+:root[data-theme="light"] .ant-alert-description,
+:root[data-theme="light"] .ant-alert-close-icon {
+  color: var(--color-text);
+}
+
 *,
 *::before,
 *::after {

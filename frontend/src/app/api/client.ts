@@ -193,6 +193,10 @@ export function errorText(error: unknown): string {
       "Историю топика не удалось подтвердить. Обновите сведения.",
     normalizer_legacy_incompatible:
       "Правило нормализатора несовместимо с текущим форматом.",
+    normalizer_rule_invalid:
+      "Правило не прошло серверную проверку. Проверьте указанный вариант и блок.",
+    version_conflict:
+      "Версия изменилась на сервере. Обновите состояние и разрешите конфликт вручную.",
     cluster_connection_conflict: "Этот кластер Kafka уже подключён.",
     external_source_conflict: "Эта внешняя цель уже зарегистрирована.",
     source_configuration_changed:

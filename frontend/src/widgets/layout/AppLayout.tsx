@@ -3,10 +3,11 @@ import {
   MenuFoldOutlined,
   MenuOutlined,
   MenuUnfoldOutlined,
+  InfoCircleOutlined,
 } from "@ant-design/icons";
-import { Button, Drawer, Layout } from "antd";
+import { Button, Drawer, Layout, Popover } from "antd";
 import { observer } from "mobx-react-lite";
-import { useLocation } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { homePage, pages } from "../../app/routes/permissions";
 import { useStores } from "../../app/providers/StoresProvider";
 import { Logo } from "../../shared/ui/Logo";
@@ -20,8 +21,16 @@ export const AppLayout = observer(({ children }: { children: ReactNode }) => {
   const main = useRef<HTMLElement>(null);
   const mobileTrigger = useRef<HTMLButtonElement>(null);
   const [labelsVisible, setLabelsVisible] = useState(!layout.collapsed);
-  const currentPage =
-    location.pathname === homePage.path
+  const normalizerEditor = /^\/normalizers\/(new|[^/]+(?:\/edit)?)$/.test(
+    location.pathname,
+  );
+  const currentPage = normalizerEditor
+    ? location.pathname === "/normalizers/new"
+      ? "Новый нормализатор"
+      : location.pathname.endsWith("/edit")
+        ? "Редактор нормализатора"
+        : "Просмотр нормализатора"
+    : location.pathname === homePage.path
       ? homePage.label
       : (pages.find((page) => page.path === location.pathname)?.label ??
         "Страница не найдена");
@@ -100,23 +109,57 @@ export const AppLayout = observer(({ children }: { children: ReactNode }) => {
         </footer>
       </Layout.Sider>
       <Layout className={styles.mainLayout}>
-        <Layout.Header className={styles.header} data-testid="workspace-header">
-          <h1
-            className={styles.pageTitle}
-            data-testid="workspace-title"
-            title={currentPage}
-          >
-            {currentPage}
-          </h1>
-          <Button
-            ref={mobileTrigger}
-            aria-label="Открыть меню"
-            aria-expanded={layout.mobileOpen}
-            className={styles.mobileToggle}
-            icon={<MenuOutlined />}
-            onClick={() => layout.setMobileOpen(true)}
-          />
-          <AccountPanel />
+        <Layout.Header
+          className={`${styles.header} ${normalizerEditor ? styles.headerEditor : ""}`}
+          data-testid="workspace-header"
+        >
+          <div className={styles.headerLeading}>
+            <Button
+              ref={mobileTrigger}
+              aria-label="Открыть меню"
+              aria-expanded={layout.mobileOpen}
+              className={styles.mobileToggle}
+              icon={<MenuOutlined />}
+              onClick={() => layout.setMobileOpen(true)}
+            />
+            {normalizerEditor && (
+              <Link
+                aria-label="← К списку"
+                className={styles.headerBack}
+                to="/normalizers"
+              >
+                <span aria-hidden="true">←</span>
+                <span className={styles.backLabel}>К списку</span>
+              </Link>
+            )}
+          </div>
+          <div className={styles.titleGroup}>
+            <h1
+              className={styles.pageTitle}
+              data-testid="workspace-title"
+              title={currentPage}
+            >
+              {currentPage}
+            </h1>
+            {normalizerEditor && (
+              <Popover
+                title="О правиле"
+                overlayClassName={styles.headerHelpPopover}
+                content="Правило — весь набор логики. Вариант — тип события с условием и приоритетом; исполняется первый совпавший. Блок извлекает данные или сопоставляет их с ECS. Изменения назначенного нормализатора применяются только к будущим сообщениям; сохранённые события не пересчитываются."
+                trigger="click"
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label="Описание редактора нормализатора"
+                  icon={<InfoCircleOutlined />}
+                />
+              </Popover>
+            )}
+          </div>
+          <div className={styles.headerTrailing}>
+            <AccountPanel />
+          </div>
         </Layout.Header>
         <Layout.Content
           className={styles.content}

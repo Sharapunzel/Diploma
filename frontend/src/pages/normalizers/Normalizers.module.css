@@ -1,0 +1,436 @@
+.page {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+  max-width: 100%;
+}
+.editorPage {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.toolbar,
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.toolbar {
+  justify-content: space-between;
+}
+.bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.actions {
+  gap: 6px;
+}
+.tablePagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+}
+.feedback {
+  position: fixed;
+  z-index: 900;
+  top: 68px;
+  right: 24px;
+  display: grid;
+  gap: 10px;
+  width: min(520px, calc(100vw - 32px));
+  pointer-events: none;
+}
+.feedback > * {
+  pointer-events: auto;
+}
+.feedback :global(.ant-alert) {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-solid);
+  color: var(--color-text);
+  box-shadow: var(--color-shadow);
+}
+.feedback :global(.ant-alert-message),
+.feedback :global(.ant-alert-description),
+.feedback :global(.ant-alert-close-icon) {
+  color: var(--color-text);
+}
+.feedbackError {
+  position: relative;
+}
+.feedbackError > :global(.ant-btn) {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 1;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+}
+.toolbar h1,
+.toolbar h2 {
+  margin: 0;
+}
+.panel {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 18px;
+  background: var(--color-surface-raised);
+  padding: clamp(14px, 2vw, 24px);
+  box-shadow: var(--color-shadow);
+}
+.staleNotice {
+  margin-bottom: 16px;
+}
+.search {
+  width: min(360px, 100%);
+  max-width: 100%;
+}
+.table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.table :global(.ant-table table) {
+  width: 100%;
+  table-layout: auto;
+}
+.table :global(.ant-table-cell) {
+  position: relative;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.table :global(.ant-table-cell:not(:last-child)::after) {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  border-right: 1px solid var(--color-border);
+  content: "";
+  pointer-events: none;
+}
+.table :global(.ant-table-cell:last-child) {
+  min-width: max-content;
+  white-space: nowrap;
+}
+.table :global(.ant-table-cell:last-child) .actions {
+  min-width: max-content;
+}
+.columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 20px;
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
+}
+.editorColumn {
+  height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  align-content: start;
+}
+.stack {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  align-content: start;
+}
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.field {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.field > span {
+  font-weight: 600;
+}
+.variant,
+.block,
+.candidate {
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 14px;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.block {
+  margin-left: 12px;
+  border-left: 3px solid var(--color-accent);
+}
+.candidate {
+  margin-left: 12px;
+}
+.settingsBody {
+  max-height: min(68dvh, 680px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 8px 4px 2px;
+}
+.settingsBody > *,
+.settingsBody .stack,
+.settingsBody .fieldWithHelp {
+  max-width: 100%;
+  min-width: 0;
+}
+.fieldPicker {
+  gap: 6px;
+  max-width: 100%;
+}
+.fieldPicker > p {
+  max-width: 100%;
+  margin: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.ecsDropdown {
+  max-width: calc(100vw - 32px);
+  overflow: hidden;
+}
+.ecsDropdown :global(.ant-select-item-option-content) {
+  min-width: 0;
+  overflow: hidden;
+  white-space: normal;
+}
+.ecsOption {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.ecsOption > span {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--color-text-secondary);
+  font-size: 0.82rem;
+}
+.treeVariant {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.treeCard {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-raised);
+  overflow-wrap: anywhere;
+}
+.treeHeading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.treeHeading strong {
+  min-width: 0;
+  flex: 1;
+}
+.treeDetail {
+  color: var(--color-text-secondary);
+  font-size: 0.86rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.treeChildren {
+  list-style: none;
+  margin: 12px 0 0 16px;
+  padding: 0 0 0 14px;
+  min-width: 0;
+}
+.treeBranch {
+  position: relative;
+  list-style: none;
+  min-width: 0;
+  margin: 0 0 10px;
+}
+.treeBranch::before {
+  content: "";
+  position: absolute;
+  top: 19px;
+  left: -14px;
+  width: 12px;
+  border-top: 1px solid var(--color-border-strong);
+}
+.treeBranch::after {
+  content: "";
+  position: absolute;
+  top: -10px;
+  bottom: 0;
+  left: -14px;
+  border-left: 1px solid var(--color-border-strong);
+}
+.treeBranch:last-child {
+  margin-bottom: 0;
+}
+.treeBranch:last-child::after {
+  bottom: auto;
+  height: 29px;
+}
+.fieldWithHelp {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+.fieldWithHelp > .field {
+  width: 100%;
+}
+.fieldWithHelp > .field > span {
+  padding-right: 34px;
+}
+.fieldWithHelp > .helpButton {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+.helpButton {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+.helpContent {
+  display: block;
+  width: min(310px, 80vw);
+  line-height: 1.5;
+}
+.headingWithHelp {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.settingsBody :global(.ant-input-number),
+.settingsBody :global(.ant-select),
+.settingsBody :global(.ant-input) {
+  width: 100%;
+}
+.settingsBody :global(.ant-switch) {
+  width: auto;
+}
+.requiredField {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.requiredField > .helpButton,
+.row > .helpButton,
+.treeAdd > .helpButton {
+  margin-left: auto;
+}
+.row > .helpButton,
+.treeAdd > .helpButton {
+  order: 99;
+}
+.issueList {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.issueList :global(.ant-btn) {
+  width: fit-content;
+  max-width: 100%;
+  height: auto;
+  padding: 2px 0;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.reasonList {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+.reasonList li + li {
+  margin-top: 6px;
+}
+.treeAdd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-left: 30px;
+}
+.json {
+  width: 100%;
+  min-height: 440px;
+  height: min(68dvh, 760px);
+  resize: vertical;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow: auto;
+}
+.preview {
+  width: 100%;
+  min-height: 120px;
+  max-height: 440px;
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 10px;
+  background: var(--color-input);
+  color: var(--color-text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    12px/1.5 ui-monospace,
+    Consolas,
+    monospace;
+}
+.muted {
+  color: var(--color-text-secondary);
+}
+.error {
+  color: var(--color-error, #b42318);
+}
+.wrap {
+  overflow-wrap: anywhere;
+}
+.full {
+  width: 100%;
+}
+@media (max-width: 900px) {
+  .editorPage {
+    height: auto;
+    min-height: 100%;
+  }
+  .columns {
+    flex: none;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .editorColumn {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+    scrollbar-gutter: auto;
+  }
+}
+@media (max-width: 520px) {
+  .feedback {
+    top: 62px;
+    right: 8px;
+  }
+}
+@media (max-width: 480px) {
+  .editorPage .feedback {
+    top: 96px;
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "variants": [
+    {
+      "key": "json_event",
+      "priority": 10,
+      "when": { "kind": "prefix", "value": "{" },
+      "blocks": [
+        {
+          "key": "payload",
+          "kind": "json",
+          "candidates": [
+            {
+              "requires": ["event.action"],
+              "extract": { "action": "event.action", "message": "message" }
+            }
+          ]
+        },
+        {
+          "key": "action",
+          "kind": "map_ecs",
+          "target": "event.action",
+          "source": { "ref": "payload.action" },
+          "required": true
+        },
+        {
+          "key": "message",
+          "kind": "map_ecs",
+          "target": "message",
+          "source": { "ref": "payload.message" },
+          "required": false
+        }
+      ]
+    }
+  ]
+}

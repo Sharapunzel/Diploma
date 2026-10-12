@@ -58,8 +58,14 @@ export type ExternalSource = {
 export type Normalizer = {
   id: string;
   name: string;
+  description: string | null;
+  rule: Record<string, unknown>;
   version: number;
   rule_status: "ready" | "legacy_incompatible";
+  created_by_user_id: string | null;
+  updated_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
 };
 export type Topic = {
   name: string;

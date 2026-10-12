@@ -1,0 +1,49 @@
+{
+  "format_version": 1,
+  "variants": [
+    {
+      "key": "nginx_combined",
+      "priority": 10,
+      "when": { "kind": "regex", "value": "^[0-9.]+ - " },
+      "blocks": [
+        {
+          "key": "line",
+          "kind": "regex",
+          "candidates": [
+            {
+              "pattern": "^(?P<ip>[0-9.]+) - (?P<user>[^ ]+) .*(?P<method>GET|POST|PUT|DELETE) (?P<path>[^ ]+) HTTP/[^ ]+ (?P<status>[0-9]{3}) .*"
+            }
+          ]
+        },
+        {
+          "key": "ip",
+          "kind": "map_ecs",
+          "target": "source.ip",
+          "source": { "ref": "line.ip" },
+          "required": true
+        },
+        {
+          "key": "method",
+          "kind": "map_ecs",
+          "target": "http.request.method",
+          "source": { "ref": "line.method" },
+          "required": true
+        },
+        {
+          "key": "status",
+          "kind": "map_ecs",
+          "target": "http.response.status_code",
+          "source": { "ref": "line.status" },
+          "required": true
+        },
+        {
+          "key": "path",
+          "kind": "map_ecs",
+          "target": "url.path",
+          "source": { "ref": "line.path" },
+          "required": false
+        }
+      ]
+    }
+  ]
+}

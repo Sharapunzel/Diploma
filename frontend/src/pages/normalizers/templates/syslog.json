@@ -1,0 +1,42 @@
+{
+  "format_version": 1,
+  "variants": [
+    {
+      "key": "syslog_rfc3164",
+      "priority": 10,
+      "when": { "kind": "regex", "value": "^[A-Z][a-z]{2} [ 0-9][0-9] " },
+      "blocks": [
+        {
+          "key": "header",
+          "kind": "regex",
+          "candidates": [
+            {
+              "pattern": "^[A-Z][a-z]{2} [ 0-9][0-9] [0-9:]{8} (?P<host>[^ ]+) (?P<process>[^:]+): (?P<message>.*)$"
+            }
+          ]
+        },
+        {
+          "key": "host",
+          "kind": "map_ecs",
+          "target": "host.name",
+          "source": { "ref": "header.host" },
+          "required": true
+        },
+        {
+          "key": "process",
+          "kind": "map_ecs",
+          "target": "process.name",
+          "source": { "ref": "header.process" },
+          "required": false
+        },
+        {
+          "key": "message",
+          "kind": "map_ecs",
+          "target": "message",
+          "source": { "ref": "header.message" },
+          "required": true
+        }
+      ]
+    }
+  ]
+}
