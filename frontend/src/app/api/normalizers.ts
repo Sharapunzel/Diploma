@@ -67,6 +67,17 @@ export type PreviewResult = {
     result: string;
   }[];
 };
+export type SnapshotRecord = {
+  position: number;
+  timestamp: string | null;
+  log: string | null;
+  issue: "invalid_envelope" | "message_too_large" | "response_limit" | null;
+};
+export type SourceSnapshot = {
+  records: SnapshotRecord[];
+  skipped: number;
+  truncated: boolean;
+};
 export type NormalizerInput = {
   name: string;
   description: string | null;
@@ -83,6 +94,18 @@ export type BlockType = {
 
 export class NormalizersApi {
   constructor(private api: ApiClient) {}
+  sourceSnapshot(sourceId: string, signal?: AbortSignal) {
+    return this.api.request<SourceSnapshot>(
+      `/sources/${encodeURIComponent(sourceId)}/debug-snapshot`,
+      { signal },
+    );
+  }
+  kafkaSources(offset = 0, signal?: AbortSignal) {
+    return this.api.request<Page<KafkaSource>>(
+      `/sources?limit=50&offset=${offset}`,
+      { signal },
+    );
+  }
   list(offset = 0, q = "", signal?: AbortSignal) {
     return this.api.request<Page<Normalizer>>(
       `/normalizers?limit=50&offset=${offset}&q=${encodeURIComponent(q)}`,

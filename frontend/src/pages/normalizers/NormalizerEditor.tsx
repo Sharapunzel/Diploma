@@ -53,6 +53,7 @@ import {
 import styles from "./Normalizers.module.css";
 import { FeedbackLayer, NormalizerFeedback } from "./NotificationOverlay";
 import { aiFeedback, draftIssues, draftRisks } from "./draftDiagnostics";
+import { SourceDebugPanel } from "./SourceDebugPanel";
 
 const clone = <T,>(value: T): T => structuredClone(value);
 const label = (text: string, element: React.ReactNode) => {
@@ -1090,6 +1091,8 @@ export function NormalizerEditor() {
   const [stale, setStale] = useState(false);
   const [previewTime, setPreviewTime] = useState("");
   const [log, setLog] = useState("");
+  const [debugMode, setDebugMode] = useState<"manual" | "source">("manual");
+  const [debugSession, setDebugSession] = useState(false);
   const [basis, setBasis] = useState("empty");
   const [basisQuery, setBasisQuery] = useState("");
   const [basisPickerKey, setBasisPickerKey] = useState(0);
@@ -1289,13 +1292,13 @@ export function NormalizerEditor() {
   }, [basis, basisQuery, service, session]);
   useEffect(() => {
     const handler = (event: BeforeUnloadEvent) => {
-      if (dirty) event.preventDefault();
+      if (dirty || debugSession) event.preventDefault();
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [dirty]);
+  }, [dirty, debugSession]);
   useEffect(() => {
-    if (!dirty) return;
+    if (!dirty && !debugSession) return;
     if (!historyGuard.current) {
       window.history.pushState(
         { ...window.history.state, normalizerDraftGuard: true },
@@ -1327,7 +1330,7 @@ export function NormalizerEditor() {
       event.stopPropagation();
       setConfirm({
         title: "Покинуть редактор?",
-        message: "Несохранённые изменения будут потеряны.",
+        message: `${dirty ? "Несохранённые изменения будут потеряны. " : ""}${debugSession ? "Результаты отладки будут потеряны." : ""}`,
         action: () => {
           bypassNavigation.current = true;
           navigate(`${link.pathname}${link.search}${link.hash}`);
@@ -1343,7 +1346,7 @@ export function NormalizerEditor() {
       );
       setConfirm({
         title: "Покинуть редактор?",
-        message: "Несохранённые изменения будут потеряны.",
+        message: `${dirty ? "Несохранённые изменения будут потеряны. " : ""}${debugSession ? "Результаты отладки будут потеряны." : ""}`,
         action: () => {
           bypassNavigation.current = true;
           window.history.go(-2);
@@ -1356,7 +1359,7 @@ export function NormalizerEditor() {
       document.removeEventListener("click", onClick, true);
       window.removeEventListener("popstate", onPopState);
     };
-  }, [dirty, navigate]);
+  }, [dirty, debugSession, navigate]);
   function askReplace(action: () => void, force = false, name = "") {
     if (dirty || force)
       setConfirm({
@@ -1367,10 +1370,10 @@ export function NormalizerEditor() {
     else action();
   }
   function leave() {
-    if (dirty)
+    if (dirty || debugSession)
       setConfirm({
         title: "Покинуть редактор?",
-        message: "Несохранённые изменения будут потеряны.",
+        message: `${dirty ? "Несохранённые изменения будут потеряны. " : ""}${debugSession ? "Результаты отладки будут потеряны." : ""}`,
         action: () => navigate("/normalizers"),
       });
     else navigate("/normalizers");
@@ -2229,116 +2232,154 @@ export function NormalizerEditor() {
           className={`${styles.panel} ${styles.stack} ${styles.editorColumn}`}
           aria-label="Отладка"
         >
-          <h2>Введённый пример</h2>
-          <p className={styles.muted}>
-            Preview нормализует введённую строку log. Служебное время проверки
-            устанавливается автоматически. Изменение правила не пересчитывает
-            сохранённые события.
-          </p>
-          {label(
-            "log — одна сырая строка",
-            <Input.TextArea
-              rows={7}
-              value={log}
-              disabled={!canWrite}
-              onChange={(event) => {
-                setLog(event.target.value);
-                setStale(true);
-                previewSeq.current++;
+          <div className={styles.row}>
+            <Button
+              type={debugMode === "manual" ? "primary" : "default"}
+              onClick={() => {
+                const action = () => {
+                  setDebugMode("manual");
+                  setDebugSession(false);
+                };
+                if (debugSession)
+                  setConfirm({
+                    title: "Сбросить результаты отладки?",
+                    message: "Текущий прогон и результаты будут потеряны.",
+                    action,
+                  });
+                else action();
               }}
-            />,
-          )}
-          {canWrite ? (
-            <div className={styles.row}>
-              <ContextHelp
-                topic="preview"
-                name="Проверка черновика и статусы"
-              />
+            >
+              Свой лог
+            </Button>
+            {canWrite && (
               <Button
-                loading={previewing}
-                disabled={previewing}
-                onClick={() => void runPreview()}
+                type={debugMode === "source" ? "primary" : "default"}
+                onClick={() => setDebugMode("source")}
               >
-                Проверить черновик
+                Лог из источника
               </Button>
-            </div>
-          ) : (
-            <Alert
-              type="info"
-              message="Серверная проверка доступна только с правом normalizers.write."
+            )}
+          </div>
+          {debugMode === "source" ? (
+            <SourceDebugPanel
+              service={service}
+              currentRule={currentRule}
+              onSessionChange={setDebugSession}
             />
-          )}
-          {!!previewError && <AppRequestError error={previewError} />}
-          <IssueSummary issues={previewIssues} onSelect={jumpToIssue} />
-          {preview && (
-            <div className={styles.stack}>
-              <div className={styles.row}>
-                <Tag
-                  color={
-                    preview.status === "complete"
-                      ? "green"
-                      : preview.status === "partial"
-                        ? "orange"
-                        : "red"
-                  }
-                >
-                  {previewStatus[preview.status]} ({preview.status})
-                </Tag>
-                {stale && <Tag color="orange">Результат устарел</Tag>}
-              </div>
-              <Alert
-                type={
-                  preview.status === "failed"
-                    ? "error"
-                    : preview.status === "partial"
-                      ? "warning"
-                      : "success"
-                }
-                showIcon
-                message={
-                  stale
-                    ? "Причины относятся к предыдущему черновику."
-                    : "Причина результата"
-                }
-                description={
-                  <ul className={styles.reasonList}>
-                    {previewReasons(preview).map((reason, index) => (
-                      <li key={index}>{reason}</li>
-                    ))}
-                  </ul>
-                }
-              />
-              <div>Вариант: {preview.variant_key || "не выбран"}</div>
-              <div className={styles.muted}>
-                Служебное время ручной проверки: {previewTime}
-              </div>
-              <h3>ECS</h3>
-              <pre className={styles.preview}>
-                {JSON.stringify(preview.ecs_data, null, 2)}
-              </pre>
-              <h3>Диагностика</h3>
-              {preview.diagnostics.length ? (
-                preview.diagnostics.map((item, index) => (
-                  <Alert
-                    key={index}
-                    type="warning"
-                    message={`${item.variant || "Правило"}${item.block ? ` / ${item.block}` : ""}${item.field ? ` / ${item.field}` : ""}: ${diagnosticText[item.code] || "Проверьте данные и правило."} (${item.code})`}
-                  />
-                ))
-              ) : (
-                <span>Диагностик нет.</span>
+          ) : (
+            <>
+              <h2>Введённый пример</h2>
+              <p className={styles.muted}>
+                Preview нормализует введённую строку log. Служебное время
+                проверки устанавливается автоматически. Изменение правила не
+                пересчитывает сохранённые события.
+              </p>
+              {label(
+                "log — одна сырая строка",
+                <Input.TextArea
+                  rows={7}
+                  value={log}
+                  disabled={!canWrite}
+                  onChange={(event) => {
+                    setLog(event.target.value);
+                    setStale(true);
+                    previewSeq.current++;
+                  }}
+                />,
               )}
-              <h3>Трассировка</h3>
-              {preview.trace.map((step, index) => (
-                <div key={index}>
-                  {step.variant} / {step.block}:{" "}
-                  {traceResult[step.result] || "Результат"} ({step.result})
-                  {step.candidate !== null
-                    ? `, кандидат ${step.candidate + 1}`
-                    : ""}
+              {canWrite ? (
+                <div className={styles.row}>
+                  <ContextHelp
+                    topic="preview"
+                    name="Проверка черновика и статусы"
+                  />
+                  <Button
+                    loading={previewing}
+                    disabled={previewing}
+                    onClick={() => void runPreview()}
+                  >
+                    Проверить черновик
+                  </Button>
                 </div>
-              ))}
-            </div>
+              ) : (
+                <Alert
+                  type="info"
+                  message="Серверная проверка доступна только с правом normalizers.write."
+                />
+              )}
+              {!!previewError && <AppRequestError error={previewError} />}
+              <IssueSummary issues={previewIssues} onSelect={jumpToIssue} />
+              {preview && (
+                <div className={styles.stack}>
+                  <div className={styles.row}>
+                    <Tag
+                      color={
+                        preview.status === "complete"
+                          ? "green"
+                          : preview.status === "partial"
+                            ? "orange"
+                            : "red"
+                      }
+                    >
+                      {previewStatus[preview.status]} ({preview.status})
+                    </Tag>
+                    {stale && <Tag color="orange">Результат устарел</Tag>}
+                  </div>
+                  <Alert
+                    type={
+                      preview.status === "failed"
+                        ? "error"
+                        : preview.status === "partial"
+                          ? "warning"
+                          : "success"
+                    }
+                    showIcon
+                    message={
+                      stale
+                        ? "Причины относятся к предыдущему черновику."
+                        : "Причина результата"
+                    }
+                    description={
+                      <ul className={styles.reasonList}>
+                        {previewReasons(preview).map((reason, index) => (
+                          <li key={index}>{reason}</li>
+                        ))}
+                      </ul>
+                    }
+                  />
+                  <div>Вариант: {preview.variant_key || "не выбран"}</div>
+                  <div className={styles.muted}>
+                    Служебное время ручной проверки: {previewTime}
+                  </div>
+                  <h3>ECS</h3>
+                  <pre className={styles.preview}>
+                    {JSON.stringify(preview.ecs_data, null, 2)}
+                  </pre>
+                  <h3>Диагностика</h3>
+                  {preview.diagnostics.length ? (
+                    preview.diagnostics.map((item, index) => (
+                      <Alert
+                        key={index}
+                        type="warning"
+                        message={`${item.variant || "Правило"}${item.block ? ` / ${item.block}` : ""}${item.field ? ` / ${item.field}` : ""}: ${diagnosticText[item.code] || "Проверьте данные и правило."} (${item.code})`}
+                      />
+                    ))
+                  ) : (
+                    <span>Диагностик нет.</span>
+                  )}
+                  <h3>Трассировка</h3>
+                  {preview.trace.map((step, index) => (
+                    <div key={index}>
+                      {step.variant} / {step.block}:{" "}
+                      {traceResult[step.result] || "Результат"} ({step.result})
+                      {step.candidate !== null
+                        ? `, кандидат ${step.candidate + 1}`
+                        : ""}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </section>
       </div>

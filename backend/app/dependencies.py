@@ -6,6 +6,7 @@ from .db import get_session
 from .ecs import EcsCatalog
 from .indexer import IndexerMetadataAdapter
 from .kafka import KafkaMetadataClient
+from .kafka_debug import DebugReader
 from .normalization.engine import NormalizationEngine
 from .repositories.protocols import OidcClient, ReadinessRepository
 from .repositories.sqlalchemy import (
@@ -38,6 +39,7 @@ from .services.implementations.administration import (
 from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.implementations.cursor import SignedParsedLogCursorCodec
+from .services.implementations.debug_snapshot import SourceSnapshotServiceImpl
 from .services.implementations.diagnostics import DiagnosticsServiceImpl
 from .services.implementations.events import EventQueryServiceImpl, PostgreSqlEventQueryProvider
 from .services.implementations.external import ExternalServiceImpl
@@ -55,6 +57,7 @@ from .services.protocols.administration import (
 )
 from .services.protocols.connections import KafkaConnectionService, SourceService
 from .services.protocols.consumers import SourceConsumerLifecycle
+from .services.protocols.debug_snapshot import SourceSnapshotService
 from .services.protocols.diagnostics import DiagnosticsService
 from .services.protocols.events import EventQueryService
 from .services.protocols.external import ExternalService
@@ -97,6 +100,22 @@ def get_oidc_client(request: Request) -> OidcClient:
 
 def get_kafka_client(request: Request) -> KafkaMetadataClient:
     return request.app.state.kafka_client
+
+
+def get_debug_reader(request: Request) -> DebugReader:
+    return request.app.state.kafka_debug_reader
+
+
+def get_source_snapshot_service(
+    session: Session = Depends(get_session),
+    metadata: KafkaMetadataClient = Depends(get_kafka_client),
+    reader: DebugReader = Depends(get_debug_reader),
+    app_settings: Settings = Depends(get_settings),
+) -> SourceSnapshotService:
+    return SourceSnapshotServiceImpl(
+        SqlAlchemySourceRepository(session), SqlAlchemyKafkaConnectionRepository(session),
+        metadata, reader, app_settings.kafka_metadata_timeout_seconds,
+    )
 
 
 def get_indexer_adapter(request: Request) -> IndexerMetadataAdapter:

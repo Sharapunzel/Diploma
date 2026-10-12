@@ -1,0 +1,36 @@
+.root {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.select {
+  width: 100%;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.raw,
+.list {
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.raw {
+  height: 180px;
+}
+.list {
+  height: 220px;
+}
+.resultRow {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+.detail {
+  min-width: 0;
+}

@@ -34,6 +34,8 @@ class KafkaMetadataError(Exception):
 
 class KafkaMetadataClient(Protocol):
     def metadata(self, config: KafkaConnectionConfig, timeout: float) -> KafkaMetadata: ...
+    def metadata_for_topic(self, config: KafkaConnectionConfig, topic_name: str,
+                           timeout: float) -> KafkaMetadata: ...
 
 
 class ConfluentKafkaMetadataClient:

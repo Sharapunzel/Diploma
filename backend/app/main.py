@@ -23,6 +23,7 @@ from .kafka import (
     ConfluentKafkaMetadataClient,
     KafkaConsumerFactory,
 )
+from .kafka_debug import ConfluentDebugReader
 from .normalization.engine import NormalizationEngine
 from .oidc import AuthlibOidcClient
 from .services.implementations.consumers import KafkaSourceSupervisor
@@ -129,6 +130,7 @@ def create_app(
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
     app.state.kafka_client = configured_kafka_client
+    app.state.kafka_debug_reader = ConfluentDebugReader()
     app.state.indexer_adapter = HttpIndexerMetadataAdapter()
     app.state.ecs_catalog = configured_catalog
     app.state.normalization_engine = configured_engine
@@ -193,6 +195,10 @@ def create_app(
                 return response
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
+        if request.url.path.startswith("/api/v1/sources/") and request.url.path.endswith(
+            "/debug-snapshot"
+        ):
+            response.headers["Cache-Control"] = "no-store"
         REQUEST_LOG.info(
             "request_completed",
             extra={

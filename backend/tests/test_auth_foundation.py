@@ -42,6 +42,7 @@ from app.dependencies import (
     get_readiness_repository,
     get_role_admin,
     get_setting_admin,
+    get_source_snapshot_service,
     get_user_admin,
     require_permission,
 )
@@ -169,6 +170,42 @@ def test_normalizer_preview_catalog_and_permissions(client, auth_database):
     assert client.post("/api/v1/normalizers/preview", json={
         "rule": simple_normalizer_rule(), "sample": {},
     }, headers={"X-CSRF-Token": csrf}).status_code == 403
+
+
+def test_debug_snapshot_http_permission_and_contract(client, auth_database):
+    from app.schemas.debug_snapshot import SnapshotRecord, SourceSnapshot
+
+    source_id = uuid4()
+
+    class Snapshot:
+        def read(self, requested):
+            assert requested == source_id
+            return SourceSnapshot(records=[SnapshotRecord(
+                position=0, timestamp="2024-01-01T00:00:00Z", log="synthetic",
+            )], skipped=0, truncated=False)
+
+    client.app.dependency_overrides[get_source_snapshot_service] = lambda: Snapshot()
+    try:
+        path = f"/api/v1/sources/{source_id}/debug-snapshot"
+        anonymous = client.get(path)
+        assert anonymous.status_code == 401
+        assert anonymous.headers["Cache-Control"] == "no-store"
+        add_local_user(auth_database)
+        assert login(client).status_code == 200
+        assert client.get(path).status_code == 403
+        client.cookies.clear()
+        admin_headers(client, auth_database)
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.json()["records"][0] == {
+            "position": 0, "timestamp": "2024-01-01T00:00:00Z",
+            "log": "synthetic", "issue": None,
+        }
+        schema = client.get("/openapi.json").json()
+        assert path.replace(str(source_id), "{source_id}") in schema["paths"]
+    finally:
+        client.app.dependency_overrides.pop(get_source_snapshot_service, None)
 
 
 def test_normalizer_preview_crud_and_rule_errors(client, auth_database):

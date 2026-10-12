@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from ....dependencies import (
     get_connection_service,
     get_source_service,
+    get_source_snapshot_service,
     require_permission,
 )
 from ....schemas.auth import ErrorResponse
@@ -21,7 +22,9 @@ from ....schemas.connections import (
     SourcePatch,
     TopicPage,
 )
+from ....schemas.debug_snapshot import SourceSnapshot
 from ....services.protocols.connections import KafkaConnectionService, SourceService
+from ....services.protocols.debug_snapshot import SourceSnapshotService
 
 router = APIRouter(tags=["connections", "sources"])
 ERRORS = {
@@ -33,6 +36,18 @@ ERRORS = {
     "503": {"model": ErrorResponse},
     "504": {"model": ErrorResponse},
 }
+
+
+@router.get("/sources/{source_id}/debug-snapshot", response_model=SourceSnapshot,
+            responses=ERRORS)
+def source_debug_snapshot(
+    source_id: UUID,
+    response: Response,
+    _: object = Depends(require_permission("normalizers.write")),
+    service: SourceSnapshotService = Depends(get_source_snapshot_service),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return service.read(source_id)
 
 
 @router.get("/kafka-connections", response_model=KafkaConnectionPage, responses=ERRORS)
