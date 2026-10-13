@@ -45,6 +45,11 @@ const NormalizerEditor = lazy(() =>
     ({ NormalizerEditor }) => ({ default: NormalizerEditor }),
   ),
 );
+const EventsPage = lazy(() =>
+  import("../../pages/events/EventsPage").then(({ EventsPage }) => ({
+    default: EventsPage,
+  })),
+);
 
 function LoadingStatus() {
   return (
@@ -160,6 +165,8 @@ export function AppRoutes() {
                     <SourcesPage />
                   ) : page.path === "/normalizers" ? (
                     <NormalizersPage />
+                  ) : page.path === "/events" ? (
+                    <EventsPage />
                   ) : (
                     <PlaceholderPage name={page.label} />
                   )}

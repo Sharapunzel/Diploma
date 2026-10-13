@@ -3213,6 +3213,95 @@ def add_source_pair(database):
         return connection.id, [(source.id, source.topic_name) for source in sources]
 
 
+def test_event_time_delete_and_opaque_local_id(client, auth_database):
+    headers = admin_headers(client, auth_database)
+    add_local_user(auth_database, username="event-reader")
+    reader_client = TestClient(client.app)
+    try:
+        assert login(reader_client, "event-reader").status_code == 200
+        assert reader_client.delete(
+            f"/api/v1/events/sources/{uuid4()}/events/opaque",
+            headers=events_headers(reader_client),
+        ).status_code == 403
+    finally:
+        reader_client.close()
+    connection_id, sources = add_source_pair(auth_database)
+    source_a, topic_a = sources[0]
+    source_b, topic_b = sources[1]
+    event_start = datetime(2026, 1, 1, tzinfo=UTC)
+    processed = datetime(2020, 1, 1, tzinfo=UTC)
+    processed_record_id = uuid4()
+    with auth_database.session_factory() as session:
+        session.add(ProcessedKafkaRecord(
+            id=processed_record_id, connection_id=connection_id,
+            connection_identity=connection_id, kafka_topic_identity=None,
+            source_id=source_a, normalizer_id=None, kafka_topic=topic_a,
+            kafka_partition=0, kafka_offset=17, result_status="complete",
+            backend_received_at=processed, backend_processed_at=processed,
+        ))
+        session.commit()
+
+    def add(source_id, topic, event_time):
+        return add_parsed_log(
+            auth_database, timestamp=processed, source_id=source_id,
+            connection_id=connection_id, topic=topic,
+            ecs_data={"@timestamp": event_time, "message": "synthetic"},
+        )
+
+    first = add(source_a, topic_a, event_start.isoformat())
+    scoped = add(source_a, topic_a, "2026-01-01T03:00:00+03:00")
+    other = add(source_b, topic_b, "2025-12-31T19:00:00-05:00")
+    boundary = add(source_a, topic_a, (event_start + timedelta(days=1)).isoformat())
+    invalid = add(source_a, topic_a, "invalid")
+    missing = add_parsed_log(
+        auth_database, timestamp=processed, source_id=source_a,
+        connection_id=connection_id, topic=topic_a,
+        ecs_data={"message": "synthetic without timestamp"},
+    )
+    url = f"/api/v1/events/sources/{source_a}"
+    search = client.post(url + "/search", json={"sort": "asc"}, headers=headers)
+    assert search.status_code == 200, search.text
+    assert all(row["normalization_status"] == "complete" for row in search.json()["items"])
+    token = search.json()["items"][0]["id"]
+    assert client.delete(f"/api/v1/events/sources/{source_b}/events/{token}", headers=headers).status_code == 404
+    assert client.delete(f"{url}/events/{token}", headers=headers).status_code == 204
+    assert client.delete(f"{url}/events/{token}", headers=headers).status_code == 404
+    scope = {"source_id": str(source_a), "timestamp_from": event_start.isoformat(),
+             "timestamp_to": (event_start + timedelta(days=1)).isoformat()}
+    result = client.post("/api/v1/parsed-logs/actions/delete", json=scope, headers=headers)
+    assert result.status_code == 200 and result.json()["deleted_count"] == 1
+    scope.pop("source_id")
+    result = client.post("/api/v1/parsed-logs/actions/delete", json=scope, headers=headers)
+    assert result.status_code == 200 and result.json()["deleted_count"] == 1
+    with auth_database.session_factory() as session:
+        assert session.get(ParsedLog, first) is None
+        assert session.get(ParsedLog, scoped) is None
+        assert session.get(ParsedLog, other) is None
+        assert session.get(ParsedLog, boundary) is not None
+        assert session.get(ParsedLog, invalid) is not None
+        assert session.get(ParsedLog, missing) is not None
+    result = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"source_id": str(source_a)}, headers=headers,
+    )
+    assert result.status_code == 200 and result.json()["deleted_count"] == 3
+    with auth_database.session_factory() as session:
+        assert session.get(ParsedLog, boundary) is None
+        assert session.get(ParsedLog, invalid) is None
+        assert session.get(ParsedLog, missing) is None
+        assert session.get(ProcessedKafkaRecord, processed_record_id) is not None
+
+    old_mode = add(source_b, topic_b, event_start.isoformat())
+    result = client.post(
+        "/api/v1/parsed-logs/actions/delete",
+        json={"source_id": str(source_b), "processed_from": "2019-12-31T00:00:00Z",
+              "processed_to": "2020-01-02T00:00:00Z"}, headers=headers,
+    )
+    assert result.status_code == 200 and result.json()["deleted_count"] == 1
+    with auth_database.session_factory() as session:
+        assert session.get(ParsedLog, old_mode) is None
+
+
 def test_ecs_catalog_is_vendored_complete_and_offline():
     catalog = PackagedEcsCatalog.load()
     assert catalog.version == "9.4.0"
@@ -3274,6 +3363,11 @@ def test_ecs_catalog_api_auth_search_pagination_and_not_found(client, auth_datab
     assert client.get("/api/v1/ecs/fields/event.action").status_code == 200
     openapi = client.app.openapi()
     assert "/api/v1/parsed-logs/actions/delete" in openapi["paths"]
+    assert "delete" in openapi["paths"]["/api/v1/events/sources/{source_id}/events/{event_id}"]
+    delete_response = openapi["paths"]["/api/v1/events/sources/{source_id}/events/{event_id}"]["delete"]["responses"]
+    assert "204" in delete_response and "200" not in delete_response
+    search_response = openapi["paths"]["/api/v1/events/sources/{source_id}/search"]["post"]["responses"]["200"]
+    assert search_response["content"]["application/json"]["schema"]["$ref"].endswith("EventSearchResponse")
     assert "post" not in openapi["paths"]["/api/v1/parsed-logs/{log_id}"]
     assert "422" in openapi["paths"]["/api/v1/parsed-logs/search"]["post"]["responses"]
 

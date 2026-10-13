@@ -18,10 +18,10 @@ from ...models import ExternalConnection, Source
 from ...schemas.events import (
     EventFieldDTO,
     EventFieldPage,
-    EventSearchItem,
     EventSearchRequest,
     EventSearchResponse,
     ExternalEventCard,
+    ExternalEventSearchItem,
 )
 
 _KEYWORD = {"keyword", "constant_keyword", "wildcard"}
@@ -303,7 +303,10 @@ class OpenSearchEventQueryProvider:
         matches = [name for name in metadata if q is None or q.casefold() in name.casefold()]
         matches.sort()
         return EventFieldPage(
-            items=[EventFieldDTO(name=name, type=metadata[name][0], operators=list(metadata[name][1]))
+            items=[EventFieldDTO(name=name, type=metadata[name][0], operators=list(metadata[name][1]),
+                                 date_formats=(metadata[name][2].get("format", "strict_date_optional_time||epoch_millis").split("||")
+                                               if metadata[name][0] in _DATE and isinstance(metadata[name][2].get("format", "strict_date_optional_time||epoch_millis"), str)
+                                               else None))
                    for name in matches[offset:offset + limit]],
             total=len(matches), limit=limit, offset=offset,
         )
@@ -547,7 +550,7 @@ class OpenSearchEventQueryProvider:
                 event_time = self._event_timestamp(document, timestamp[2].get("format", "strict_date_optional_time||epoch_millis"))
             except ValueError:
                 continue
-            items.append(EventSearchItem(
+            items.append(ExternalEventSearchItem(
                 source_id=source_id,
                 source_type="external",
                 id=self._event_id(source_id, configuration, selected_target, hit["_index"], hit["_id"]),

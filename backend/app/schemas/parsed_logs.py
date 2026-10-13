@@ -224,8 +224,10 @@ class ParsedLogBulkDeleteRequest(StrictRequest):
     source_id: UUID | None = None
     processed_from: datetime | None = None
     processed_to: datetime | None = None
+    timestamp_from: datetime | None = None
+    timestamp_to: datetime | None = None
 
-    @field_validator("processed_from", "processed_to")
+    @field_validator("processed_from", "processed_to", "timestamp_from", "timestamp_to")
     @classmethod
     def require_timezone(cls, value):
         if value is not None and (value.tzinfo is None or value.utcoffset() is None):
@@ -234,6 +236,14 @@ class ParsedLogBulkDeleteRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_scope_shape(self):
+        event_range = self.timestamp_from is not None or self.timestamp_to is not None
+        if event_range:
+            if self.timestamp_from is None or self.timestamp_to is None:
+                raise ValueError("both event time boundaries are required")
+            if self.timestamp_from >= self.timestamp_to:
+                raise ValueError("timestamp_from must be earlier than timestamp_to")
+            if self.processed_from is not None or self.processed_to is not None:
+                raise ValueError("event time and processed time cannot be combined")
         has_range = self.processed_from is not None or self.processed_to is not None
         if has_range and (self.processed_from is None or self.processed_to is None):
             raise ValueError("both processed time boundaries are required")

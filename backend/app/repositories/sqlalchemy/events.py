@@ -236,7 +236,7 @@ class SqlAlchemyEventQueryRepository:
         limit,
     ):
         event_time = _timestamp_expression()
-        statement = select(ParsedLog.id, event_time, ParsedLog.ecs_data).where(
+        statement = select(ParsedLog.id, event_time, ParsedLog.ecs_data, ParsedLog.normalization_status).where(
             ParsedLog.source_id == source_id,
             ParsedLog.created_at <= snapshot_boundary,
             event_time.is_not(None),

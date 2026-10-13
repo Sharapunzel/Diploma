@@ -289,7 +289,8 @@ class SqlAlchemyParsedLogRepository:
 
     def delete_many(
         self, source_id: UUID | None, processed_from: datetime | None,
-        processed_to: datetime | None,
+        processed_to: datetime | None, timestamp_from: datetime | None = None,
+        timestamp_to: datetime | None = None,
     ) -> int:
         statement = delete(ParsedLog)
         if source_id is not None:
@@ -298,5 +299,10 @@ class SqlAlchemyParsedLogRepository:
             statement = statement.where(ParsedLog.backend_processed_at >= processed_from)
         if processed_to is not None:
             statement = statement.where(ParsedLog.backend_processed_at < processed_to)
+        if timestamp_from is not None or timestamp_to is not None:
+            from .events import _timestamp_expression
+
+            event_time = _timestamp_expression()
+            statement = statement.where(event_time >= timestamp_from, event_time < timestamp_to)
         result = self.session.execute(statement)
         return result.rowcount or 0

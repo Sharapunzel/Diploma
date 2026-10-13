@@ -30,5 +30,6 @@ class ParsedLogRepository(Protocol):
     def delete(self, log: ParsedLog) -> None: ...
     def delete_many(
         self, source_id: UUID | None, processed_from: datetime | None,
-        processed_to: datetime | None,
+        processed_to: datetime | None, timestamp_from: datetime | None = None,
+        timestamp_to: datetime | None = None,
     ) -> int: ...

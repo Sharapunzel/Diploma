@@ -59,6 +59,7 @@ from .services.protocols.connections import KafkaConnectionService, SourceServic
 from .services.protocols.consumers import SourceConsumerLifecycle
 from .services.protocols.debug_snapshot import SourceSnapshotService
 from .services.protocols.diagnostics import DiagnosticsService
+from .services.protocols.event_deletion import EventDeletionService
 from .services.protocols.events import EventQueryService
 from .services.protocols.external import ExternalService
 from .services.protocols.normalization import NormalizerPreviewService
@@ -202,6 +203,25 @@ def get_event_query_service(
         app_settings.oidc_state_secret.get_secret_value(),
     )
     return EventQueryServiceImpl(repository, providers)
+
+
+def get_local_event_deletion_service(
+    session: Session = Depends(get_session),
+    app_settings: Settings = Depends(get_settings),
+) -> EventDeletionService:
+    from .repositories.sqlalchemy.events import SqlAlchemyEventQueryRepository
+    from .repositories.sqlalchemy.parsed_logs import SqlAlchemyParsedLogRepository
+    from .services.implementations.event_deletion import LocalEventDeletionService
+    from .services.implementations.events import LocalEventIdCodec
+
+    repository = SqlAlchemyEventQueryRepository(session)
+    return LocalEventDeletionService(
+        repository,
+        repository,
+        LocalEventIdCodec(app_settings.oidc_state_secret.get_secret_value()),
+        SqlAlchemyParsedLogRepository(session),
+        SqlAlchemyUnitOfWork(session),
+    )
 
 
 def get_diagnostics_service(

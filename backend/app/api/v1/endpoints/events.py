@@ -1,16 +1,23 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 
-from ....dependencies import get_event_query_service, require_permission
+from ....dependencies import (
+    get_event_query_service,
+    get_local_event_deletion_service,
+    require_permission,
+)
 from ....schemas.errors import ErrorResponse
 from ....schemas.events import EventCard, EventFieldPage, EventSearchRequest, EventSearchResponse
+from ....services.protocols.event_deletion import EventDeletionService
 from ....services.protocols.events import EventQueryService
 
 router = APIRouter(prefix="/events/sources/{source_id}", tags=["Events"])
 Service = Annotated[EventQueryService, Depends(get_event_query_service)]
+DeletionService = Annotated[EventDeletionService, Depends(get_local_event_deletion_service)]
 ReadPermission = Annotated[tuple, Depends(require_permission("events.read"))]
+DeletePermission = Annotated[tuple, Depends(require_permission("events.delete"))]
 AUTH_ERRORS = {
     401: {"model": ErrorResponse, "description": "Authentication required"},
     403: {"model": ErrorResponse, "description": "Permission denied"},
@@ -43,3 +50,14 @@ def search_events(source_id: UUID, body: EventSearchRequest, _: ReadPermission, 
 @router.get("/events/{event_id}", response_model=EventCard, responses=READ_ERRORS)
 def get_event(source_id: UUID, event_id: str, _: ReadPermission, service: Service):
     return service.get(source_id, event_id)
+
+
+@router.delete("/events/{event_id}", status_code=204, responses=AUTH_ERRORS)
+def delete_local_event(
+    source_id: UUID,
+    event_id: str,
+    _: DeletePermission,
+    service: DeletionService,
+):
+    service.delete(source_id, event_id)
+    return Response(status_code=204)

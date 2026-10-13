@@ -18,10 +18,10 @@ from ...schemas.events import (
     EventCard,
     EventFieldDTO,
     EventFieldPage,
-    EventSearchItem,
     EventSearchRequest,
     EventSearchResponse,
     KafkaEventCard,
+    KafkaEventSearchItem,
     LocalEventDetails,
     LocalEventMetadata,
 )
@@ -59,6 +59,22 @@ def _event_operators(field) -> tuple[str, ...]:
     return ()
 
 
+class LocalEventIdCodec:
+    def __init__(self, secret: str):
+        self._cipher = Fernet(
+            base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8") + b"events-id").digest())
+        )
+
+    def encode(self, identity: UUID) -> str:
+        return self._cipher.encrypt(str(identity).encode("ascii")).decode("ascii")
+
+    def decode(self, value: str) -> UUID:
+        try:
+            return UUID(self._cipher.decrypt(value.encode("ascii"), ttl=None).decode("ascii"))
+        except (InvalidToken, TypeError, ValueError, UnicodeError):
+            raise DomainError("event_not_found", "Event not found", 404) from None
+
+
 class PostgreSqlEventQueryProvider:
     source_type = "kafka"
 
@@ -66,9 +82,7 @@ class PostgreSqlEventQueryProvider:
         self.repository = repository
         self.catalog = catalog
         secret_bytes = secret.encode("utf-8")
-        self.ids = Fernet(
-            base64.urlsafe_b64encode(hashlib.sha256(secret_bytes + b"events-id").digest())
-        )
+        self.ids = LocalEventIdCodec(secret)
         self.cursors = Fernet(
             base64.urlsafe_b64encode(hashlib.sha256(secret_bytes + b"events-cursor").digest())
         )
@@ -143,13 +157,10 @@ class PostgreSqlEventQueryProvider:
         return hashlib.sha256(value.encode()).hexdigest()
 
     def _opaque_id(self, identity: UUID) -> str:
-        return self.ids.encrypt(str(identity).encode("ascii")).decode("ascii")
+        return self.ids.encode(identity)
 
     def _decode_id(self, value: str) -> UUID:
-        try:
-            return UUID(self.ids.decrypt(value.encode("ascii"), ttl=None).decode("ascii"))
-        except (InvalidToken, TypeError, ValueError, UnicodeError):
-            raise DomainError("event_not_found", "Event not found", 404) from None
+        return self.ids.decode(value)
 
     def search(self, source_id: UUID, request: EventSearchRequest) -> EventSearchResponse:
         filters = []
@@ -212,18 +223,19 @@ class PostgreSqlEventQueryProvider:
         more = len(rows) > request.limit
         rows = rows[: request.limit]
         items = [
-            EventSearchItem(
+            KafkaEventSearchItem(
                 source_id=source_id,
                 source_type=self.source_type,
                 id=self._opaque_id(identity),
                 event_timestamp=timestamp,
                 fields=fields,
+                normalization_status=status,
             )
-            for identity, timestamp, fields in rows
+            for identity, timestamp, fields, status in rows
         ]
         next_cursor = None
         if more and rows:
-            identity, timestamp, _ = rows[-1]
+            identity, timestamp, _, _ = rows[-1]
             payload = json.dumps(
                 {
                     "source": str(source_id),

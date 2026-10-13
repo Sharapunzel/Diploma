@@ -213,13 +213,14 @@ class ParsedLogServiceImpl:
     def delete_many(
         self, request: ParsedLogBulkDeleteRequest
     ) -> ParsedLogBulkDeleteResponse:
-        if request.source_id is None and request.processed_from is None:
+        if request.source_id is None and request.processed_from is None and request.timestamp_from is None:
             raise DomainError(
                 "deletion_scope_required", "A source or time range is required", 422
             )
         try:
             deleted = self.repository.delete_many(
-                request.source_id, request.processed_from, request.processed_to
+                request.source_id, request.processed_from, request.processed_to,
+                request.timestamp_from, request.timestamp_to,
             )
             self.unit_of_work.commit()
         except Exception as error:  # noqa: BLE001 -- rollback and sanitize all adapter failures.

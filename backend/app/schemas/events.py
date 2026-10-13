@@ -69,6 +69,7 @@ class EventFieldDTO(StrictRequest):
     name: str
     type: str
     operators: list[str]
+    date_formats: list[str] | None = None
 
 
 class EventFieldPage(StrictRequest):
@@ -78,12 +79,25 @@ class EventFieldPage(StrictRequest):
     offset: int
 
 
-class EventSearchItem(StrictRequest):
+class EventSearchItemBase(StrictRequest):
     source_id: UUID
-    source_type: Literal["kafka", "external"]
     id: str
     event_timestamp: datetime
     fields: dict[str, Any]
+
+
+class KafkaEventSearchItem(EventSearchItemBase):
+    source_type: Literal["kafka"]
+    normalization_status: Literal["complete", "partial"]
+
+
+class ExternalEventSearchItem(EventSearchItemBase):
+    source_type: Literal["external"]
+
+
+EventSearchItem = Annotated[
+    KafkaEventSearchItem | ExternalEventSearchItem, Field(discriminator="source_type")
+]
 
 
 class EventSearchResponse(StrictRequest):

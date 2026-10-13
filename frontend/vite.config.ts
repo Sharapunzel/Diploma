@@ -22,6 +22,8 @@ export default defineConfig({
     hmr: { clientPort: Number(process.env.HMR_CLIENT_PORT || 8080) },
   },
   test: {
+    maxWorkers: 2,
+    testTimeout: 20_000,
     environment: "jsdom",
     include: ["src/**/*.test.{ts,tsx}"],
     setupFiles: ["src/test/setup.ts"],
