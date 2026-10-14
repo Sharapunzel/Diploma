@@ -165,4 +165,15 @@ describe("ApiClient", () => {
       "Индексер",
     );
   });
+
+  it("shows distinct safe Kafka security errors", () => {
+    const descriptions = [
+      errorText(new ApiError(503, "kafka_tls_failed")),
+      errorText(new ApiError(503, "kafka_authentication_failed")),
+      errorText(new ApiError(503, "kafka_acl_denied")),
+      errorText(new ApiError(503, "kafka_security_configuration_invalid")),
+    ];
+    expect(new Set(descriptions).size).toBe(4);
+    expect(descriptions.every((text) => text.includes("Kafka"))).toBe(true);
+  });
 });

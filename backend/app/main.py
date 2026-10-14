@@ -24,6 +24,7 @@ from .kafka import (
     KafkaConsumerFactory,
 )
 from .kafka_debug import ConfluentDebugReader
+from .kafka_security import KafkaSecurityProfile
 from .normalization.engine import NormalizationEngine
 from .oidc import AuthlibOidcClient
 from .services.implementations.consumers import KafkaSourceSupervisor
@@ -79,7 +80,18 @@ def create_app(
     current = config or settings
     owned_database = database is None
     configured_database = database or Database(current.database_url)
-    configured_kafka_client = kafka_client or ConfluentKafkaMetadataClient()
+    kafka_security_profile = (
+        KafkaSecurityProfile(
+            current.kafka_security_protocol,
+            current.kafka_runtime_username,
+            current.kafka_runtime_password_file,
+            current.kafka_ca_file,
+            tuple(current.kafka_dev_allowed_bootstrap_servers),
+        ) if current.kafka_security_protocol is not None else None
+    )
+    if kafka_security_profile is not None and current.environment != "test":
+        kafka_security_profile.client_options()
+    configured_kafka_client = kafka_client or ConfluentKafkaMetadataClient(kafka_security_profile)
     configured_catalog = ecs_catalog if ecs_catalog is not None else PackagedEcsCatalog.load()
     configured_engine = NormalizationEngine(configured_catalog)
 
@@ -93,7 +105,9 @@ def create_app(
         configured_engine,
         configured_kafka_client,
         consumer_factory
-        or ConfluentKafkaConsumerFactory(current.kafka_metadata_timeout_seconds),
+        or ConfluentKafkaConsumerFactory(
+            current.kafka_metadata_timeout_seconds, kafka_security_profile
+        ),
         current.kafka_metadata_timeout_seconds,
         current.kafka_consumer_poll_timeout_seconds,
         current.kafka_consumer_retry_delay_seconds,
@@ -102,6 +116,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if current.environment != "test" and kafka_security_profile is None:
+            raise RuntimeError("Kafka security profile is required before the API can start")
+        if kafka_security_profile is not None and current.environment != "test":
+            kafka_security_profile.client_options()
         if consumers_enabled:
             await run_in_threadpool(supervisor.start)
         try:
@@ -130,7 +148,7 @@ def create_app(
     app.state.database = configured_database
     app.state.oidc_client = oidc_client or AuthlibOidcClient(current)
     app.state.kafka_client = configured_kafka_client
-    app.state.kafka_debug_reader = ConfluentDebugReader()
+    app.state.kafka_debug_reader = ConfluentDebugReader(kafka_security_profile)
     app.state.indexer_adapter = HttpIndexerMetadataAdapter()
     app.state.ecs_catalog = configured_catalog
     app.state.normalization_engine = configured_engine

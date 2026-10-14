@@ -59,3 +59,12 @@ def test_dev_compose_passes_external_key_and_oidc_settings():
         assert api[key] == value
     assert api["ENVIRONMENT"] == "development"
     assert api["SESSION_COOKIE_SECURE"] == "false"
+    kafka = config["services"]["kafka"]
+    assert kafka["environment"]["DIPLOMA_KAFKA_MODE"] == "development"
+    assert kafka["ports"][0]["host_ip"] == "127.0.0.1"
+    assert kafka["healthcheck"]["test"][1].find("--command-config") >= 0
+    assert api["KAFKA_SECURITY_PROTOCOL"] == "SASL_PLAINTEXT"
+    assert api["KAFKA_DEV_ALLOWED_BOOTSTRAP_SERVERS"] == (
+        "127.0.0.1:19093,localhost:19093,[::1]:19093,kafka:9092"
+    )
+    assert config["services"]["api"]["depends_on"]["kafka-acls"]["condition"] == "service_completed_successfully"

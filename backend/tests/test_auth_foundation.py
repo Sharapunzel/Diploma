@@ -1365,7 +1365,9 @@ def test_settings_security_validation():
         Settings(environment="production", session_cookie_secure=True)
 
 
-def test_openapi_http_routes_follow_environment():
+def test_openapi_http_routes_follow_environment(tmp_path):
+    (tmp_path / "reader_password").write_text("test-only-password", encoding="utf-8")
+    (tmp_path / "kafka_ca.pem").write_text("test-only-ca", encoding="utf-8")
     development = create_app(Settings(environment="development"))
     production = create_app(Settings(
         environment="production",
@@ -1374,12 +1376,21 @@ def test_openapi_http_routes_follow_environment():
         external_secret_key="FjzCZG1bo4T5WBYB_oBUrhyoSEkbxsOgCwMsNXCEsVw=",
         trusted_hosts=["example.test"],
         forwarded_allow_ips=["172.30.0.10"],
+        kafka_security_protocol="SASL_SSL",
+        kafka_runtime_username="diploma-reader",
+        kafka_runtime_password_file=tmp_path / "reader_password",
+        kafka_ca_file=tmp_path / "kafka_ca.pem",
     ))
     try:
         for path in ("/docs", "/redoc", "/openapi.json"):
             assert any(getattr(route, "path", None) == path for route in development.routes)
             assert not any(getattr(route, "path", None) == path for route in production.routes)
         assert production.openapi()["paths"]
+        for application in (development, production):
+            schemas = application.openapi()["components"]["schemas"]
+            assert "security_protocol" not in schemas["KafkaConnectionCreate"]["properties"]
+            assert "security_protocol" not in schemas["KafkaConnectionPatch"]["properties"]
+            assert "security_protocol" not in schemas["KafkaConnectionDTO"]["properties"]
     finally:
         development.state.database.dispose()
         production.state.database.dispose()
@@ -1401,6 +1412,10 @@ def test_production_secret_files_are_loaded(tmp_path, monkeypatch):
         session_cookie_secure=True,
         trusted_hosts=["example.test"],
         forwarded_allow_ips=["172.30.0.10"],
+        kafka_security_protocol="SASL_SSL",
+        kafka_runtime_username="diploma-reader",
+        kafka_runtime_password_file=tmp_path / "kafka_reader_password",
+        kafka_ca_file=tmp_path / "kafka_ca.pem",
     )
     assert configured.database_url == secrets["DATABASE_URL_FILE"]
     assert configured.oidc_state_secret.get_secret_value() == secrets["OIDC_STATE_SECRET_FILE"]
@@ -2186,7 +2201,10 @@ class FakeKafkaMetadataClient:
         self.calls += 1
         if self.mode == "unexpected":
             raise RuntimeError("adapter implementation defect")
-        if self.mode in {"unavailable", "timeout"}:
+        if self.mode in {
+            "unavailable", "timeout", "tls", "authentication", "authorization",
+            "configuration",
+        }:
             raise KafkaMetadataError(self.mode)
         return KafkaMetadata(
             broker_count=1,
@@ -2460,19 +2478,21 @@ def test_kafka_connections_topics_and_source_lifecycle(client, auth_database):
             "id": "66666666-6666-4666-8666-666666666666",
             "name": "local-kafka",
             "bootstrap_servers": ["localhost:9092"],
+            "security_protocol": "PLAINTEXT",
         },
         headers=headers,
     )
     assert created.status_code == 201
     connection = created.json()
     assert connection["id"] == "66666666-6666-4666-8666-666666666666"
-    assert connection["security_protocol"] == "PLAINTEXT" and connection["extra_config"] == {}
+    assert "security_protocol" not in connection
+    assert connection["extra_config"] == {}
     connection_id = connection["id"]
     assert client.get(f"/api/v1/kafka-connections/{connection_id}").status_code == 200
     assert client.get("/api/v1/kafka-connections", params={"q": "local"}).json()["total"] == 1
     patched_connection = client.patch(
         f"/api/v1/kafka-connections/{connection_id}",
-        json={"name": "local-kafka-renamed"},
+        json={"name": "local-kafka-renamed", "security_protocol": "PLAINTEXT"},
         headers=headers,
     )
     assert patched_connection.status_code == 200
@@ -3044,6 +3064,18 @@ def test_kafka_source_validation_permissions_and_safe_failures(client, auth_data
     fake.mode = "timeout"
     timeout = client.get(f"/api/v1/kafka-connections/{connection['id']}/topics")
     assert timeout.status_code == 504 and timeout.json()["code"] == "kafka_timeout"
+    for kind, code in (
+        ("tls", "kafka_tls_failed"),
+        ("authentication", "kafka_authentication_failed"),
+        ("authorization", "kafka_acl_denied"),
+        ("configuration", "kafka_security_configuration_invalid"),
+    ):
+        fake.mode = kind
+        response = client.post(
+            f"/api/v1/kafka-connections/{connection['id']}/test", headers=headers
+        )
+        assert response.status_code == 503 and response.json()["code"] == code
+        assert "sensitive" not in response.text
     fake.mode = "ok"
     unknown_topic = client.post(
         "/api/v1/sources",

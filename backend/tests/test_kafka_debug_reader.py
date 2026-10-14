@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from app.kafka_debug import (
     ConfluentDebugReader,
     DebugReadError,
 )
+from app.kafka_security import KafkaSecurityProfile
 
 
 class FakeMessage:
@@ -89,7 +91,10 @@ def run_reader(monkeypatch, bounds, messages, **kwargs):
     )
     monkeypatch.setitem(sys.modules, "confluent_kafka", fake_module)
     config = KafkaConnectionConfig(("broker:9092",), "PLAINTEXT")
-    result = ConfluentDebugReader().read(config, "logs", 1)
+    test_profile = KafkaSecurityProfile(
+        "SASL_SSL", "reader", Path(__file__), Path(__file__)
+    )
+    result = ConfluentDebugReader(test_profile).read(config, "logs", 1)
     return result, state["client"]
 
 

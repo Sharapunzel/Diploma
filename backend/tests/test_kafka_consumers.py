@@ -1409,6 +1409,170 @@ def test_adapter_commit_wait_obeys_deadline_and_checks_callback() -> None:
     assert error.value.kind == "unavailable"
 
 
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("tls", "kafka_poll_tls_failed"),
+        ("authentication", "kafka_poll_authentication_failed"),
+        ("authorization", "kafka_poll_acl_denied"),
+        ("configuration", "kafka_poll_security_configuration_invalid"),
+        ("timeout", "kafka_poll_timeout"),
+        ("unavailable", "kafka_poll_unavailable"),
+    ],
+)
+def test_consumer_failure_state_uses_safe_security_category(kind, expected):
+    from app.services.implementations.consumers import kafka_consumer_reason
+    from app.services.implementations.diagnostics import describe_reason
+
+    reason = kafka_consumer_reason("poll", KafkaConsumerError(kind))
+    assert reason == expected
+    assert describe_reason(reason)
+
+
+@pytest.mark.parametrize("kind", ["tls", "authentication", "authorization"])
+def test_consumer_metadata_failure_state_keeps_security_category(kind):
+    from app.services.implementations.consumers import kafka_consumer_reason
+    from app.services.implementations.diagnostics import describe_reason
+
+    reason = kafka_consumer_reason("metadata", KafkaConsumerError(kind))
+    assert reason in {
+        "kafka_metadata_tls_failed",
+        "kafka_metadata_authentication_failed",
+        "kafka_metadata_acl_denied",
+    }
+    assert describe_reason(reason)
+
+
+def test_consumer_preserves_observed_tls_and_auth_causes_for_generic_failures():
+    from confluent_kafka import KafkaError
+
+    class ErrorMessage:
+        def error(self):
+            return KafkaError(KafkaError._ALL_BROKERS_DOWN)
+
+    class PollClient:
+        def poll(self, timeout):
+            return ErrorMessage()
+
+    poll_consumer = ConfluentKafkaConsumer(PollClient())
+    poll_consumer._on_error(KafkaError(KafkaError._SSL))
+    with pytest.raises(KafkaConsumerError) as poll_error:
+        poll_consumer.poll(0)
+    assert poll_error.value.kind == "tls"
+
+    class CommitClient:
+        def commit(self, **_):
+            pass
+
+        def poll(self, timeout):
+            self.consumer._on_commit(KafkaError(KafkaError._ALL_BROKERS_DOWN), [])
+
+    commit_client = CommitClient()
+    commit_consumer = ConfluentKafkaConsumer(commit_client)
+    commit_client.consumer = commit_consumer
+    commit_consumer._on_error(KafkaError(KafkaError._AUTHENTICATION))
+    with pytest.raises(KafkaConsumerError) as commit_error:
+        commit_consumer.commit((KafkaPartition("events", 0, 1),), 1)
+    assert commit_error.value.kind == "authentication"
+
+
+def test_repeated_callback_without_message_is_bounded_and_visible():
+    from confluent_kafka import KafkaError
+
+    class CallbackOnlyClient:
+        def poll(self, timeout):
+            self.adapter._on_error(KafkaError(KafkaError._AUTHENTICATION, "private detail"))
+
+    client = CallbackOnlyClient()
+    adapter = ConfluentKafkaConsumer(client)
+    client.adapter = adapter
+    for _ in range(10_000):
+        with pytest.raises(KafkaConsumerError) as error:
+            adapter.poll(0)
+        assert error.value.kind == "authentication"
+    assert len(adapter.failure_observer._observed) <= 1
+
+
+def test_callback_without_message_during_commit_keeps_authentication_cause():
+    from confluent_kafka import KafkaError
+
+    class CallbackOnlyClient:
+        def commit(self, **kwargs):
+            self.offsets = kwargs["offsets"]
+
+        def poll(self, timeout):
+            self.adapter._on_error(KafkaError(KafkaError._AUTHENTICATION, "private detail"))
+
+    client = CallbackOnlyClient()
+    adapter = ConfluentKafkaConsumer(client)
+    client.adapter = adapter
+    with pytest.raises(KafkaConsumerError) as error:
+        adapter.commit((KafkaPartition("review", 0, 1),), 0.01)
+    assert error.value.kind == "authentication"
+    assert not adapter.commit_results
+
+
+def test_successful_poll_clears_old_callback_before_later_transport_failure():
+    from confluent_kafka import KafkaError
+
+    class Message:
+        def error(self):
+            return None
+
+        def topic(self):
+            return "review"
+
+        def partition(self):
+            return 0
+
+        def offset(self):
+            return 1
+
+        def value(self):
+            return b"event"
+
+    class TransportFailure:
+        def error(self):
+            return KafkaError(KafkaError._ALL_BROKERS_DOWN)
+
+    class Client:
+        calls = 0
+
+        def poll(self, timeout):
+            self.calls += 1
+            return Message() if self.calls == 1 else TransportFailure()
+
+    adapter = ConfluentKafkaConsumer(Client())
+    adapter._on_error(KafkaError(KafkaError._SSL))
+    assert adapter.poll(0) is None
+    with pytest.raises(KafkaConsumerError) as error:
+        adapter.poll(0)
+    assert error.value.kind == "unavailable"
+
+
+def test_supervisor_reports_safe_callback_failure_reason(consumer_database, clean_consumer_data):
+    from app.services.implementations.diagnostics import describe_reason
+
+    _, source_id = _source(consumer_database)
+
+    class AuthenticationFailure(FakeConsumer):
+        def poll(self, timeout):
+            raise KafkaConsumerError("authentication")
+
+    supervisor = _supervisor(consumer_database, AuthenticationFailure([]))
+    supervisor.start()
+    try:
+        _wait(
+            lambda: source_id in supervisor._workers
+            and supervisor._workers[source_id].state.reason == "kafka_poll_authentication_failed"
+        )
+        reason = supervisor._workers[source_id].state.reason
+        assert describe_reason(reason)
+        assert "private detail" not in describe_reason(reason)
+    finally:
+        assert supervisor.stop()
+
+
 def test_supervisor_shutdown_waits_for_current_worker_and_closes_it(
     consumer_database, clean_consumer_data
 ):

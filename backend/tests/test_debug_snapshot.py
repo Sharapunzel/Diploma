@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.core.errors import DomainError
-from app.kafka import KafkaMetadata, KafkaTopic
+from app.kafka import KafkaMetadata, KafkaMetadataError, KafkaTopic
 from app.kafka_debug import DebugReadError, DebugRecord
 from app.services.implementations.debug_snapshot import SourceSnapshotServiceImpl
 
@@ -129,6 +129,9 @@ def test_response_size_limit_marks_records_without_exposing_values():
 
 @pytest.mark.parametrize(("kind", "code", "status"), [
     ("timeout", "kafka_debug_unavailable", 504),
+    ("tls", "kafka_tls_failed", 503),
+    ("authentication", "kafka_authentication_failed", 503),
+    ("authorization", "kafka_acl_denied", 503),
     ("incomplete", "kafka_snapshot_incomplete", 409),
     ("byte_limit", "kafka_snapshot_too_large", 413),
 ])
@@ -143,3 +146,17 @@ def test_reader_failures_are_safe_and_distinct(kind, code, status):
         service.read(source.id)
     assert error.value.code == code
     assert error.value.status_code == status
+
+
+def test_metadata_security_failure_is_classified_for_snapshot():
+    service, source, _, _ = setup([])
+
+    class FailedMetadata:
+        def metadata_for_topic(self, *_):
+            raise KafkaMetadataError("configuration")
+
+    service.metadata = FailedMetadata()
+    with pytest.raises(DomainError) as error:
+        service.read(source.id)
+    assert error.value.code == "kafka_security_configuration_invalid"
+    assert error.value.status_code == 503

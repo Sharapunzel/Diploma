@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     trusted_hosts: list[str] = []
     forwarded_allow_ips: list[str] = ["127.0.0.1"]
     kafka_metadata_timeout_seconds: int = 5
+    kafka_security_protocol: Literal["SASL_PLAINTEXT", "SASL_SSL"] | None = None
+    kafka_runtime_username: str | None = None
+    kafka_runtime_password_file: Path | None = None
+    kafka_ca_file: Path | None = None
+    kafka_dev_allowed_bootstrap_servers: list[str] = [
+        "127.0.0.1:9092",
+        "localhost:9092",
+        "[::1]:9092",
+        "kafka:9092",
+    ]
     kafka_consumers_enabled: bool = True
     kafka_consumer_poll_timeout_seconds: float = 1.0
     kafka_consumer_retry_delay_seconds: float = 2.0
@@ -41,7 +51,10 @@ class Settings(BaseSettings):
         env_file=".env", env_prefix="", extra="ignore", enable_decoding=False
     )
 
-    @field_validator("cors_origins", "oidc_scopes", "trusted_hosts", "forwarded_allow_ips", mode="before")
+    @field_validator(
+        "cors_origins", "oidc_scopes", "trusted_hosts", "forwarded_allow_ips",
+        "kafka_dev_allowed_bootstrap_servers", mode="before"
+    )
     @classmethod
     def split_csv(cls, value):
         if isinstance(value, str):
@@ -83,6 +96,11 @@ class Settings(BaseSettings):
             raise ValueError("TTL values must be positive")
         if not 1 <= self.kafka_metadata_timeout_seconds <= 30:
             raise ValueError("kafka metadata timeout must be between 1 and 30 seconds")
+        if self.kafka_security_protocol is not None:
+            if not self.kafka_runtime_username or not self.kafka_runtime_password_file:
+                raise ValueError("Kafka runtime credentials are required")
+            if self.kafka_security_protocol == "SASL_SSL" and not self.kafka_ca_file:
+                raise ValueError("SASL_SSL requires a Kafka CA file")
         if not 0.1 <= self.kafka_consumer_poll_timeout_seconds <= 30:
             raise ValueError("kafka consumer poll timeout must be between 0.1 and 30 seconds")
         if not 0.1 <= self.kafka_consumer_retry_delay_seconds <= 60:
@@ -133,6 +151,8 @@ class Settings(BaseSettings):
             not self.oidc_redirect_uri or not self.oidc_redirect_uri.startswith("https://")
         ):
             raise ValueError("production OIDC_REDIRECT_URI must use public HTTPS")
+        if self.environment == "production" and self.kafka_security_protocol != "SASL_SSL":
+            raise ValueError("production Kafka requires SASL_SSL")
         return self
 
 

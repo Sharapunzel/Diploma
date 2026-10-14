@@ -196,7 +196,6 @@ export const ConnectionsPage = observer(() => {
         const input: KafkaConnectionInput = {
           name: values.name.trim(),
           bootstrap_servers: servers,
-          security_protocol: "PLAINTEXT",
         };
         changed = true;
         submit = () => connections.saveKafka(undefined, input);
@@ -483,7 +482,7 @@ export const ConnectionsPage = observer(() => {
       key: "info",
       render: (_: unknown, item: RecordType) =>
         kind === "kafka"
-          ? "Kafka · PLAINTEXT"
+          ? "Kafka · защищённое подключение"
           : `Индексер · ${(item as ExternalConnection).username} · пароль ${(item as ExternalConnection).has_password ? "задан" : "не задан"} · CA ${(item as ExternalConnection).has_ca ? "загружен" : "не загружен"}`,
     },
     {

@@ -180,6 +180,14 @@ export function errorText(error: unknown): string {
   const known: Record<string, string> = {
     kafka_timeout: "Время ожидания Kafka истекло.",
     kafka_unavailable: "Kafka недоступна.",
+    kafka_tls_failed:
+      "Не удалось проверить сертификат Kafka. Обратитесь к администратору.",
+    kafka_authentication_failed:
+      "Kafka отклонила служебные учётные данные. Обратитесь к администратору.",
+    kafka_acl_denied:
+      "Kafka отказала в выполнении операции из-за прав доступа. Обратитесь к администратору.",
+    kafka_security_configuration_invalid:
+      "Адрес Kafka несовместим с настроенным профилем безопасности.",
     source_enabled: "Сначала выключите источник, затем измените его настройки.",
     source_exists:
       "У подключения есть зарегистрированные источники. Изменить адреса брокеров или параметры безопасности нельзя.",

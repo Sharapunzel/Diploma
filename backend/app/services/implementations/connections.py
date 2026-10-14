@@ -30,8 +30,16 @@ def fail(code: str, message: str, status: int = 404, details: dict | None = None
 
 
 def kafka_error(error: KafkaMetadataError) -> None:
+    if error.kind == "configuration":
+        fail("kafka_security_configuration_invalid", "Kafka security profile cannot be used for this address", 503)
     if error.kind == "timeout":
         fail("kafka_timeout", "Kafka metadata request timed out", 504)
+    if error.kind == "tls":
+        fail("kafka_tls_failed", "Kafka TLS trust or hostname verification failed", 503)
+    if error.kind == "authentication":
+        fail("kafka_authentication_failed", "Kafka credentials were rejected", 503)
+    if error.kind == "authorization":
+        fail("kafka_acl_denied", "Kafka ACL denied the operation", 503)
     fail("kafka_unavailable", "Kafka is unavailable", 503)
 
 
@@ -76,7 +84,9 @@ class KafkaConnectionServiceImpl:
             id=data.id,
             name=data.name,
             bootstrap_servers=data.bootstrap_servers,
-            security_protocol=data.security_protocol,
+            # Legacy storage column remains for existing rows; it never selects
+            # the effective server-owned Kafka security profile.
+            security_protocol="PLAINTEXT",
         )
         try:
             self.repository.add(connection)

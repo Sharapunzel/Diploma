@@ -4,11 +4,25 @@ from datetime import UTC, datetime
 from threading import RLock
 from typing import Protocol
 
+from .kafka_security import KafkaSecurityConfigurationError, KafkaSecurityProfile
+
 
 @dataclass(frozen=True)
 class KafkaConnectionConfig:
     bootstrap_servers: tuple[str, ...]
     security_protocol: str
+
+
+def client_security_options(
+    config: KafkaConnectionConfig, profile: KafkaSecurityProfile | None
+) -> dict[str, str]:
+    # The persisted protocol remains legacy metadata only. It can never provide
+    # runtime credentials or select a transport.
+    if profile is None:
+        raise KafkaSecurityConfigurationError(
+            "Kafka security profile is required for broker access"
+        )
+    return profile.client_options(config.bootstrap_servers)
 
 
 @dataclass(frozen=True)
@@ -32,6 +46,105 @@ class KafkaMetadataError(Exception):
         self.kind = kind
 
 
+def kafka_failure_kind(error) -> str:
+    """Return a safe operator category without exposing librdkafka text."""
+    from confluent_kafka import KafkaError
+
+    kafka_error = error.args[0] if isinstance(error, Exception) and error.args else error
+    code = getattr(kafka_error, "code", lambda: None)()
+    if code == KafkaError._SSL:
+        return "tls"
+    if code == KafkaError._AUTHENTICATION:
+        return "authentication"
+    if code in (KafkaError.TOPIC_AUTHORIZATION_FAILED,
+                KafkaError.GROUP_AUTHORIZATION_FAILED,
+                KafkaError.CLUSTER_AUTHORIZATION_FAILED):
+        return "authorization"
+    if code == KafkaError._TIMED_OUT:
+        return "timeout"
+    return "unavailable"
+
+
+class KafkaFailureObserver:
+    """Keep one pending callback cause for the next operation on this client."""
+
+    def __init__(self) -> None:
+        self._observed: deque[str] = deque(maxlen=1)
+        self._lock = RLock()
+
+    def __call__(self, error) -> None:
+        kind = kafka_failure_kind(error)
+        with self._lock:
+            pending = self._observed[0] if self._observed else None
+            if kind in {"tls", "authentication", "authorization"} or pending is None:
+                self._observed.append(kind)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._observed.clear()
+
+    def take(self) -> str | None:
+        with self._lock:
+            return self._observed.popleft() if self._observed else None
+
+    def classify(self, error) -> str:
+        kind = kafka_failure_kind(error)
+        if kind in {"tls", "authentication", "authorization"}:
+            self.clear()
+            return kind
+        observed = self.take()
+        return observed if observed in {"tls", "authentication", "authorization"} else kind
+
+
+def diagnose_security_failure(config: KafkaConnectionConfig,
+                              profile: KafkaSecurityProfile | None) -> str:
+    """Inspect librdkafka's poll errors when metadata reports only transport failure."""
+    if profile is None:
+        return "unavailable"
+    from time import monotonic
+
+    from confluent_kafka import Consumer, KafkaException
+
+    probes: list[tuple[Consumer, KafkaFailureObserver]] = []
+    options = client_security_options(config, profile)
+    for family in ("v4", "v6"):
+        observer = KafkaFailureObserver()
+        try:
+            consumer = Consumer(
+                {
+                    "bootstrap.servers": ",".join(config.bootstrap_servers),
+                    **options,
+                    "broker.address.family": family,
+                    "group.id": "diploma-source-security-diagnostic",
+                    "enable.auto.commit": False,
+                    "allow.auto.create.topics": False,
+                    "error_cb": observer,
+                }
+            )
+            consumer.subscribe(["__diploma_security_probe_nonexistent__"])
+            probes.append((consumer, observer))
+        except KafkaException:
+            continue
+    if not probes:
+        return "unavailable"
+    try:
+        deadline = monotonic() + 2
+        while monotonic() < deadline:
+            for consumer, observer in probes:
+                message = consumer.poll(min(0.1, max(0, deadline - monotonic())))
+                if message is not None and message.error():
+                    observed = observer.classify(message.error())
+                    if observed in {"tls", "authentication", "authorization"}:
+                        return observed
+                observed = observer.classify("unavailable")
+                if observed in {"tls", "authentication", "authorization"}:
+                    return observed
+    finally:
+        for consumer, _ in probes:
+            consumer.close()
+    return "unavailable"
+
+
 class KafkaMetadataClient(Protocol):
     def metadata(self, config: KafkaConnectionConfig, timeout: float) -> KafkaMetadata: ...
     def metadata_for_topic(self, config: KafkaConnectionConfig, topic_name: str,
@@ -39,26 +152,22 @@ class KafkaMetadataClient(Protocol):
 
 
 class ConfluentKafkaMetadataClient:
-    def __init__(self) -> None:
+    def __init__(self, security_profile: KafkaSecurityProfile | None = None) -> None:
         self._lock = RLock()
-        self._clients: dict[KafkaConnectionConfig, object] = {}
+        self._security_profile = security_profile
         self._cluster_ids: dict[KafkaConnectionConfig, str | None] = {}
 
-    def _client(self, config: KafkaConnectionConfig):
+    def _client(self, config: KafkaConnectionConfig, observer: KafkaFailureObserver):
         from confluent_kafka.admin import AdminClient
 
-        with self._lock:
-            client = self._clients.get(config)
-            if client is None:
-                client = AdminClient(
-                    {
-                        "bootstrap.servers": ",".join(config.bootstrap_servers),
-                        "security.protocol": config.security_protocol,
-                        "allow.auto.create.topics": False,
-                    }
-                )
-                self._clients[config] = client
-            return client
+        return AdminClient(
+            {
+                "bootstrap.servers": ",".join(config.bootstrap_servers),
+                **client_security_options(config, self._security_profile),
+                "allow.auto.create.topics": False,
+                "error_cb": observer,
+            }
+        )
 
     def metadata(self, config: KafkaConnectionConfig, timeout: float) -> KafkaMetadata:
         from time import perf_counter
@@ -66,9 +175,10 @@ class ConfluentKafkaMetadataClient:
         from confluent_kafka import KafkaError, KafkaException
         from confluent_kafka.admin import _TopicCollection
 
+        observer = KafkaFailureObserver()
         started = perf_counter()
         try:
-            client = self._client(config)
+            client = self._client(config, observer)
             cluster = client.list_topics(timeout=timeout)
             identities: dict[str, str] = {}
             describe_topics = getattr(client, "describe_topics", None)
@@ -79,15 +189,21 @@ class ConfluentKafkaMetadataClient:
                     for name, description in descriptions.items()
                 }
         except KafkaException as error:
-            code = getattr(error.args[0], "code", lambda: None)() if error.args else None
-            kind = "timeout" if code == KafkaError._TIMED_OUT else "unavailable"
+            kind = observer.classify(error)
+            if kind == "unavailable":
+                kind = diagnose_security_failure(config, self._security_profile)
             raise KafkaMetadataError(kind) from error
+        except KafkaSecurityConfigurationError as error:
+            raise KafkaMetadataError("configuration") from error
         except TimeoutError as error:
-            raise KafkaMetadataError("timeout") from error
+            kind = observer.classify(error)
+            if kind == "unavailable":
+                kind = diagnose_security_failure(config, self._security_profile)
+            raise KafkaMetadataError("timeout" if kind == "unavailable" else kind) from error
         for metadata in cluster.topics.values():
             topic_error = getattr(metadata, "error", None)
             if topic_error is not None and topic_error.code() != KafkaError.NO_ERROR:
-                kind = "timeout" if topic_error.code() == KafkaError._TIMED_OUT else "unavailable"
+                kind = observer.classify(topic_error)
                 raise KafkaMetadataError(kind)
         topics = tuple(
             KafkaTopic(
@@ -115,30 +231,35 @@ class ConfluentKafkaMetadataClient:
         from confluent_kafka import KafkaError, KafkaException
         from confluent_kafka.admin import _TopicCollection
 
-        with self._lock:
-            cluster_id = self._cluster_ids.get(config)
-        if not cluster_id:
-            return self.metadata(config, timeout)
+        observer = KafkaFailureObserver()
         started = perf_counter()
         try:
-            descriptions = self._client(config).describe_topics(
+            client = self._client(config, observer)
+            cluster = client.list_topics(topic=topic_name, timeout=timeout)
+            descriptions = client.describe_topics(
                 _TopicCollection([topic_name])
             )
             description = descriptions[topic_name].result(timeout)
         except KafkaException as error:
             code = getattr(error.args[0], "code", lambda: None)() if error.args else None
             if code == KafkaError.UNKNOWN_TOPIC_OR_PART:
-                return KafkaMetadata(0, (), round((perf_counter() - started) * 1000, 3), cluster_id)
-            raise KafkaMetadataError(
-                "timeout" if code == KafkaError._TIMED_OUT else "unavailable"
-            ) from error
+                return KafkaMetadata(0, (), round((perf_counter() - started) * 1000, 3), None)
+            kind = observer.classify(error)
+            if kind == "unavailable":
+                kind = diagnose_security_failure(config, self._security_profile)
+            raise KafkaMetadataError(kind) from error
+        except KafkaSecurityConfigurationError as error:
+            raise KafkaMetadataError("configuration") from error
         except TimeoutError as error:
-            raise KafkaMetadataError("timeout") from error
+            kind = observer.classify(error)
+            if kind == "unavailable":
+                kind = diagnose_security_failure(config, self._security_profile)
+            raise KafkaMetadataError("timeout" if kind == "unavailable" else kind) from error
         return KafkaMetadata(
-            broker_count=0,
+            broker_count=len(cluster.brokers),
             topics=(KafkaTopic(topic_name, len(description.partitions), str(description.topic_id)),),
             latency_ms=round((perf_counter() - started) * 1000, 3),
-            cluster_identity=cluster_id,
+            cluster_identity=cluster.cluster_id,
         )
 
 
@@ -205,19 +326,17 @@ class ConfluentKafkaConsumer:
         self.events: deque[KafkaAssignment | KafkaRevocation] = deque()
         self.messages: deque[KafkaMessage] = deque()
         self.commit_results: deque[tuple[object, tuple[object, ...]]] = deque()
+        self.failure_observer = KafkaFailureObserver()
         self.assigned = False
+
+    def _on_error(self, error) -> None:
+        self.failure_observer(error)
 
     def _on_commit(self, error, partitions) -> None:
         self.commit_results.append((error, tuple(partitions or ())))
 
-    @staticmethod
-    def _failure(error) -> KafkaConsumerError:
-        from confluent_kafka import KafkaError
-
-        code = getattr(error.args[0], "code", lambda: None)() if error.args else None
-        return KafkaConsumerError(
-            "timeout" if code == KafkaError._TIMED_OUT else "unavailable"
-        )
+    def _failure(self, error) -> KafkaConsumerError:
+        return KafkaConsumerError(self.failure_observer.classify(error))
 
     def subscribe(self, topic: str) -> None:
         from confluent_kafka import KafkaException
@@ -258,7 +377,10 @@ class ConfluentKafkaConsumer:
             message = self.client.poll(timeout)
         except KafkaException as error:
             raise self._failure(error) from error
+        if message is None and (kind := self.failure_observer.take()):
+            raise KafkaConsumerError(kind)
         if message is not None and message.error() is None:
+            self.failure_observer.clear()
             self.messages.append(
                 KafkaMessage(
                     topic=message.topic(),
@@ -277,9 +399,10 @@ class ConfluentKafkaConsumer:
         error = message.error()
         if error is not None:
             if error.code() == KafkaError._PARTITION_EOF:
+                if kind := self.failure_observer.take():
+                    raise KafkaConsumerError(kind)
                 return None
-            kind = "timeout" if error.code() == KafkaError._TIMED_OUT else "unavailable"
-            raise KafkaConsumerError(kind)
+            raise self._failure(error)
         return None
 
     def assign(self, partitions: tuple[KafkaPartition, ...]) -> None:
@@ -377,6 +500,8 @@ class ConfluentKafkaConsumer:
 
         deadline = monotonic() + timeout
         while not self.commit_results:
+            if kind := self.failure_observer.take():
+                raise KafkaConsumerError(kind)
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise KafkaConsumerError("timeout")
@@ -385,6 +510,8 @@ class ConfluentKafkaConsumer:
             except KafkaException as error:
                 raise self._failure(error) from error
             if message is None:
+                if kind := self.failure_observer.take():
+                    raise KafkaConsumerError(kind)
                 continue
             if message.error() is None:
                 self.messages.append(
@@ -396,15 +523,17 @@ class ConfluentKafkaConsumer:
                         received_at=datetime.now(UTC),
                     )
                 )
+                if kind := self.failure_observer.take():
+                    raise KafkaConsumerError(kind)
             else:
                 from confluent_kafka import KafkaError
 
                 if message.error().code() != KafkaError._PARTITION_EOF:
                     kind = (
-                        "timeout"
-                        if message.error().code() == KafkaError._TIMED_OUT
-                        else "unavailable"
+                        self.failure_observer.classify(message.error())
                     )
+                    raise KafkaConsumerError(kind)
+                if kind := self.failure_observer.take():
                     raise KafkaConsumerError(kind)
         error, partitions = self.commit_results.popleft()
         if error is not None:
@@ -415,6 +544,7 @@ class ConfluentKafkaConsumer:
         }
         if any(observed.get(key) != offset for key, offset in requested.items()):
             raise KafkaConsumerError("commit_failed")
+        self.failure_observer.clear()
 
     def close(self) -> None:
         from confluent_kafka import KafkaException
@@ -426,17 +556,23 @@ class ConfluentKafkaConsumer:
 
 
 class ConfluentKafkaConsumerFactory:
-    def __init__(self, operation_timeout: float = 5) -> None:
+    def __init__(self, operation_timeout: float = 5,
+                 security_profile: KafkaSecurityProfile | None = None) -> None:
         self.operation_timeout = operation_timeout
+        self.security_profile = security_profile
 
     def create(self, config: KafkaConnectionConfig, group_id: str) -> KafkaConsumer:
         from confluent_kafka import Consumer
 
+        try:
+            security_options = client_security_options(config, self.security_profile)
+        except KafkaSecurityConfigurationError as error:
+            raise KafkaConsumerError("configuration") from error
         adapter = ConfluentKafkaConsumer(None)
         client = Consumer(
             {
                 "bootstrap.servers": ",".join(config.bootstrap_servers),
-                "security.protocol": config.security_protocol,
+                **security_options,
                 "group.id": group_id,
                 "enable.auto.commit": False,
                 "enable.auto.offset.store": False,
@@ -445,6 +581,7 @@ class ConfluentKafkaConsumerFactory:
                 "allow.auto.create.topics": False,
                 "socket.timeout.ms": int(self.operation_timeout * 1000),
                 "on_commit": adapter._on_commit,
+                "error_cb": adapter._on_error,
             }
         )
         adapter.client = client

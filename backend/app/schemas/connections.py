@@ -38,7 +38,15 @@ class KafkaConnectionCreate(BaseModel):
     id: UUID | None = None
     name: str = Field(min_length=1, max_length=200)
     bootstrap_servers: list[str] = Field(min_length=1, max_length=16)
-    security_protocol: Literal["PLAINTEXT"] = "PLAINTEXT"
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_protocol(cls, values):
+        if isinstance(values, dict) and "security_protocol" in values:
+            values = dict(values)
+            if values.pop("security_protocol") != "PLAINTEXT":
+                raise ValueError("security_protocol is server managed")
+        return values
 
     _name = field_validator("name")(trimmed)
     _servers = field_validator("bootstrap_servers")(
@@ -57,7 +65,15 @@ class KafkaConnectionPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=200)
     bootstrap_servers: list[str] | None = Field(default=None, min_length=1, max_length=16)
-    security_protocol: Literal["PLAINTEXT"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_protocol(cls, values):
+        if isinstance(values, dict) and "security_protocol" in values:
+            values = dict(values)
+            if values.pop("security_protocol") != "PLAINTEXT":
+                raise ValueError("security_protocol is server managed")
+        return values
 
     @model_validator(mode="after")
     def nonempty(self):
@@ -67,8 +83,6 @@ class KafkaConnectionPatch(BaseModel):
             raise ValueError("name must not be null")
         if "bootstrap_servers" in self.model_fields_set and self.bootstrap_servers is None:
             raise ValueError("bootstrap_servers must not be null")
-        if "security_protocol" in self.model_fields_set and self.security_protocol is None:
-            raise ValueError("security_protocol must not be null")
         return self
 
     @field_validator("name")
@@ -87,7 +101,6 @@ class KafkaConnectionDTO(BaseModel):
     id: UUID
     name: str
     bootstrap_servers: list[str]
-    security_protocol: str
     extra_config: dict
     created_at: datetime
     updated_at: datetime

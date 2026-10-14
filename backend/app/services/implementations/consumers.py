@@ -41,6 +41,21 @@ from .processing import (
 LOGGER = logging.getLogger("app.kafka_consumers")
 
 
+def kafka_consumer_reason(operation: str, error: KafkaConsumerError) -> str:
+    kind = error.kind if error.kind in {
+        "timeout", "tls", "authentication", "authorization", "commit_failed",
+        "configuration",
+    } else "unavailable"
+    suffix = {
+        "tls": "tls_failed",
+        "authentication": "authentication_failed",
+        "authorization": "acl_denied",
+        "commit_failed": "commit_failed",
+        "configuration": "security_configuration_invalid",
+    }.get(kind, kind)
+    return f"kafka_{operation}_{suffix}"
+
+
 @dataclass(frozen=True)
 class ConsumerWorkerState:
     status: str
@@ -157,11 +172,13 @@ class _SourceWorker:
             targeted = getattr(self.metadata_client, "metadata_for_topic", None)
             metadata = (
                 targeted(config, self.config.topic_name, self.metadata_timeout)
-                if callable(targeted) and not full_metadata
+                if callable(targeted)
                 else self.metadata_client.metadata(config, self.metadata_timeout)
             )
-        except KafkaMetadataError:
-            self._set_state("retrying", "kafka_metadata_unavailable")
+        except KafkaMetadataError as error:
+            self._set_state(
+                "retrying", kafka_consumer_reason("metadata", KafkaConsumerError(error.kind))
+            )
             return False
         topic = next(
             (item for item in metadata.topics if item.name == self.config.topic_name),
@@ -373,8 +390,8 @@ class _SourceWorker:
                 else:
                     self._set_state("waiting", "some_partitions_stopped" if self.stopped_partitions else None)
             return not retry_assignment
-        except KafkaConsumerError:
-            self._set_state("retrying", "kafka_position_unavailable")
+        except KafkaConsumerError as error:
+            self._set_state("retrying", kafka_consumer_reason("position", error))
             return False
 
     def _stop_partition(self, partition: int, reason: str) -> None:
@@ -395,8 +412,8 @@ class _SourceWorker:
         )
         try:
             self.consumer.pause((partition,))
-        except KafkaConsumerError:
-            self._set_state("retrying", "kafka_pause_unavailable")
+        except KafkaConsumerError as error:
+            self._set_state("retrying", kafka_consumer_reason("pause", error))
 
     def _retry_blocked(self) -> None:
         if self.consumer is None:
@@ -425,13 +442,14 @@ class _SourceWorker:
                 self.consumer.resume((marker,))
                 del self.blocked[partition]
                 self._set_state("waiting")
-            except KafkaConsumerError:
+            except KafkaConsumerError as error:
                 self.blocked[partition] = (
                     message,
                     action,
                     monotonic() + self.retry_delay,
                 )
-                self._set_state("retrying", "kafka_commit_unavailable")
+                operation = "commit" if action == "commit" else "position"
+                self._set_state("retrying", kafka_consumer_reason(operation, error))
 
     def _handle_message(self, message: KafkaMessage) -> None:
         if message.partition in self.stopped_partitions:
@@ -460,8 +478,8 @@ class _SourceWorker:
                 try:
                     self.consumer.pause((KafkaPartition(message.topic, message.partition, message.offset),))
                     self.gap_paused.add(message.partition)
-                except KafkaConsumerError:
-                    self._set_state("retrying", "kafka_pause_unavailable")
+                except KafkaConsumerError as error:
+                    self._set_state("retrying", kafka_consumer_reason("pause", error))
             return
         if message.offset < expected:
             return
@@ -603,8 +621,8 @@ class _SourceWorker:
             )
             self._set_expected_offset(message.partition, message.offset + 1)
             self._set_state("waiting")
-        except KafkaConsumerError:
-            self._set_state("retrying", "kafka_commit_unavailable")
+        except KafkaConsumerError as error:
+            self._set_state("retrying", kafka_consumer_reason("commit", error))
             self._block(message, "commit")
 
     def _run(self) -> None:
@@ -625,8 +643,8 @@ class _SourceWorker:
                     )
                     self.consumer.subscribe(self.config.topic_name)
                     break
-                except KafkaConsumerError:
-                    self._set_state("retrying", "kafka_consumer_unavailable")
+                except KafkaConsumerError as error:
+                    self._set_state("retrying", kafka_consumer_reason("consumer", error))
                     self.stop_requested.wait(self.retry_delay)
             pending_assignment: KafkaAssignment | None = None
             assignment_retry_at = monotonic()
@@ -658,8 +676,8 @@ class _SourceWorker:
                     continue
                 try:
                     event = self.consumer.poll(self.poll_timeout)
-                except KafkaConsumerError:
-                    self._set_state("retrying", "kafka_poll_unavailable")
+                except KafkaConsumerError as error:
+                    self._set_state("retrying", kafka_consumer_reason("poll", error))
                     self.stop_requested.wait(self.retry_delay)
                     continue
                 if event is None:
@@ -676,8 +694,8 @@ class _SourceWorker:
                     self.sparse_seek_pending.clear()
                     try:
                         self.consumer.unassign()
-                    except KafkaConsumerError:
-                        self._set_state("retrying", "kafka_revoke_unavailable")
+                    except KafkaConsumerError as error:
+                        self._set_state("retrying", kafka_consumer_reason("revoke", error))
                     self._set_state("waiting")
                 elif isinstance(event, KafkaMessage) and event.topic == self.config.topic_name:
                     if self._topic_is_safe():

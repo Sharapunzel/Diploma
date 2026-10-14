@@ -1,9 +1,10 @@
 ## Подключения и источники Kafka
 
 Управление Kafka доступно под `/api/v1` и использует существующие пары разрешений
-`connections.read`/`connections.write` и `sources.read`/`sources.write`. API принимает
-только подключения `PLAINTEXT`; учётные данные, URL, произвольные параметры Kafka и секреты
-отклоняются. Запросы метаданных используют `KAFKA_METADATA_TIMEOUT_SECONDS` (1–30 секунд).
+`connections.read`/`connections.write` и `sources.read`/`sources.write`. API принимает только адреса bootstrap и сохраняет старое поле `security_protocol` для совместимости.
+Реальный SASL/TLS-профиль задаётся сервером, а не пользовательским запросом; учётные данные, URL,
+произвольные параметры Kafka и секреты отклоняются. Настройка и переход тома описаны
+в [инструкции по безопасности Kafka](kafka-security.md). Запросы метаданных используют `KAFKA_METADATA_TIMEOUT_SECONDS` (1–30 секунд).
 
 Обычный порядок работы:
 

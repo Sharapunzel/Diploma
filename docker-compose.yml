@@ -20,34 +20,39 @@ services:
     networks: [internal]
 
   kafka:
-    image: apache/kafka:4.2.0
+    build: ./kafka
     restart: unless-stopped
     hostname: kafka
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      DIPLOMA_KAFKA_MODE: development
+      KAFKA_BIND_ADDRESS: ${KAFKA_BIND_ADDRESS:-127.0.0.1}
+      KAFKA_PUBLIC_HOST: ${KAFKA_PUBLIC_HOST:-127.0.0.1}
+      KAFKA_HOST_PORT: ${KAFKA_HOST_PORT:-9092}
+      KAFKA_ADMIN_PASSWORD_FILE: /run/secrets/kafka_admin_password
+      KAFKA_READER_PASSWORD_FILE: /run/secrets/kafka_reader_password
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    secrets: [kafka_admin_password, kafka_reader_password]
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --command-config /tmp/diploma-kafka-admin.properties --list >/dev/null 2>&1"]
       interval: 10s
       timeout: 10s
       retries: 12
       start_period: 30s
+    networks: [internal]
+
+  kafka-acls:
+    build: ./kafka
+    command: ["acls"]
+    restart: "no"
+    environment:
+      DIPLOMA_KAFKA_MODE: development
+      KAFKA_ADMIN_PASSWORD_FILE: /run/secrets/kafka_admin_password
+    secrets: [kafka_admin_password]
+    depends_on:
+      kafka:
+        condition: service_healthy
     networks: [internal]
 
   migrate:
@@ -72,6 +77,10 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-diploma_user}:diploma_password@postgres:5432/${POSTGRES_DB:-diploma_db}
       KAFKA_CONSUMERS_ENABLED: "true"
       KAFKA_METADATA_TIMEOUT_SECONDS: "5"
+      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_RUNTIME_USERNAME: diploma-reader
+      KAFKA_RUNTIME_PASSWORD_FILE: /run/secrets/kafka_reader_password
+      KAFKA_DEV_ALLOWED_BOOTSTRAP_SERVERS: "127.0.0.1:${KAFKA_HOST_PORT:-9092},localhost:${KAFKA_HOST_PORT:-9092},[::1]:${KAFKA_HOST_PORT:-9092},kafka:9092"
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1}
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.30.0.10}
     depends_on:
@@ -79,6 +88,9 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-acls:
+        condition: service_completed_successfully
+    secrets: [kafka_reader_password]
     networks: [internal]
 
   proxy:
@@ -103,3 +115,7 @@ networks:
 secrets:
   postgres_password:
     file: ${POSTGRES_PASSWORD_FILE:-./.dev/postgres_password.example}
+  kafka_admin_password:
+    file: ${KAFKA_ADMIN_PASSWORD_FILE:-./.dev/kafka_admin_password}
+  kafka_reader_password:
+    file: ${KAFKA_READER_PASSWORD_FILE:-./.dev/kafka_reader_password}

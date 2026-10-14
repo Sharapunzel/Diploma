@@ -10,7 +10,6 @@ export type KafkaConnection = {
   id: string;
   name: string;
   bootstrap_servers: string[];
-  security_protocol: "PLAINTEXT";
   created_at: string;
   updated_at: string;
 };
@@ -75,7 +74,6 @@ export type Topic = {
 export type KafkaConnectionInput = {
   name: string;
   bootstrap_servers: string[];
-  security_protocol: "PLAINTEXT";
 };
 export type KafkaConnectionPatch = Partial<
   Pick<KafkaConnectionInput, "name" | "bootstrap_servers">

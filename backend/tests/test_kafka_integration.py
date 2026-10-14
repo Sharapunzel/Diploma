@@ -1,5 +1,6 @@
 import os
 import time
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -12,8 +13,42 @@ from test_auth_foundation import admin_headers, create_normalizer, login
 from app.config import Settings
 from app.db import Database
 from app.kafka import ConfluentKafkaMetadataClient, KafkaConnectionConfig, KafkaMetadataError
+from app.kafka_security import KafkaSecurityProfile
 from app.main import create_app
 from app.models import KafkaOperationalEvent, ParsedLog, ProcessedKafkaRecord, Source
+
+
+def kafka_test_profile() -> KafkaSecurityProfile | None:
+    password_file = os.getenv("KAFKA_TEST_READER_PASSWORD_FILE")
+    if not password_file:
+        return None
+    ca_file = os.getenv("KAFKA_TEST_CA_FILE")
+    return KafkaSecurityProfile(
+        os.getenv("KAFKA_TEST_SECURITY_PROTOCOL", "SASL_PLAINTEXT"),
+        "diploma-reader", Path(password_file), Path(ca_file) if ca_file else None,
+        tuple(
+            item.strip()
+            for item in os.getenv("KAFKA_TEST_DEV_ALLOWED_BOOTSTRAP_SERVERS", "127.0.0.1:9092,localhost:9092,[::1]:9092,kafka:9092").split(",")
+            if item.strip()
+        ),
+    )
+
+
+def kafka_test_admin_config() -> dict[str, str]:
+    result = {
+        "bootstrap.servers": os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092"),
+        "security.protocol": os.getenv("KAFKA_TEST_SECURITY_PROTOCOL", "PLAINTEXT"),
+    }
+    password_file = os.getenv("KAFKA_TEST_ADMIN_PASSWORD_FILE")
+    if password_file:
+        result.update({
+            "sasl.mechanism": "SCRAM-SHA-512",
+            "sasl.username": "diploma-kafka-admin",
+            "sasl.password": Path(password_file).read_text(encoding="utf-8").strip(),
+        })
+    if ca_file := os.getenv("KAFKA_TEST_CA_FILE"):
+        result["ssl.ca.location"] = ca_file
+    return result
 
 
 @pytest.fixture(scope="module")
@@ -30,7 +65,15 @@ def integration_client(integration_database):
 
     run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
     clear_auth_state(integration_database)
-    settings = Settings(environment="test", database_url=os.environ["TEST_DATABASE_URL"])
+    profile = kafka_test_profile()
+    settings = Settings(
+        environment="test", database_url=os.environ["TEST_DATABASE_URL"],
+        kafka_security_protocol=profile.protocol if profile else None,
+        kafka_runtime_username=profile.username if profile else None,
+        kafka_runtime_password_file=profile.password_file if profile else None,
+        kafka_ca_file=profile.ca_file if profile else None,
+        kafka_dev_allowed_bootstrap_servers=list(profile.dev_allowed_bootstrap_servers) if profile else [],
+    )
     with TestClient(create_app(settings, database=integration_database)) as client:
         yield client
     clear_auth_state(integration_database)
@@ -44,7 +87,7 @@ def test_real_kafka_metadata_adapter():
     )
     assert bootstrap_servers
 
-    metadata = ConfluentKafkaMetadataClient().metadata(
+    metadata = ConfluentKafkaMetadataClient(kafka_test_profile()).metadata(
         KafkaConnectionConfig(bootstrap_servers, "PLAINTEXT"),
         timeout=5,
     )
@@ -57,7 +100,7 @@ def test_real_kafka_metadata_adapter():
 def test_real_kafka_api_source_lifecycle(integration_client, integration_database):
     bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_name = f"diploma-task4-{uuid4().hex}"
-    admin = AdminClient({"bootstrap.servers": bootstrap, "security.protocol": "PLAINTEXT"})
+    admin = AdminClient(kafka_test_admin_config())
     create_future = admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[topic_name]
     create_future.result(10)
     connection_id = None
@@ -128,18 +171,26 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
 
     bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_name = f"diploma-task8-{uuid4().hex}"
-    admin = AdminClient({"bootstrap.servers": bootstrap, "security.protocol": "PLAINTEXT"})
+    admin = AdminClient(kafka_test_admin_config())
     admin.create_topics([
         NewTopic(topic_name, num_partitions=1, replication_factor=1)
     ])[topic_name].result(10)
     run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
     clear_auth_state(integration_database)
+    profile = kafka_test_profile()
     settings = Settings(
         environment="test",
         database_url=os.environ["TEST_DATABASE_URL"],
         kafka_consumer_poll_timeout_seconds=0.1,
         kafka_consumer_retry_delay_seconds=0.1,
         kafka_supervisor_sync_seconds=0.1,
+        kafka_security_protocol=profile.protocol if profile else None,
+        kafka_runtime_username=profile.username if profile else None,
+        kafka_runtime_password_file=profile.password_file if profile else None,
+        kafka_ca_file=profile.ca_file if profile else None,
+        kafka_dev_allowed_bootstrap_servers=(
+            list(profile.dev_allowed_bootstrap_servers) if profile else []
+        ),
     )
     connection_id = None
     source_id = None
@@ -177,7 +228,7 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
             assert client.post(
                 f"/api/v1/sources/{source_id}/enable", headers=headers
             ).status_code == 200
-            producer = Producer({"bootstrap.servers": bootstrap})
+            producer = Producer(kafka_test_admin_config())
             producer.produce(
                 topic_name,
                 b'{"timestamp":"2026-03-02T11:59:00Z","log":"real event"}',
@@ -228,7 +279,7 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
                     "/api/v1/auth/session"
                 ).json()["csrf_token"]
             }
-            producer = Producer({"bootstrap.servers": bootstrap})
+            producer = Producer(kafka_test_admin_config())
             producer.produce(
                 topic_name,
                 b'{"timestamp":"2026-03-02T11:59:00Z","log":"after restart"}',
@@ -266,17 +317,23 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
 
     bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_name = f"diploma-task8-gap-{uuid4().hex}"
-    admin = AdminClient({"bootstrap.servers": bootstrap, "security.protocol": "PLAINTEXT"})
+    admin = AdminClient(kafka_test_admin_config())
     admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[topic_name].result(10)
     run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
     clear_auth_state(integration_database)
+    profile = kafka_test_profile()
     settings = Settings(
         environment="test", database_url=os.environ["TEST_DATABASE_URL"],
         kafka_consumer_poll_timeout_seconds=0.1,
         kafka_consumer_retry_delay_seconds=0.1,
         kafka_supervisor_sync_seconds=0.1,
+        kafka_security_protocol=profile.protocol if profile else None,
+        kafka_runtime_username=profile.username if profile else None,
+        kafka_runtime_password_file=profile.password_file if profile else None,
+        kafka_ca_file=profile.ca_file if profile else None,
+        kafka_dev_allowed_bootstrap_servers=list(profile.dev_allowed_bootstrap_servers) if profile else [],
     )
-    metadata_client = ConfluentKafkaMetadataClient()
+    metadata_client = ConfluentKafkaMetadataClient(profile)
     config = KafkaConnectionConfig((bootstrap,), "PLAINTEXT")
 
     def eventually(predicate, reason, timeout=25):
@@ -301,7 +358,7 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
                 ParsedLog.source_id == source_id, ParsedLog.kafka_offset == offset
             ))
 
-    producer = Producer({"bootstrap.servers": bootstrap})
+    producer = Producer(kafka_test_admin_config())
     try:
         old_topic_id = eventually(topic_id, "initial topic ID unavailable")
         with TestClient(create_app(settings, database=integration_database, start_consumers=True)) as client:
@@ -350,7 +407,7 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
             future = admin.delete_records([TopicPartition(topic_name, 0, 3)])
             next(iter(future.values())).result(10)
             inspector = Consumer({
-                "bootstrap.servers": bootstrap, "group.id": f"inspect-{uuid4().hex}",
+                **kafka_test_admin_config(), "group.id": f"inspect-{uuid4().hex}",
                 "enable.auto.commit": False,
             })
             try:
@@ -425,6 +482,10 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
                 raise
 
 
+def _mock_security_profile() -> KafkaSecurityProfile:
+    return KafkaSecurityProfile("SASL_SSL", "reader", Path(__file__), Path(__file__))
+
+
 def test_kafka_timeout_and_unexpected_errors_are_classified(monkeypatch):
     class TimeoutAdmin:
         def __init__(self, _config):
@@ -434,7 +495,7 @@ def test_kafka_timeout_and_unexpected_errors_are_classified(monkeypatch):
             raise KafkaException(KafkaError(KafkaError._TIMED_OUT))
 
     monkeypatch.setattr("confluent_kafka.admin.AdminClient", TimeoutAdmin)
-    client = ConfluentKafkaMetadataClient()
+    client = ConfluentKafkaMetadataClient(_mock_security_profile())
     try:
         client.metadata(KafkaConnectionConfig(("localhost:9092",), "PLAINTEXT"), 1)
     except KafkaMetadataError as error:
@@ -447,7 +508,7 @@ def test_kafka_timeout_and_unexpected_errors_are_classified(monkeypatch):
             raise KafkaException(KafkaError(KafkaError._ALL_BROKERS_DOWN))
 
     monkeypatch.setattr("confluent_kafka.admin.AdminClient", UnavailableAdmin)
-    client = ConfluentKafkaMetadataClient()
+    client = ConfluentKafkaMetadataClient(_mock_security_profile())
     try:
         client.metadata(KafkaConnectionConfig(("localhost:9092",), "PLAINTEXT"), 1)
     except KafkaMetadataError as error:
@@ -460,7 +521,7 @@ def test_kafka_timeout_and_unexpected_errors_are_classified(monkeypatch):
             raise RuntimeError("adapter bug")
 
     monkeypatch.setattr("confluent_kafka.admin.AdminClient", BrokenAdmin)
-    client = ConfluentKafkaMetadataClient()
+    client = ConfluentKafkaMetadataClient(_mock_security_profile())
     try:
         client.metadata(KafkaConnectionConfig(("localhost:9092",), "PLAINTEXT"), 1)
     except RuntimeError:
@@ -469,7 +530,7 @@ def test_kafka_timeout_and_unexpected_errors_are_classified(monkeypatch):
         raise AssertionError("unexpected adapter errors must propagate")
 
 
-def test_topic_metadata_reuses_admin_client_without_full_cluster_listing(monkeypatch):
+def test_topic_metadata_scopes_admin_client_errors_to_each_request(monkeypatch):
     from types import SimpleNamespace
 
     created = []
@@ -488,7 +549,7 @@ def test_topic_metadata_reuses_admin_client_without_full_cluster_listing(monkeyp
             self.targeted_calls = 0
             created.append(self)
 
-        def list_topics(self, timeout):
+        def list_topics(self, timeout, topic=None):
             self.full_calls += 1
             return SimpleNamespace(
                 cluster_id="cluster-id",
@@ -501,13 +562,13 @@ def test_topic_metadata_reuses_admin_client_without_full_cluster_listing(monkeyp
             return {"events": Future(self)}
 
     monkeypatch.setattr("confluent_kafka.admin.AdminClient", Admin)
-    client = ConfluentKafkaMetadataClient()
+    client = ConfluentKafkaMetadataClient(_mock_security_profile())
     config = KafkaConnectionConfig(("localhost:9092",), "PLAINTEXT")
     assert client.metadata(config, 1).topics[0].identity == "first-id"
     for _ in range(8):
         assert client.metadata_for_topic(config, "events", 1).topics[0].identity == "first-id"
-    assert len(created) == 1
+    assert len(created) == 9
     assert created[0].full_calls == 1
-    assert created[0].targeted_calls == 9
-    created[0].topic_id = "replacement-id"
-    assert client.metadata_for_topic(config, "events", 1).topics[0].identity == "replacement-id"
+    assert created[0].targeted_calls == 1
+    assert client.metadata_for_topic(config, "events", 1).topics[0].identity == "first-id"
+    assert len(created) == 10 and created[-1].targeted_calls == 1

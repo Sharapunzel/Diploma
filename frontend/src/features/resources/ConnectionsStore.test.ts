@@ -22,7 +22,6 @@ describe("ConnectionsStore", () => {
         id: "connection",
         name: "Kafka",
         bootstrap_servers: ["kafka:9092"],
-        security_protocol: "PLAINTEXT",
         created_at: "",
         updated_at: "",
       },

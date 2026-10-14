@@ -7,15 +7,15 @@
 ```text
 Браузер ── HTTP (разработка) / HTTPS (production) ──> Nginx ──> FastAPI
                                                        └──> Vite (только разработка)
-Fluent Bit ── PLAINTEXT (разработка) / TLS (production) ──> Kafka
+Будущий Fluent Bit ── SASL/SCRAM (локальный dev) / SASL_SSL (production) ──> Kafka
                                                    FastAPI ──> PostgreSQL, Kafka
 ```
 
-Compose размещает PostgreSQL и Kafka в закрытой bridge-сети с постоянными именованными томами. Порт FastAPI не публикуется на хосте. Nginx — единственная опубликованная веб-служба. Controller-порт Kafka остаётся внутренним; брокер предоставляет FastAPI отдельный внутренний listener. Внешний TLS-трафик Kafka не проходит через Nginx. Ограничьте доступ к порту брокера сетями известных агентов Fluent Bit: TLS подтверждает брокер и шифрует канал, но эта версия не аутентифицирует агентов (без SASL, клиентских сертификатов и ACL).
+Compose размещает PostgreSQL и Kafka в закрытой bridge-сети с постоянными именованными томами. Порт FastAPI не публикуется на хосте. Nginx — единственная опубликованная веб-служба. Controller-порт Kafka остаётся внутренним; внутренний и внешний клиентские listener требуют SCRAM-SHA-512 и ACL. В production оба используют TLS, Kafka не проходит через Nginx. Учётные записи и управление агентами Fluent Bit будут добавлены в TASK-20/21; текущий runtime principal имеет только права чтения.
 
 ## Требования и запуск разработки
 
-Установите Docker Engine с плагином Compose. Несекретный шаблон пароля для разработки находится в `.dev/postgres_password.example`, поэтому чистая копия запускается без подготовки секретов. Compose использует одинаковый `POSTGRES_PASSWORD` для PostgreSQL, миграций и FastAPI. Для собственного локального пароля создайте неотслеживаемый `.env` в корне репозитория со строкой `POSTGRES_PASSWORD=<пароль, безопасный для URI>`. `.env` и локальные файлы `.dev/` игнорируются Git. Используйте только `A-Z`, `a-z`, цифры, `_`, `-`, `.`: пароль входит в development URL SQLAlchemy. Пароль по умолчанию намеренно слабый; не используйте его в production.
+Установите Docker Engine с плагином Compose. Перед первым запуском создайте отдельные тестовые Kafka credentials командой `python scripts/prepare_dev_kafka.py`. Скрипт сохраняет их в неотслеживаемой `.dev/` и не перезаписывает существующие файлы. Несекретный шаблон пароля PostgreSQL находится в `.dev/postgres_password.example`. Compose использует одинаковый `POSTGRES_PASSWORD` для PostgreSQL, миграций и FastAPI. Для собственного локального пароля создайте неотслеживаемый `.env` в корне репозитория со строкой `POSTGRES_PASSWORD=<пароль, безопасный для URI>`. `.env` и локальные файлы `.dev/` игнорируются Git. Используйте только `A-Z`, `a-z`, цифры, `_`, `-`, `.`: пароль входит в development URL SQLAlchemy. Пароль по умолчанию намеренно слабый; не используйте его в production.
 
 Перед созданием внешних OpenSearch-подключений сгенерируйте **один постоянный** ключ Fernet командой ниже и сохраните строку `EXTERNAL_SECRET_KEY=<полученный ключ>` в корневом `.env`. При последующих пересозданиях контейнера используйте тот же файл и ключ: иначе сохранённые пароли нельзя расшифровать. Без ключа остальной dev-стек запускается, но создание внешнего подключения возвращает `503 external_key_unavailable`. Compose читает корневой `.env` для подстановки и явно передаёт ключ в `api`; файл `backend/.env` используется только при прямом запуске backend и не попадает в образ. Не добавляйте `.env` в Git и не публикуйте вывод `docker compose config` или `docker inspect`: они могут содержать значение ключа и другие dev-секреты.
 
@@ -31,7 +31,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
 ```
 
-Dev proxy доступен по `http://localhost:8080`; frontend, глубокие маршруты SPA и HMR идут через этот адрес без второго публичного порта. Этот HTTP адрес предназначен только для локальной отладки: реальные пароли нельзя передавать по недоверенной сети без HTTPS. Решение о сохранении учётных данных принимает браузер или установленный менеджер паролей; приложение не хранит историю логинов и пароли. Маршруты API имеют префикс `/api/v1`, Swagger — `/docs`, OpenAPI — `/openapi.json`. PostgreSQL публикуется только на loopback-порту 5432. PLAINTEXT listener Kafka для агентов публикуется на порту 9092 для локальной отладки. `backend/.env.example` настроен на браузерный адрес proxy. Для прямого запуска FastAPI без Compose задайте `DATABASE_URL` с `localhost:5432`, `CORS_ORIGINS=http://localhost:5173`, OIDC callback `http://localhost:8000/api/v1/auth/oidc/callback` и перенаправления `http://localhost:5173/` и `/login?error=oidc`. Для Compose используйте callback через proxy. При создании Kafka-подключения приложения указывайте внутренний адрес `kafka:9092`; `localhost` внутри backend-контейнера указывает на него самого.
+Dev proxy доступен по `http://localhost:8080`; frontend, глубокие маршруты SPA и HMR идут через этот адрес без второго публичного порта. Этот HTTP адрес предназначен только для локальной отладки: реальные пароли нельзя передавать по недоверенной сети без HTTPS. Решение о сохранении учётных данных принимает браузер или установленный менеджер паролей; приложение не хранит историю логинов и пароли. Маршруты API имеют префикс `/api/v1`, Swagger — `/docs`, OpenAPI — `/openapi.json`. PostgreSQL публикуется только на loopback-порту 5432. Kafka `SASL_PLAINTEXT` с тестовыми credentials публикуется только на `127.0.0.1:9092`; при попытке опубликовать dev Kafka на другом интерфейсе брокер откажет в запуске. `backend/.env.example` настроен на браузерный адрес proxy. Для прямого запуска FastAPI без Compose задайте `DATABASE_URL` с `localhost:5432`, `CORS_ORIGINS=http://localhost:5173`, OIDC callback `http://localhost:8000/api/v1/auth/oidc/callback` и перенаправления `http://localhost:5173/` и `/login?error=oidc`. Для Compose используйте callback через proxy. Kafka-профиль для прямого запуска backend описан в [инструкции по безопасности](docs/kafka-security.md). При создании Kafka-подключения приложения указывайте внутренний адрес `kafka:9092`; `localhost` внутри backend-контейнера указывает на него самого.
 
 Для локальной работы с фронтендом нужна Node.js 20.19.5 (эта же версия используется в `frontend/Dockerfile.dev`). В `frontend/` выполните `npm ci`, затем `npm run typecheck`, `npm run lint`, `npm run format:check`, `npm run test`, `npm run build`. `npm run dev` запускает Vite; штатный браузерный адрес при Compose — proxy на порту 8080. Файлы `node_modules` на хосте и в контейнере разделены. При каждом запуске frontend-контейнер сравнивает хэш `package-lock.json` с установленными зависимостями в своём volume и запускает `npm ci`, если lockfile изменился. После изменения зависимостей выполните `docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d frontend`; общие тома PostgreSQL/Kafka удалять не требуется. Правки исходников подхватываются через HMR без пересборки.
 
@@ -39,7 +39,7 @@ Dev proxy доступен по `http://localhost:8080`; frontend, глубок�
 
 При ручном запуске Playwright необходимы `PLAYWRIGHT_BASE_URL`, `PLAYWRIGHT_USERNAME`, `PLAYWRIGHT_PASSWORD`, `PLAYWRIGHT_OIDC=1` и Chromium (`npx playwright install chromium`) либо `PLAYWRIGHT_CHROME_PATH` к установленному Chrome. Критические сценарии local/OIDC/HMR не пропускаются при отсутствии настройки, а завершаются понятной ошибкой.
 
-На `/login` сервер сообщает доступные способы входа. Локальная форма и OIDC могут отображаться одновременно; OIDC требует настройки IdP и `OIDC_REDIRECT_URI` с фактическим портом proxy. После входа серверная сессия хранится в HttpOnly cookie. Тема по умолчанию следует системе; ручной выбор светлой или тёмной сохраняется в localStorage. На `/connections` доступны Kafka и внешние подключения, на `/sources` — их источники. Просмотр сохранённых внешних подключений требует `connections.read`, но их проверка и обнаружение индексов/потоков требуют `connections.write`; изменения источников требуют `sources.write`. Для внешнего подключения нужен постоянный `EXTERNAL_SECRET_KEY` на backend. Корпоративный публичный CA загружается отдельной операцией после сохранения подключения; CA общедоверенного издателя обычно загружать не нужно. Изменение внешнего подключения или CA выключает связанные источники, их включают повторно вручную. Разделы нормализаторов, событий, диагностики, администрирования и настроек пока являются заглушками. Production-поставка собранного frontend относится к TASK-19.
+На `/login` сервер сообщает доступные способы входа. Локальная форма и OIDC могут отображаться одновременно; OIDC требует настройки IdP и `OIDC_REDIRECT_URI` с фактическим портом proxy. После входа серверная сессия хранится в HttpOnly cookie. Тема по умолчанию следует системе; ручной выбор светлой или тёмной сохраняется в localStorage. На `/connections` доступны Kafka и внешние подключения, на `/sources` — их источники. Просмотр сохранённых внешних подключений требует `connections.read`, но их проверка и обнаружение индексов/потоков требуют `connections.write`; изменения источников требуют `sources.write`. Для внешнего подключения нужен постоянный `EXTERNAL_SECRET_KEY` на backend. Корпоративный публичный CA загружается отдельной операцией после сохранения подключения; CA общедоверенного издателя обычно загружать не нужно. Изменение внешнего подключения или CA выключает связанные источники, их включают повторно вручную. Разделы нормализаторов, событий, диагностики, администрирования и настроек пока являются заглушками. Production-поставка собранного frontend относится к завершающей задаче этапа.
 
 Проверьте `http://localhost:8080/api/v1/health/live` и `http://localhost:8080/api/v1/health/ready`. Одноразовый сервис `migrate` применяет миграции Alembic до запуска API; при ошибке API не стартует. Первого администратора создавайте интерактивно:
 
@@ -92,19 +92,23 @@ docker compose -p $prodSmokeProject --env-file .env.smoke.production -f docker-c
 
 ## Подготовка production
 
-Используйте Linux-хост и закрытый каталог секретов и сертификатов вне репозитория. Backend и одноразовый сервис миграции работают с UID/GID `10001`; дайте этому UID доступ на чтение `database_url`, `oidc_state_secret`, `oidc_client_secret`, `external_secret_key` и право прохода (`--x`) по каждому родительскому каталогу. Пример узких POSIX ACL:
+Используйте Linux-хост и закрытый каталог секретов и сертификатов вне репозитория. Backend и одноразовый сервис миграции работают с UID/GID `10001`; дайте этому UID доступ на чтение `database_url`, `oidc_state_secret`, `oidc_client_secret`, `external_secret_key` и право прохода (`--x`) по каждому родительскому каталогу. Файлы Kafka reader password и CA также должны читаться UID 10001; Kafka admin password, broker PEM и CA — UID 1000. Пример узких POSIX ACL:
 
 ```shell
 install -d -o root -g root -m 0700 /etc/diploma /etc/diploma/secrets /etc/diploma/tls/web /etc/diploma/tls/kafka
 setfacl -m u:10001:--x /etc/diploma /etc/diploma/secrets
+setfacl -m u:10001:--x /etc/diploma/tls /etc/diploma/tls/kafka
 setfacl -m u:10001:r-- /etc/diploma/secrets/database_url /etc/diploma/secrets/oidc_state_secret /etc/diploma/secrets/oidc_client_secret /etc/diploma/secrets/external_secret_key
 setfacl -m u:1000:--x /etc/diploma /etc/diploma/tls /etc/diploma/tls/kafka
-setfacl -m u:1000:r-- /etc/diploma/tls/kafka/broker.pem
+setfacl -m u:1000:--x /etc/diploma/secrets
+setfacl -m u:1000:r-- /etc/diploma/tls/kafka/broker.pem /etc/diploma/tls/kafka/ca.pem
+setfacl -m u:1000:r-- /etc/diploma/secrets/kafka_admin_password /etc/diploma/secrets/kafka_reader_password
+setfacl -m u:10001:r-- /etc/diploma/secrets/kafka_reader_password /etc/diploma/tls/kafka/ca.pem
 ```
 
 Главному процессу Nginx дайте доступ только к веб-сертификату и ключу и право прохода по родительским каталогам. PostgreSQL читает файл пароля при начальной инициализации под root; UID backend не должен читать его. До запуска проверьте права через `getfacl`. Не открывайте файлы и каталоги всем пользователям. Compose secrets с `file:` — bind mounts: `uid/gid/mode` не отменяет запреты на исходном пути.
 
-Подготовьте защищённые файлы: пароль PostgreSQL, SQLAlchemy `DATABASE_URL` (с URL-кодированным паролем), уникальный OIDC state secret (минимум 32 случайных байта), OIDC client secret, Fernet `EXTERNAL_SECRET_KEY`, цепочку веб-сертификата, веб-ключ и Kafka PEM bundle из цепочки сертификата брокера и незашифрованного приватного ключа PKCS#8. Образ Apache Kafka работает с UID/GID 1000; только ему предоставьте чтение bundle (например, UID 1000, `0400` или узкий ACL). Генерация Fernet-ключа:
+Подготовьте защищённые файлы: пароль PostgreSQL, SQLAlchemy `DATABASE_URL` (с URL-кодированным паролем), уникальный OIDC state secret (минимум 32 случайных байта), OIDC client secret, Fernet `EXTERNAL_SECRET_KEY`, цепочку веб-сертификата, веб-ключ и Kafka PEM bundle из цепочки сертификата брокера и незашифрованного приватного ключа PKCS#8, доверенный CA и два независимых пароля Kafka. Сертификат Kafka должен содержать SAN `kafka` и внешнее имя `KAFKA_PUBLIC_HOST`. Образ Apache Kafka работает с UID/GID 1000; только ему предоставьте чтение bundle (например, UID 1000, `0400` или узкий ACL). Генерация Fernet-ключа:
 
 ```shell
 python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
@@ -124,6 +128,9 @@ EXTERNAL_SECRET_KEY_FILE=/etc/diploma/secrets/external_secret_key
 WEB_CERTIFICATE_FILE=/etc/diploma/tls/web/fullchain.pem
 WEB_PRIVATE_KEY_FILE=/etc/diploma/tls/web/privkey.pem
 KAFKA_BROKER_PEM_FILE=/etc/diploma/tls/kafka/broker.pem
+KAFKA_CA_FILE=/etc/diploma/tls/kafka/ca.pem
+KAFKA_ADMIN_PASSWORD_FILE=/etc/diploma/secrets/kafka_admin_password
+KAFKA_READER_PASSWORD_FILE=/etc/diploma/secrets/kafka_reader_password
 OIDC_ENABLED=false
 # При включении OIDC задайте OIDC_ISSUER_URL, OIDC_CLIENT_ID и:
 # OIDC_REDIRECT_URI=https://events.example.org/api/v1/auth/oidc/callback
@@ -138,9 +145,9 @@ docker compose --env-file .env.production -f docker-compose.yml -f docker-compos
 docker compose --env-file .env.production -f docker-compose.yml -f docker-compose.prod.yml up --build -d
 ```
 
-Наружу публикуются только Nginx 80/443 и TLS-порт Kafka 9094. Порт 80 перенаправляет на HTTPS. Ограничьте 9094 сетями агентов. FastAPI, PostgreSQL и внутренний PLAINTEXT listener Kafka не публикуются. Веб- и Kafka-сертификаты имеют независимые имена и процедуры продления. Обновите файлы на месте и выполните `docker compose ... restart proxy kafka`, сохранив тома. Ротация секретов описана в [инструкции по TLS](docs/tls.md). Не используйте `down -v` для обычной остановки. Kafka-подключение приложения использует внутренний `kafka:9092`; внешние агенты используют TLS-адрес и 9094.
+Наружу публикуются только Nginx 80/443 и TLS-порт Kafka 9094. Порт 80 перенаправляет на HTTPS. Ограничьте 9094 сетями агентов. FastAPI, PostgreSQL и внутренний `SASL_SSL` listener Kafka не публикуются. Веб- и Kafka-сертификаты имеют независимые имена и процедуры продления. Обновите файлы на месте и выполните `docker compose ... restart proxy kafka`, сохранив тома. Ротация секретов описана в [инструкции по TLS](docs/tls.md). Не используйте `down -v` для обычной остановки. Kafka-подключение приложения использует внутренний `kafka:9092`; внешние агенты используют TLS-адрес и 9094.
 
-Fluent Bit подключается напрямую к `kafka.example.org:9094` с проверкой сертификата по CA издателя. Пример — в [инструкции по TLS](docs/tls.md). Автосоздание топика включено: после первой записи агента новый топик появляется как обнаруженный и регистрируется как источник только по явному действию пользователя.
+Учётные записи и конфигурации Fluent Bit появятся в TASK-20/21. Пока runtime principal приложения читает существующие топики; он не может создавать топики или записывать сообщения. Автосоздание на брокере сохранено для будущего сценария.
 
 ## Эксплуатация
 
@@ -152,6 +159,7 @@ Fluent Bit подключается напрямую к `kafka.example.org:9094`
 - Корень API: `/api/v1`; Swagger/OpenAPI доступны только в разработке и тестах, в production отключены (`/docs`, `/redoc`, `/openapi.json`).
 - Тестовая БД и миграции: [инструкция по БД](docs/database.md).
 - Kafka offsets и обработка: [инструкция по Kafka](docs/kafka.md).
+- SCRAM, ACL и переход тома: [безопасность Kafka](docs/kafka-security.md).
 - События ECS и нормализация: [инструкция по событиям](docs/events.md).
 - Сессии и CSRF: [инструкция по аутентификации](docs/authentication.md).
 - Административный API: [инструкция по управлению](docs/administration.md).

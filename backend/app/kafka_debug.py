@@ -2,7 +2,12 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Protocol
 
-from .kafka import KafkaConnectionConfig
+from .kafka import (
+    KafkaConnectionConfig,
+    KafkaFailureObserver,
+    client_security_options,
+)
+from .kafka_security import KafkaSecurityConfigurationError, KafkaSecurityProfile
 
 MAX_DEBUG_RECORDS = 50
 MAX_DEBUG_BYTES = 1_048_576
@@ -31,13 +36,21 @@ class DebugReadError(Exception):
 class ConfluentDebugReader:
     """Read a frozen, globally bounded tail without joining or committing a group."""
 
+    def __init__(self, security_profile: KafkaSecurityProfile | None = None) -> None:
+        self.security_profile = security_profile
+
     def read(self, config: KafkaConnectionConfig, topic: str, timeout: float) -> list[DebugRecord]:
         from confluent_kafka import Consumer, KafkaException, TopicPartition
 
+        failures = KafkaFailureObserver()
+        try:
+            security_options = client_security_options(config, self.security_profile)
+        except KafkaSecurityConfigurationError as error:
+            raise DebugReadError("configuration") from error
         client = Consumer(
             {
                 "bootstrap.servers": ",".join(config.bootstrap_servers),
-                "security.protocol": config.security_protocol,
+                **security_options,
                 "group.id": "diploma-debug-isolated",
                 "enable.auto.commit": False,
                 "enable.auto.offset.store": False,
@@ -47,6 +60,7 @@ class ConfluentDebugReader:
                 "max.partition.fetch.bytes": MAX_DEBUG_BYTES,
                 "fetch.max.bytes": MAX_DEBUG_BYTES,
                 "queued.max.messages.kbytes": MAX_DEBUG_BYTES // 1024,
+                "error_cb": failures,
             }
         )
         deadline = monotonic() + timeout
@@ -54,7 +68,7 @@ class ConfluentDebugReader:
             metadata = client.list_topics(topic=topic, timeout=max(0.1, deadline - monotonic()))
             item = metadata.topics.get(topic)
             if item is None or item.error is not None:
-                raise DebugReadError("unavailable")
+                raise DebugReadError(failures.classify(item.error) if item else "unavailable")
             partitions = sorted(item.partitions)
             if len(partitions) > MAX_DEBUG_PARTITIONS:
                 raise DebugReadError("too_many_partitions")
@@ -117,7 +131,7 @@ class ConfluentDebugReader:
                 if message is None:
                     continue
                 if message.error():
-                    raise DebugReadError("unavailable")
+                    raise DebugReadError(failures.classify(message.error()))
                 key = (message.partition(), message.offset())
                 if key[0] in next_offset and key[1] != next_offset[key[0]]:
                     raise DebugReadError("incomplete")
@@ -138,6 +152,6 @@ class ConfluentDebugReader:
                 key=lambda row: (-(watermarks[row.partition][1] - row.offset), row.partition),
             )
         except KafkaException as error:
-            raise DebugReadError("unavailable") from error
+            raise DebugReadError(failures.classify(error)) from error
         finally:
             client.close()

@@ -56,6 +56,29 @@ REASON_DESCRIPTIONS = {
     'stopped_by_lifecycle': 'The worker stopped while the source was disabled or reconfigured.',
     'consumer_runtime_failure': 'The worker stopped because of an internal runtime failure.',
 }
+_KAFKA_OPERATIONS = {
+    "metadata": "retrieve Kafka metadata",
+    "consumer": "create the Kafka consumer",
+    "position": "read Kafka positions",
+    "poll": "read a Kafka message",
+    "commit": "commit the Kafka position",
+    "pause": "pause a Kafka partition",
+    "revoke": "release a Kafka assignment",
+}
+_KAFKA_FAILURES = {
+    "unavailable": "Kafka is unavailable",
+    "timeout": "the Kafka request timed out",
+    "tls_failed": "Kafka TLS trust or hostname verification failed",
+    "authentication_failed": "Kafka rejected the service credentials",
+    "acl_denied": "Kafka ACL denied the operation",
+    "commit_failed": "Kafka did not confirm the requested position",
+    "security_configuration_invalid": "the address is not allowed by the configured Kafka security profile",
+}
+for _operation, _action in _KAFKA_OPERATIONS.items():
+    for _suffix, _failure in _KAFKA_FAILURES.items():
+        REASON_DESCRIPTIONS[f"kafka_{_operation}_{_suffix}"] = (
+            f"Could not {_action}: {_failure}."
+        )
 UNKNOWN_REASON_DESCRIPTION = "Reason unavailable; check the source state and application logs."
 
 def describe_reason(code: str | None) -> str | None:

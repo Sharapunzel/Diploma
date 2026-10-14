@@ -34,7 +34,12 @@ class SourceSnapshotServiceImpl:
                 metadata = self.metadata.metadata_for_topic(config, source.topic_name, self.timeout)
             except KafkaMetadataError as error:
                 status = 504 if error.kind == "timeout" else 503
-                raise DomainError("kafka_unavailable", "Kafka metadata unavailable", status) from error
+                code = {
+                    "tls": "kafka_tls_failed", "authentication": "kafka_authentication_failed",
+                    "authorization": "kafka_acl_denied",
+                    "configuration": "kafka_security_configuration_invalid",
+                }.get(error.kind, "kafka_unavailable")
+                raise DomainError(code, "Kafka metadata unavailable", status) from error
             topic = next((item for item in metadata.topics if item.name == source.topic_name), None)
             if topic is None or topic.identity != source.kafka_topic_identity:
                 raise DomainError("source_generation_changed", "Kafka topic generation changed", 409)
@@ -48,7 +53,12 @@ class SourceSnapshotServiceImpl:
             if error.kind == "byte_limit":
                 raise DomainError("kafka_snapshot_too_large", "Kafka snapshot exceeds the safe read limit", 413) from error
             status = 504 if error.kind == "timeout" else 503
-            raise DomainError("kafka_debug_unavailable", "Kafka snapshot unavailable", status) from error
+            code = {
+                "tls": "kafka_tls_failed", "authentication": "kafka_authentication_failed",
+                "authorization": "kafka_acl_denied",
+                "configuration": "kafka_security_configuration_invalid",
+            }.get(error.kind, "kafka_debug_unavailable")
+            raise DomainError(code, "Kafka snapshot unavailable", status) from error
         check_identity()
         current = self.sources.find_by_id_for_update(source_id)
         if (current is None or current.is_archived or
