@@ -424,6 +424,9 @@ def clear_auth_state(auth_database):
         connection.execute(text("DELETE FROM logs.processed_kafka_records"))
         connection.execute(text("DELETE FROM app.auth_sessions"))
         connection.execute(text("DELETE FROM app.oidc_role_mappings"))
+        connection.execute(text("DELETE FROM app.kafka_provisioning_operations"))
+        connection.execute(text("DELETE FROM app.fluentbit_agent_topics"))
+        connection.execute(text("DELETE FROM app.fluentbit_agents"))
         connection.execute(text("DELETE FROM app.sources"))
         connection.execute(text("DELETE FROM app.external_connections"))
         connection.execute(text("DELETE FROM app.kafka_connections"))
@@ -2781,7 +2784,11 @@ def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_
         }
     for role_id in (ADMIN_ID, GUEST_ID):
         assert downgraded[role_id][0] == before[role_id][0]
-        assert downgraded[role_id][1] == before[role_id][1] - {"processing_errors.raw.read"}
+        assert downgraded[role_id][1] == before[role_id][1] - {
+            "processing_errors.raw.read",
+            "agents.read",
+            "agents.write",
+        }
     run_alembic(auth_database_url, "upgrade", "head")
     with psycopg.connect(url) as connection:
         upgraded = connection.execute(

@@ -80,7 +80,7 @@ def main() -> None:
         "transaction.state.log.min.isr=1",
         "group.initial.rebalance.delay.ms=0",
         "num.partitions=3",
-        "auto.create.topics.enable=true",
+        "auto.create.topics.enable=false",
     ]
     for listener in ("internal", "external"):
         lines.append(

@@ -106,6 +106,8 @@ class KafkaConnectionServiceImpl:
             fail("connection_not_found", "Kafka connection not found")
         values = data.model_dump(exclude_unset=True)
         changing_config = any(key in values for key in ("bootstrap_servers", "security_protocol"))
+        if changing_config and self.repository.has_agent_assignments(connection.id):
+            fail("agent_assignment_exists", "Revoke agent assignments before changing the Kafka connection", 409)
         if changing_config and self.repository.has_enabled_sources(connection.id):
             fail("source_enabled", "Enabled sources prevent connection changes", 409)
         if changing_config and self.repository.has_sources(connection.id):
@@ -126,6 +128,8 @@ class KafkaConnectionServiceImpl:
 
     def delete(self, connection_id: UUID) -> None:
         connection = self.get(connection_id)
+        if self.repository.has_agent_assignments(connection.id):
+            fail("agent_assignment_exists", "Revoke assigned agents before deleting the Kafka connection", 409)
         try:
             self.repository.delete(connection)
             self.uow.commit()
@@ -264,6 +268,8 @@ class SourceServiceImpl:
         if source.is_archived:
             fail("source_archived", "Archived source cannot be changed", 409)
         values = data.model_dump(exclude_unset=True)
+        if any(key in values for key in ("connection_id", "topic_name")) and self.sources.has_agent_assignment(source.id):
+            fail("agent_assignment_exists", "Remove the agent topic assignment before changing its source connection or topic", 409)
         if source.is_enabled and any(key in values for key in ("connection_id", "topic_name")):
             fail("source_enabled", "Enabled source connection or topic cannot change", 409)
         target_connection_id = values.get("connection_id", source.connection_id)
@@ -329,6 +335,8 @@ class SourceServiceImpl:
 
     def delete(self, source_id: UUID) -> None:
         source = self.get(source_id)
+        if self.sources.has_agent_assignment(source.id):
+            fail("agent_assignment_exists", "Remove the agent topic assignment before deleting the source", 409)
         try:
             self.sources.delete(source)
             self.uow.commit()

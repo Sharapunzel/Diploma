@@ -8,3 +8,4 @@
 - [Внешний OpenSearch-совместимый источник](external-sources.md)
 - [Первый администратор и управление API](administration.md)
 - [TLS и сертификаты](tls.md)
+- [Жизненный цикл Fluent Bit-агентов](agent-lifecycle.md)

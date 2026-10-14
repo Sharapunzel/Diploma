@@ -17,6 +17,7 @@ backend/*.egg-info/
 *secret*
 *password*
 *credential*
+!/backend/app/agent_credentials.py
 *.secret
 *.secret.*
 *.pem

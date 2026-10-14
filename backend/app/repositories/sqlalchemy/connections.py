@@ -5,7 +5,13 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from ...models import KafkaConnection, ProcessedKafkaRecord, Source
+from ...models import (
+    FluentBitAgent,
+    FluentBitAgentTopic,
+    KafkaConnection,
+    ProcessedKafkaRecord,
+    Source,
+)
 
 
 def _like(value: str) -> str:
@@ -54,6 +60,16 @@ class SqlAlchemyKafkaConnectionRepository:
         return bool(self.session.scalar(
             select(Source.id).where(Source.connection_id == connection_id).limit(1)
         ))
+
+    def has_agent_assignments(self, connection_id: UUID) -> bool:
+        if self.session.scalar(select(FluentBitAgent.id).where(
+            FluentBitAgent.connection_id == connection_id,
+            FluentBitAgent.state != "revoked",
+        ).limit(1)):
+            return True
+        return bool(self.session.scalar(select(FluentBitAgentTopic.id).where(
+            FluentBitAgentTopic.connection_id == connection_id
+        ).limit(1)))
 
     def add(self, connection: KafkaConnection) -> KafkaConnection:
         self.session.add(connection)
@@ -172,3 +188,8 @@ class SqlAlchemySourceRepository:
                 )
             )
         )
+
+    def has_agent_assignment(self, source_id: UUID) -> bool:
+        return bool(self.session.scalar(select(FluentBitAgentTopic.id).where(
+            FluentBitAgentTopic.source_id == source_id
+        ).limit(1)))

@@ -6,10 +6,13 @@ from uuid import UUID, uuid4
 import pytest
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic, _ConsumerGroupTopicPartitions
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from test_auth_foundation import admin_headers, create_normalizer, login
 
+from app.agent_kafka_admin import AgentKafkaAdminProfile, ConfluentAgentKafkaAdmin
+from app.agent_provisioner import AgentProvisioner
 from app.config import Settings
 from app.db import Database
 from app.kafka import ConfluentKafkaMetadataClient, KafkaConnectionConfig, KafkaMetadataError
@@ -25,10 +28,15 @@ def kafka_test_profile() -> KafkaSecurityProfile | None:
     ca_file = os.getenv("KAFKA_TEST_CA_FILE")
     return KafkaSecurityProfile(
         os.getenv("KAFKA_TEST_SECURITY_PROTOCOL", "SASL_PLAINTEXT"),
-        "diploma-reader", Path(password_file), Path(ca_file) if ca_file else None,
+        "diploma-reader",
+        Path(password_file),
+        Path(ca_file) if ca_file else None,
         tuple(
             item.strip()
-            for item in os.getenv("KAFKA_TEST_DEV_ALLOWED_BOOTSTRAP_SERVERS", "127.0.0.1:9092,localhost:9092,[::1]:9092,kafka:9092").split(",")
+            for item in os.getenv(
+                "KAFKA_TEST_DEV_ALLOWED_BOOTSTRAP_SERVERS",
+                "127.0.0.1:9092,localhost:9092,[::1]:9092,kafka:9092",
+            ).split(",")
             if item.strip()
         ),
     )
@@ -41,11 +49,13 @@ def kafka_test_admin_config() -> dict[str, str]:
     }
     password_file = os.getenv("KAFKA_TEST_ADMIN_PASSWORD_FILE")
     if password_file:
-        result.update({
-            "sasl.mechanism": "SCRAM-SHA-512",
-            "sasl.username": "diploma-kafka-admin",
-            "sasl.password": Path(password_file).read_text(encoding="utf-8").strip(),
-        })
+        result.update(
+            {
+                "sasl.mechanism": "SCRAM-SHA-512",
+                "sasl.username": "diploma-kafka-admin",
+                "sasl.password": Path(password_file).read_text(encoding="utf-8").strip(),
+            }
+        )
     if ca_file := os.getenv("KAFKA_TEST_CA_FILE"):
         result["ssl.ca.location"] = ca_file
     return result
@@ -60,19 +70,25 @@ def integration_database():
 
 
 @pytest.fixture
-def integration_client(integration_database):
+def integration_client(integration_database, tmp_path):
     from test_auth_foundation import clear_auth_state, run_alembic
 
     run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
     clear_auth_state(integration_database)
     profile = kafka_test_profile()
+    credentials_key_file = tmp_path / "agent-credentials.key"
+    credentials_key_file.write_bytes(Fernet.generate_key())
     settings = Settings(
-        environment="test", database_url=os.environ["TEST_DATABASE_URL"],
+        environment="test",
+        database_url=os.environ["TEST_DATABASE_URL"],
         kafka_security_protocol=profile.protocol if profile else None,
         kafka_runtime_username=profile.username if profile else None,
         kafka_runtime_password_file=profile.password_file if profile else None,
         kafka_ca_file=profile.ca_file if profile else None,
-        kafka_dev_allowed_bootstrap_servers=list(profile.dev_allowed_bootstrap_servers) if profile else [],
+        kafka_dev_allowed_bootstrap_servers=list(profile.dev_allowed_bootstrap_servers)
+        if profile
+        else [],
+        agent_credentials_key_file=credentials_key_file,
     )
     with TestClient(create_app(settings, database=integration_database)) as client:
         yield client
@@ -101,7 +117,9 @@ def test_real_kafka_api_source_lifecycle(integration_client, integration_databas
     bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_name = f"diploma-task4-{uuid4().hex}"
     admin = AdminClient(kafka_test_admin_config())
-    create_future = admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[topic_name]
+    create_future = admin.create_topics(
+        [NewTopic(topic_name, num_partitions=1, replication_factor=1)]
+    )[topic_name]
     create_future.result(10)
     connection_id = None
     source_id = None
@@ -116,30 +134,44 @@ def test_real_kafka_api_source_lifecycle(integration_client, integration_databas
         assert connection_response.status_code == 201, connection_response.text
         connection = connection_response.json()
         connection_id = connection["id"]
-        assert integration_client.post(f"/api/v1/kafka-connections/{connection_id}/test", headers=headers).status_code == 200
+        assert (
+            integration_client.post(
+                f"/api/v1/kafka-connections/{connection_id}/test", headers=headers
+            ).status_code
+            == 200
+        )
         deadline = time.monotonic() + 10
         while True:
-            topics = integration_client.get(f"/api/v1/kafka-connections/{connection_id}/topics").json()
+            topics = integration_client.get(
+                f"/api/v1/kafka-connections/{connection_id}/topics"
+            ).json()
             if any(item["name"] == topic_name for item in topics["items"]):
                 break
             if time.monotonic() >= deadline:
                 raise AssertionError("created Kafka topic did not appear in metadata")
             time.sleep(0.1)
-        sources = integration_client.get(
-            f"/api/v1/sources?connection_id={connection_id}"
-        ).json()
+        sources = integration_client.get(f"/api/v1/sources?connection_id={connection_id}").json()
         assert sources["total"] == 0
         normalizer = create_normalizer(integration_client, headers, f"real-{uuid4().hex}")
         source_response = integration_client.post(
             "/api/v1/sources",
-            json={"name": f"source-{uuid4().hex}", "connection_id": connection_id, "topic_name": topic_name},
+            json={
+                "name": f"source-{uuid4().hex}",
+                "connection_id": connection_id,
+                "topic_name": topic_name,
+            },
             headers=headers,
         )
         assert source_response.status_code == 201, source_response.text
         source = source_response.json()
         source_id = source["id"]
         assert source["is_enabled"] is False and source["normalizer_id"] is None
-        assert integration_client.get(f"/api/v1/kafka-connections/{connection_id}/topics").json()["total"] >= 1
+        assert (
+            integration_client.get(f"/api/v1/kafka-connections/{connection_id}/topics").json()[
+                "total"
+            ]
+            >= 1
+        )
         assigned = integration_client.put(
             f"/api/v1/sources/{source_id}/normalizer",
             json={"normalizer_id": normalizer["id"]},
@@ -166,15 +198,261 @@ def test_real_kafka_api_source_lifecycle(integration_client, integration_databas
             raise delete_error
 
 
+def test_real_agent_registration_acl_rotation_and_revoke(integration_client, integration_database):
+    from test_auth_foundation import create_normalizer
+
+    bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
+    admin = AdminClient(kafka_test_admin_config())
+    existing_topic = f"diploma-task20-existing-{uuid4().hex}"
+    foreign_topic = f"diploma-task20-foreign-{uuid4().hex}"
+    new_topic = f"diploma-task20-new-{uuid4().hex}"
+    added_topic = f"diploma-task20-added-{uuid4().hex}"
+    admin.create_topics(
+        [
+            NewTopic(existing_topic, num_partitions=1, replication_factor=1),
+            NewTopic(foreign_topic, num_partitions=1, replication_factor=1),
+        ]
+    )
+    for name in (existing_topic, foreign_topic):
+        admin.list_topics(topic=name, timeout=10)
+
+    headers = admin_headers(integration_client, integration_database)
+    connection_id = None
+    source_id = None
+    agent_id = None
+    worker = None
+    producers = []
+    try:
+        connection_response = integration_client.post(
+            "/api/v1/kafka-connections",
+            json={"name": f"agent-{uuid4().hex}", "bootstrap_servers": [bootstrap]},
+            headers=headers,
+        )
+        assert connection_response.status_code == 201, connection_response.text
+        connection_id = connection_response.json()["id"]
+        normalizer = create_normalizer(integration_client, headers, f"agent-{uuid4().hex}")
+        source_response = integration_client.post(
+            "/api/v1/sources",
+            json={
+                "name": f"existing-{uuid4().hex}",
+                "connection_id": connection_id,
+                "topic_name": existing_topic,
+            },
+            headers=headers,
+        )
+        assert source_response.status_code == 201, source_response.text
+        source_id = source_response.json()["id"]
+        linked = integration_client.put(
+            f"/api/v1/sources/{source_id}/normalizer",
+            json={"normalizer_id": normalizer["id"]},
+            headers=headers,
+        )
+        assert linked.status_code == 200
+
+        created = integration_client.post(
+            "/api/v1/agents",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+            json={
+                "name": "integration-agent",
+                "topics": [
+                    {"connection_id": connection_id, "topic_name": new_topic, "action": "create"},
+                    {
+                        "connection_id": connection_id,
+                        "topic_name": existing_topic,
+                        "action": "attach",
+                    },
+                ],
+            },
+        )
+        assert created.status_code == 202, created.text
+        agent = created.json()
+        agent_id = agent["id"]
+        assert agent["operation_id"]
+
+        profile = kafka_test_profile()
+        assert profile is not None
+        admin_password_file = Path(os.environ["KAFKA_TEST_ADMIN_PASSWORD_FILE"])
+        worker = AgentProvisioner(
+            integration_database,
+            ConfluentAgentKafkaAdmin(
+                AgentKafkaAdminProfile(
+                    profile.protocol, "diploma-kafka-admin", admin_password_file, profile.ca_file
+                )
+            ),
+            integration_client.app.state.kafka_client,
+            timeout=10,
+            credentials_key_file=integration_client.app.state.settings.agent_credentials_key_file,
+        )
+        assert str(worker.claim()) == agent["operation_id"]
+        worker.execute(UUID(agent["operation_id"]))
+        ready = integration_client.get(f"/api/v1/agents/{agent_id}").json()
+        operation_state = integration_client.get(
+            f"/api/v1/agents/{agent_id}/operations/{agent['operation_id']}"
+        ).json()
+        assert ready["state"] == "ready", operation_state
+        assert len(ready["topics"]) == 2
+        assert (
+            next(item for item in ready["topics"] if item["topic_name"] == existing_topic)[
+                "source_id"
+            ]
+            == source_id
+        )
+        with integration_database.session_factory() as session:
+            preserved = session.get(Source, UUID(source_id))
+            assert (
+                preserved.is_enabled is False and str(preserved.normalizer_id) == normalizer["id"]
+            )
+
+        credentials_response = integration_client.post(
+            f"/api/v1/agents/{agent_id}/credentials/claim", headers=headers
+        )
+        assert credentials_response.status_code == 200
+        assert credentials_response.headers["cache-control"] == "no-store"
+        credentials = credentials_response.json()
+        assert (
+            integration_client.post(
+                f"/api/v1/agents/{agent_id}/credentials/claim", headers=headers
+            ).status_code
+            == 409
+        )
+
+        producer_config = {
+            "bootstrap.servers": bootstrap,
+            "security.protocol": profile.protocol,
+            "sasl.mechanism": "SCRAM-SHA-512",
+            "sasl.username": credentials["username"],
+            "sasl.password": credentials["password"],
+            "error_cb": lambda error: None,
+        }
+
+        def send(producer, topic):
+            errors = []
+            producer.produce(
+                topic,
+                value=b"agent integration",
+                callback=lambda error, _message: errors.append(error),
+            )
+            pending = producer.flush(10)
+            return errors[-1] if errors else (KafkaError._AUTHENTICATION if pending else None)
+
+        producer = Producer(producer_config)
+        producers.append(producer)
+        assert send(producer, new_topic) is None
+        assert send(producer, foreign_topic) is not None
+        unknown_topic = f"diploma-task20-unknown-{uuid4().hex}"
+        assert send(producer, unknown_topic) is not None
+        assert unknown_topic not in admin.list_topics(timeout=10).topics
+        invalid_password = Producer({**producer_config, "sasl.password": "invalid-password"})
+        unknown_agent = Producer(
+            {
+                **producer_config,
+                "sasl.username": f"diploma-agent-unknown-{uuid4().hex}",
+                "sasl.password": "invalid-agent-password",
+            }
+        )
+        producers.extend([invalid_password, unknown_agent])
+        assert send(invalid_password, new_topic) is not None
+        assert send(unknown_agent, new_topic) is not None
+
+        added = integration_client.post(
+            f"/api/v1/agents/{agent_id}/topics",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+            json={"connection_id": connection_id, "topic_name": added_topic, "action": "create"},
+        )
+        assert added.status_code == 202, added.text
+        worker_operation = integration_client.get(f"/api/v1/agents/{agent_id}").json()[
+            "operation_id"
+        ]
+        assert str(worker.claim()) == worker_operation
+        worker.execute(UUID(worker_operation))
+        assert integration_client.get(f"/api/v1/agents/{agent_id}").json()["state"] == "ready"
+
+        topic_assignment = next(
+            item for item in ready["topics"] if item["topic_name"] == existing_topic
+        )
+        removed = integration_client.delete(
+            f"/api/v1/agents/{agent_id}/topics/{topic_assignment['id']}",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+        )
+        assert removed.status_code == 202, removed.text
+        remove_operation = integration_client.get(f"/api/v1/agents/{agent_id}").json()[
+            "operation_id"
+        ]
+        assert str(worker.claim()) == remove_operation
+        worker.execute(UUID(remove_operation))
+        assert send(producer, existing_topic) is not None
+
+        rotated = integration_client.post(
+            f"/api/v1/agents/{agent_id}/credentials/rotate",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+        )
+        assert rotated.status_code == 202, rotated.text
+        rotate_operation = integration_client.get(f"/api/v1/agents/{agent_id}").json()[
+            "operation_id"
+        ]
+        assert str(worker.claim()) == rotate_operation
+        worker.execute(UUID(rotate_operation))
+        assert send(producer, new_topic) is not None
+        rotated_credentials = integration_client.post(
+            f"/api/v1/agents/{agent_id}/credentials/claim", headers=headers
+        ).json()
+        current_producer = Producer(
+            {
+                **producer_config,
+                "sasl.username": rotated_credentials["username"],
+                "sasl.password": rotated_credentials["password"],
+            }
+        )
+        producers.append(current_producer)
+        assert send(current_producer, new_topic) is None
+
+        revoked = integration_client.post(
+            f"/api/v1/agents/{agent_id}/revoke",
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+        )
+        assert revoked.status_code == 202, revoked.text
+        revoke_operation = integration_client.get(f"/api/v1/agents/{agent_id}").json()[
+            "operation_id"
+        ]
+        assert str(worker.claim()) == revoke_operation
+        worker.execute(UUID(revoke_operation))
+        assert integration_client.get(f"/api/v1/agents/{agent_id}").json()["state"] == "revoked"
+        assert send(current_producer, new_topic) is not None
+    finally:
+        for producer in producers:
+            producer.flush(5)
+        if agent_id is not None:
+            state = integration_client.get(f"/api/v1/agents/{agent_id}")
+            if state.status_code == 200 and state.json()["state"] != "revoked":
+                operation = integration_client.post(
+                    f"/api/v1/agents/{agent_id}/revoke",
+                    headers={**headers, "Idempotency-Key": str(uuid4())},
+                )
+                if operation.status_code == 202:
+                    worker_operation = integration_client.get(f"/api/v1/agents/{agent_id}").json()[
+                        "operation_id"
+                    ]
+                    if worker is not None and str(worker.claim()) == worker_operation:
+                        worker.execute(UUID(worker_operation))
+        if source_id is not None:
+            integration_client.delete(f"/api/v1/sources/{source_id}", headers=headers)
+        if connection_id is not None:
+            integration_client.delete(f"/api/v1/kafka-connections/{connection_id}", headers=headers)
+        try:
+            admin.delete_topics([existing_topic, foreign_topic, new_topic, added_topic])
+        except KafkaException:
+            pass
+
+
 def test_real_kafka_consumer_persists_before_offset_commit(integration_database):
     from test_auth_foundation import clear_auth_state, run_alembic
 
     bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_name = f"diploma-task8-{uuid4().hex}"
     admin = AdminClient(kafka_test_admin_config())
-    admin.create_topics([
-        NewTopic(topic_name, num_partitions=1, replication_factor=1)
-    ])[topic_name].result(10)
+    admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[
+        topic_name
+    ].result(10)
     run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
     clear_auth_state(integration_database)
     profile = kafka_test_profile()
@@ -220,14 +498,18 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
             assert source.status_code == 201, source.text
             source_id = source.json()["id"]
             consumer_group = f"diploma-source-{source_id}"
-            assert client.put(
-                f"/api/v1/sources/{source_id}/normalizer",
-                json={"normalizer_id": normalizer["id"]},
-                headers=headers,
-            ).status_code == 200
-            assert client.post(
-                f"/api/v1/sources/{source_id}/enable", headers=headers
-            ).status_code == 200
+            assert (
+                client.put(
+                    f"/api/v1/sources/{source_id}/normalizer",
+                    json={"normalizer_id": normalizer["id"]},
+                    headers=headers,
+                ).status_code
+                == 200
+            )
+            assert (
+                client.post(f"/api/v1/sources/{source_id}/enable", headers=headers).status_code
+                == 200
+            )
             producer = Producer(kafka_test_admin_config())
             producer.produce(
                 topic_name,
@@ -255,12 +537,11 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
         assert consumer_group is not None
 
         def committed_offset() -> int:
-            request = _ConsumerGroupTopicPartitions(
-                consumer_group, [TopicPartition(topic_name, 0)]
-            )
+            request = _ConsumerGroupTopicPartitions(consumer_group, [TopicPartition(topic_name, 0)])
             offsets = admin.list_consumer_group_offsets([request])[consumer_group].result(10)
             partition = next(
-                item for item in offsets.topic_partitions
+                item
+                for item in offsets.topic_partitions
                 if item.topic == topic_name and item.partition == 0
             )
             return partition.offset
@@ -275,9 +556,7 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
         ) as restarted_client:
             assert login(restarted_client, "admin").status_code == 200
             restarted_headers = {
-                "X-CSRF-Token": restarted_client.get(
-                    "/api/v1/auth/session"
-                ).json()["csrf_token"]
+                "X-CSRF-Token": restarted_client.get("/api/v1/auth/session").json()["csrf_token"]
             }
             producer = Producer(kafka_test_admin_config())
             producer.produce(
@@ -299,9 +578,12 @@ def test_real_kafka_consumer_persists_before_offset_commit(integration_database)
                 time.sleep(0.1)
             else:
                 raise AssertionError("consumer did not resume from confirmed offset")
-            assert restarted_client.post(
-                f"/api/v1/sources/{source_id}/disable", headers=restarted_headers
-            ).status_code == 200
+            assert (
+                restarted_client.post(
+                    f"/api/v1/sources/{source_id}/disable", headers=restarted_headers
+                ).status_code
+                == 200
+            )
         assert committed_offset() == 2
     finally:
         clear_auth_state(integration_database)
@@ -318,12 +600,15 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
     bootstrap = os.getenv("KAFKA_TEST_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_name = f"diploma-task8-gap-{uuid4().hex}"
     admin = AdminClient(kafka_test_admin_config())
-    admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[topic_name].result(10)
+    admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[
+        topic_name
+    ].result(10)
     run_alembic(os.environ["TEST_DATABASE_URL"], "upgrade", "head")
     clear_auth_state(integration_database)
     profile = kafka_test_profile()
     settings = Settings(
-        environment="test", database_url=os.environ["TEST_DATABASE_URL"],
+        environment="test",
+        database_url=os.environ["TEST_DATABASE_URL"],
         kafka_consumer_poll_timeout_seconds=0.1,
         kafka_consumer_retry_delay_seconds=0.1,
         kafka_supervisor_sync_seconds=0.1,
@@ -331,7 +616,9 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
         kafka_runtime_username=profile.username if profile else None,
         kafka_runtime_password_file=profile.password_file if profile else None,
         kafka_ca_file=profile.ca_file if profile else None,
-        kafka_dev_allowed_bootstrap_servers=list(profile.dev_allowed_bootstrap_servers) if profile else [],
+        kafka_dev_allowed_bootstrap_servers=list(profile.dev_allowed_bootstrap_servers)
+        if profile
+        else [],
     )
     metadata_client = ConfluentKafkaMetadataClient(profile)
     config = KafkaConnectionConfig((bootstrap,), "PLAINTEXT")
@@ -354,14 +641,18 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
 
     def stored(source_id, offset):
         with integration_database.session_factory() as session:
-            return session.scalar(select(ParsedLog).where(
-                ParsedLog.source_id == source_id, ParsedLog.kafka_offset == offset
-            ))
+            return session.scalar(
+                select(ParsedLog).where(
+                    ParsedLog.source_id == source_id, ParsedLog.kafka_offset == offset
+                )
+            )
 
     producer = Producer(kafka_test_admin_config())
     try:
         old_topic_id = eventually(topic_id, "initial topic ID unavailable")
-        with TestClient(create_app(settings, database=integration_database, start_consumers=True)) as client:
+        with TestClient(
+            create_app(settings, database=integration_database, start_consumers=True)
+        ) as client:
             headers = admin_headers(client, integration_database)
             connection = client.post(
                 "/api/v1/kafka-connections",
@@ -378,13 +669,22 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
             )
             assert old.status_code == 201, old.text
             old_source_id = UUID(old.json()["id"])
-            assert client.put(
-                f"/api/v1/sources/{old_source_id}/normalizer",
-                json={"normalizer_id": normalizer["id"]}, headers=headers,
-            ).status_code == 200
-            producer.produce(topic_name, b'{"timestamp":"2026-03-02T11:59:00Z","log":"first event"}')
+            assert (
+                client.put(
+                    f"/api/v1/sources/{old_source_id}/normalizer",
+                    json={"normalizer_id": normalizer["id"]},
+                    headers=headers,
+                ).status_code
+                == 200
+            )
+            producer.produce(
+                topic_name, b'{"timestamp":"2026-03-02T11:59:00Z","log":"first event"}'
+            )
             assert producer.flush(10) == 0
-            assert client.post(f"/api/v1/sources/{old_source_id}/enable", headers=headers).status_code == 200
+            assert (
+                client.post(f"/api/v1/sources/{old_source_id}/enable", headers=headers).status_code
+                == 200
+            )
             eventually(lambda: stored(old_source_id, 0), "first Kafka record not stored")
 
             def committed():
@@ -397,7 +697,10 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
                 return rows.topic_partitions[0].offset
 
             eventually(lambda: committed() == 1, "first Kafka offset not committed")
-            assert client.post(f"/api/v1/sources/{old_source_id}/disable", headers=headers).status_code == 200
+            assert (
+                client.post(f"/api/v1/sources/{old_source_id}/disable", headers=headers).status_code
+                == 200
+            )
             for number in (1, 2, 3):
                 producer.produce(
                     topic_name,
@@ -406,36 +709,58 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
             assert producer.flush(10) == 0
             future = admin.delete_records([TopicPartition(topic_name, 0, 3)])
             next(iter(future.values())).result(10)
-            inspector = Consumer({
-                **kafka_test_admin_config(), "group.id": f"inspect-{uuid4().hex}",
-                "enable.auto.commit": False,
-            })
+            inspector = Consumer(
+                {
+                    **kafka_test_admin_config(),
+                    "group.id": f"inspect-{uuid4().hex}",
+                    "enable.auto.commit": False,
+                }
+            )
             try:
                 eventually(
-                    lambda: inspector.get_watermark_offsets(TopicPartition(topic_name, 0), timeout=3)[0] == 3,
+                    lambda: (
+                        inspector.get_watermark_offsets(TopicPartition(topic_name, 0), timeout=3)[0]
+                        == 3
+                    ),
                     "test topic low watermark did not reach 3",
                 )
             finally:
                 inspector.close()
-            assert client.post(f"/api/v1/sources/{old_source_id}/enable", headers=headers).status_code == 200
-            eventually(lambda: stored(old_source_id, 3), "consumer did not resume from low watermark")
+            assert (
+                client.post(f"/api/v1/sources/{old_source_id}/enable", headers=headers).status_code
+                == 200
+            )
+            eventually(
+                lambda: stored(old_source_id, 3), "consumer did not resume from low watermark"
+            )
             with integration_database.session_factory() as session:
-                gap = session.scalar(select(KafkaOperationalEvent).where(
-                    KafkaOperationalEvent.source_identity == old_source_id,
-                    KafkaOperationalEvent.kind == "retention_gap",
-                ))
+                gap = session.scalar(
+                    select(KafkaOperationalEvent).where(
+                        KafkaOperationalEvent.source_identity == old_source_id,
+                        KafkaOperationalEvent.kind == "retention_gap",
+                    )
+                )
                 assert gap is not None and (gap.offset_start, gap.offset_end) == (1, 3)
                 assert gap.old_topic_identity == old_topic_id
-                assert session.scalar(select(ParsedLog).where(
-                    ParsedLog.source_id == old_source_id,
-                    ParsedLog.kafka_offset.in_((1, 2)),
-                )) is None
+                assert (
+                    session.scalar(
+                        select(ParsedLog).where(
+                            ParsedLog.source_id == old_source_id,
+                            ParsedLog.kafka_offset.in_((1, 2)),
+                        )
+                    )
+                    is None
+                )
 
             admin.delete_topics([topic_name])[topic_name].result(10)
             eventually(lambda: topic_id() is None, "old topic remained visible")
-            admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[topic_name].result(10)
-            new_topic_id = eventually(lambda: (found if (found := topic_id()) != old_topic_id else None),
-                                      "recreated topic ID did not change")
+            admin.create_topics([NewTopic(topic_name, num_partitions=1, replication_factor=1)])[
+                topic_name
+            ].result(10)
+            new_topic_id = eventually(
+                lambda: found if (found := topic_id()) != old_topic_id else None,
+                "recreated topic ID did not change",
+            )
 
             def archived():
                 with integration_database.session_factory() as session:
@@ -444,13 +769,20 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
 
             eventually(archived, "old source was not archived", timeout=35)
             with integration_database.session_factory() as session:
-                event = session.scalar(select(KafkaOperationalEvent).where(
-                    KafkaOperationalEvent.source_identity == old_source_id,
-                    KafkaOperationalEvent.kind == "topic_recreated",
-                ))
+                event = session.scalar(
+                    select(KafkaOperationalEvent).where(
+                        KafkaOperationalEvent.source_identity == old_source_id,
+                        KafkaOperationalEvent.kind == "topic_recreated",
+                    )
+                )
                 assert event is not None and event.new_topic_identity == new_topic_id
             topics = client.get(f"/api/v1/kafka-connections/{connection_id}/topics").json()
-            assert next(item for item in topics["items"] if item["name"] == topic_name)["is_registered"] is False
+            assert (
+                next(item for item in topics["items"] if item["name"] == topic_name)[
+                    "is_registered"
+                ]
+                is False
+            )
             new = client.post(
                 "/api/v1/sources",
                 json={"name": "new", "connection_id": connection_id, "topic_name": topic_name},
@@ -459,19 +791,32 @@ def test_real_kafka_retention_and_recreated_topic_generation(integration_databas
             assert new.status_code == 201, new.text
             new_source_id = UUID(new.json()["id"])
             assert new_source_id != old_source_id and not new.json()["is_enabled"]
-            assert client.put(
-                f"/api/v1/sources/{new_source_id}/normalizer",
-                json={"normalizer_id": normalizer["id"]}, headers=headers,
-            ).status_code == 200
-            assert client.post(f"/api/v1/sources/{new_source_id}/enable", headers=headers).status_code == 200
-            producer.produce(topic_name, b'{"timestamp":"2026-03-02T11:59:00Z","log":"new generation"}')
+            assert (
+                client.put(
+                    f"/api/v1/sources/{new_source_id}/normalizer",
+                    json={"normalizer_id": normalizer["id"]},
+                    headers=headers,
+                ).status_code
+                == 200
+            )
+            assert (
+                client.post(f"/api/v1/sources/{new_source_id}/enable", headers=headers).status_code
+                == 200
+            )
+            producer.produce(
+                topic_name, b'{"timestamp":"2026-03-02T11:59:00Z","log":"new generation"}'
+            )
             assert producer.flush(10) == 0
             eventually(lambda: stored(new_source_id, 0), "new generation record not stored")
             with integration_database.session_factory() as session:
-                generations = set(session.scalars(select(ProcessedKafkaRecord.kafka_topic_identity).where(
-                    ProcessedKafkaRecord.kafka_topic == topic_name,
-                    ProcessedKafkaRecord.kafka_offset == 0,
-                )))
+                generations = set(
+                    session.scalars(
+                        select(ProcessedKafkaRecord.kafka_topic_identity).where(
+                            ProcessedKafkaRecord.kafka_topic == topic_name,
+                            ProcessedKafkaRecord.kafka_offset == 0,
+                        )
+                    )
+                )
                 assert generations == {old_topic_id, new_topic_id}
     finally:
         clear_auth_state(integration_database)

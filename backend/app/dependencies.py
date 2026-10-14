@@ -36,6 +36,7 @@ from .services.implementations.administration import (
     SettingAdministration,
     UserAdministration,
 )
+from .services.implementations.agents import AgentLifecycleServiceImpl
 from .services.implementations.auth import AuthService
 from .services.implementations.connections import KafkaConnectionServiceImpl, SourceServiceImpl
 from .services.implementations.cursor import SignedParsedLogCursorCodec
@@ -55,6 +56,7 @@ from .services.protocols.administration import (
     SettingAdministrationService,
     UserAdministrationService,
 )
+from .services.protocols.agents import AgentLifecycleService
 from .services.protocols.connections import KafkaConnectionService, SourceService
 from .services.protocols.consumers import SourceConsumerLifecycle
 from .services.protocols.debug_snapshot import SourceSnapshotService
@@ -368,6 +370,14 @@ def get_connection_service(
     return build_connection_service(
         session, app_settings, client, get_consumer_lifecycle(request)
     )
+
+
+def get_agent_lifecycle_service(
+    session: Session = Depends(get_session),
+    client: KafkaMetadataClient = Depends(get_kafka_client),
+    app_settings: Settings = Depends(get_settings),
+) -> AgentLifecycleService:
+    return AgentLifecycleServiceImpl(session, client, app_settings)
 
 
 def get_source_service(

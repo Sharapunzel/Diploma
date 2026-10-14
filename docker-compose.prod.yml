@@ -33,6 +33,7 @@ services:
       OIDC_STATE_SECRET_FILE: /run/secrets/oidc_state_secret
       OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       EXTERNAL_SECRET_KEY_FILE: /run/secrets/external_secret_key
+      AGENT_CREDENTIALS_KEY_FILE: /run/secrets/agent_credentials_key
       OIDC_ENABLED: ${OIDC_ENABLED:-false}
       OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
@@ -43,7 +44,21 @@ services:
       SESSION_COOKIE_SECURE: "true"
       TRUSTED_HOSTS: ${PUBLIC_HOST:?Set public web DNS name},localhost
       FORWARDED_ALLOW_IPS: ${PROXY_IP:-172.30.0.10}
-    secrets: [database_url, oidc_state_secret, oidc_client_secret, external_secret_key, kafka_reader_password, kafka_ca]
+    secrets: [database_url, oidc_state_secret, oidc_client_secret, external_secret_key, kafka_reader_password, kafka_ca, agent_credentials_key]
+  provisioner:
+    environment:
+      ENVIRONMENT: production
+      PROCESS_ROLE: provisioner
+      KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_RUNTIME_USERNAME: diploma-reader
+      KAFKA_RUNTIME_PASSWORD_FILE: /run/secrets/kafka_reader_password
+      KAFKA_ADMIN_USERNAME: diploma-kafka-admin
+      KAFKA_ADMIN_PASSWORD_FILE: /run/secrets/kafka_admin_password
+      KAFKA_CA_FILE: /run/secrets/kafka_ca
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/database_url
+      AGENT_CREDENTIALS_KEY_FILE: /run/secrets/agent_credentials_key
+    secrets: [database_url, kafka_reader_password, kafka_admin_password, kafka_ca, agent_credentials_key]
   proxy:
     ports:
       - "${HTTP_BIND:-0.0.0.0:80:80}"
@@ -71,6 +86,8 @@ secrets:
     file: ${OIDC_CLIENT_SECRET_FILE:?Set path to protected OIDC client secret}
   external_secret_key:
     file: ${EXTERNAL_SECRET_KEY_FILE:?Set path to protected Fernet key}
+  agent_credentials_key:
+    file: ${AGENT_CREDENTIALS_KEY_FILE:?Set path to protected agent credential encryption key}
   web_certificate:
     file: ${WEB_CERTIFICATE_FILE:?Set path to public web certificate chain}
   web_private_key:

@@ -306,3 +306,68 @@ class Source(TimestampMixin, Base):
     is_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), nullable=False
     )
+
+
+class FluentBitAgent(TimestampMixin, Base):
+    __tablename__ = "fluentbit_agents"
+    __table_args__ = (
+        CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
+        CheckConstraint("state IN ('provisioning', 'ready', 'error', 'revocation_pending', 'revoked')", name="state_valid"),
+        CheckConstraint("access_revision > 0", name="access_revision_positive"),
+        CheckConstraint("btrim(cluster_identity) <> ''", name="cluster_not_blank"),
+        CheckConstraint("state = 'revoked' OR connection_id IS NOT NULL", name="active_has_connection"),
+        {"schema": "app"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    connection_id: Mapped[UUID | None] = mapped_column(ForeignKey("app.kafka_connections.id", ondelete="RESTRICT"))
+    cluster_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, server_default=text("'provisioning'"), nullable=False)
+    access_revision: Mapped[int] = mapped_column(Integer, server_default=text("1"), nullable=False)
+    safe_error: Mapped[str | None] = mapped_column(Text)
+    pending_credentials_ciphertext: Mapped[str | None] = mapped_column(Text)
+
+
+class FluentBitAgentTopic(TimestampMixin, Base):
+    __tablename__ = "fluentbit_agent_topics"
+    __table_args__ = (
+        CheckConstraint("btrim(cluster_identity) <> ''", name="cluster_not_blank"),
+        CheckConstraint("btrim(topic_name) <> ''", name="topic_not_blank"),
+        CheckConstraint("topic_identity IS NULL OR btrim(topic_identity) <> ''", name="topic_identity_not_blank"),
+        CheckConstraint("state IN ('pending', 'ready', 'error', 'removal_pending', 'revocation_pending')", name="state_valid"),
+        CheckConstraint("state <> 'ready' OR topic_identity IS NOT NULL", name="ready_has_identity"),
+        UniqueConstraint("cluster_identity", "topic_name", name="uq_agent_topics_cluster_topic_name"),
+        Index("uq_agent_topics_physical_topic", "cluster_identity", "topic_identity", unique=True,
+              postgresql_where=text("topic_identity IS NOT NULL")),
+        Index("ix_agent_topics_agent_id", "agent_id"),
+        {"schema": "app"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    agent_id: Mapped[UUID] = mapped_column(ForeignKey("app.fluentbit_agents.id", ondelete="RESTRICT"), nullable=False)
+    connection_id: Mapped[UUID] = mapped_column(ForeignKey("app.kafka_connections.id", ondelete="RESTRICT"), nullable=False)
+    source_id: Mapped[UUID] = mapped_column(ForeignKey("app.sources.id", ondelete="RESTRICT"), nullable=False)
+    cluster_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_name: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_identity: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, server_default=text("'pending'"), nullable=False)
+
+
+class KafkaProvisioningOperation(TimestampMixin, Base):
+    __tablename__ = "kafka_provisioning_operations"
+    __table_args__ = (
+        CheckConstraint("kind IN ('register', 'add_topic', 'remove_topic', 'revoke', 'rotate')", name="kind_valid"),
+        CheckConstraint("state IN ('pending', 'running', 'retry', 'succeeded', 'failed')", name="state_valid"),
+        CheckConstraint("attempts >= 0", name="attempts_nonnegative"),
+        Index("ix_kafka_provisioning_operations_queue", "state", "updated_at"),
+        {"schema": "app"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    agent_id: Mapped[UUID] = mapped_column(ForeignKey("app.fluentbit_agents.id", ondelete="RESTRICT"), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, server_default=text("'pending'"), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    request_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    safe_error: Mapped[str | None] = mapped_column(Text)
+    owner_token: Mapped[UUID | None] = mapped_column()

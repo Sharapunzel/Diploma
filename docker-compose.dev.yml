@@ -28,6 +28,11 @@ services:
       OIDC_ERROR_REDIRECT_URL: ${OIDC_ERROR_REDIRECT_URL:-/login?error=oidc}
       SESSION_COOKIE_SECURE: "false"
     expose: ["8000"]
+  provisioner:
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-diploma_user}:${POSTGRES_PASSWORD:-diploma_password}@postgres:5432/${POSTGRES_DB:-diploma_db}
+      ENVIRONMENT: development
+      PROCESS_ROLE: provisioner
   frontend:
     build:
       context: ./frontend

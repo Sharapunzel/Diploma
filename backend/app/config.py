@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     environment: Literal["development", "test", "production"] = "development"
+    process_role: Literal["api", "provisioner"] = "api"
     log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://localhost/diploma_db"
     cors_origins: list[str] = []
@@ -35,6 +36,9 @@ class Settings(BaseSettings):
     kafka_security_protocol: Literal["SASL_PLAINTEXT", "SASL_SSL"] | None = None
     kafka_runtime_username: str | None = None
     kafka_runtime_password_file: Path | None = None
+    kafka_admin_username: str | None = None
+    kafka_admin_password_file: Path | None = None
+    agent_credentials_key_file: Path | None = None
     kafka_ca_file: Path | None = None
     kafka_dev_allowed_bootstrap_servers: list[str] = [
         "127.0.0.1:9092",
@@ -101,6 +105,13 @@ class Settings(BaseSettings):
                 raise ValueError("Kafka runtime credentials are required")
             if self.kafka_security_protocol == "SASL_SSL" and not self.kafka_ca_file:
                 raise ValueError("SASL_SSL requires a Kafka CA file")
+        if self.process_role == "provisioner" and self.environment != "test" and self.kafka_admin_password_file is not None:
+            if not self.kafka_admin_username:
+                raise ValueError("Kafka provisioning admin username is required")
+            if self.agent_credentials_key_file is None:
+                raise ValueError("agent credentials encryption key file is required")
+        if self.process_role == "provisioner" and self.environment == "production" and self.kafka_admin_password_file is None:
+            raise ValueError("production agent provisioning requires Kafka admin credentials")
         if not 0.1 <= self.kafka_consumer_poll_timeout_seconds <= 30:
             raise ValueError("kafka consumer poll timeout must be between 0.1 and 30 seconds")
         if not 0.1 <= self.kafka_consumer_retry_delay_seconds <= 60:

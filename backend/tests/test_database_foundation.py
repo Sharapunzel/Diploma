@@ -27,6 +27,8 @@ ADMIN_PERMISSIONS = [
     "events.read",
     "events.delete",
     "processing_errors.raw.read",
+    "agents.read",
+    "agents.write",
 ]
 GUEST_PERMISSIONS = [
     "users.read",
@@ -35,6 +37,7 @@ GUEST_PERMISSIONS = [
     "sources.read",
     "normalizers.read",
     "events.read",
+    "agents.read",
 ]
 
 
@@ -90,6 +93,43 @@ def expect_constraint(db, statement, parameters=()):
     ):
         db.execute(statement, parameters)
     db.rollback()
+
+
+def test_agent_cluster_route_migration_backfills_without_topics(db, database_urls):
+    sqlalchemy_url, _ = database_urls
+    run_alembic(sqlalchemy_url, "downgrade", "0011_fluentbit_agents")
+    connection_id, agent_id = uuid4(), uuid4()
+    db.execute(
+        "INSERT INTO app.kafka_connections (id, name, cluster_identity, bootstrap_servers) "
+        "VALUES (%s, %s, %s, %s)",
+        (connection_id, f"migration-{uuid4().hex}", "migration-cluster", ["kafka:9092"]),
+    )
+    db.execute(
+        "INSERT INTO app.fluentbit_agents (id, name, state) VALUES (%s, %s, 'ready')",
+        (agent_id, "agent-without-topics"),
+    )
+    db.execute(
+        "INSERT INTO app.kafka_provisioning_operations "
+        "(agent_id, kind, state, request_key, payload) "
+        "VALUES (%s, 'register', 'succeeded', %s, %s)",
+        (
+            agent_id,
+            str(uuid4()),
+            Jsonb({"topics": [{"connection_id": str(connection_id), "cluster_identity": "migration-cluster"}]}),
+        ),
+    )
+    db.commit()
+    run_alembic(sqlalchemy_url, "upgrade", "head")
+    run_alembic(sqlalchemy_url, "check")
+    assert db.execute(
+        "SELECT connection_id, cluster_identity FROM app.fluentbit_agents WHERE id = %s",
+        (agent_id,),
+    ).fetchone() == (connection_id, "migration-cluster")
+    db.rollback()
+    db.execute("DELETE FROM app.kafka_provisioning_operations WHERE agent_id = %s", (agent_id,))
+    db.execute("DELETE FROM app.fluentbit_agents WHERE id = %s", (agent_id,))
+    db.execute("DELETE FROM app.kafka_connections WHERE id = %s", (connection_id,))
+    db.commit()
 
 
 def insert_user(db, **overrides):
