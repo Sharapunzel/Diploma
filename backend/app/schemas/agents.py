@@ -58,6 +58,7 @@ class AgentDTO(BaseModel):
     description: str | None
     state: str
     access_revision: int
+    credentials_claimable: bool
     safe_error: str | None
     operation_id: UUID | None = None
     topics: list[AgentTopicDTO]

@@ -16,9 +16,11 @@ export const Navigation = observer(
   }) => {
     const { session, layout } = useStores();
     const location = useLocation();
-    const selectedPath = location.pathname.startsWith("/normalizers/")
-      ? "/normalizers"
-      : location.pathname;
+    const selectedPath = location.pathname.startsWith("/agents/")
+      ? "/agents"
+      : location.pathname.startsWith("/normalizers/")
+        ? "/normalizers"
+        : location.pathname;
     const groups = availableNavigationGroups((permission) =>
       session.has(permission),
     );

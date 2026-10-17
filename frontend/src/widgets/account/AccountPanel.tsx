@@ -7,6 +7,7 @@ import { useStores } from "../../app/providers/StoresProvider";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
 import { AppRequestError } from "../../app/ui/AppRequestError";
 import { ThemeToggleControl } from "../../app/ui/ThemeToggleControl";
+import { isAgentSecretVisible } from "../../features/agents/activeSecret";
 import styles from "./AccountPanel.module.css";
 
 export const AccountPanel = observer(() => {
@@ -16,6 +17,7 @@ export const AccountPanel = observer(() => {
   const trigger = useRef<HTMLButtonElement>(null);
   const confirmationOpenRef = useRef(false);
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const [secretAtLogout, setSecretAtLogout] = useState(false);
   const [pending, setPending] = useState(false);
   const [logoutError, setLogoutError] = useState<unknown | null>(null);
   const pendingRef = useRef(false);
@@ -57,6 +59,7 @@ export const AccountPanel = observer(() => {
 
   const openConfirmation = () => {
     setLogoutError(null);
+    setSecretAtLogout(isAgentSecretVisible());
     confirmationOpenRef.current = true;
     setConfirmationOpen(true);
   };
@@ -147,7 +150,11 @@ export const AccountPanel = observer(() => {
         open={confirmationOpen}
         pending={pending}
         title="Выйти из аккаунта?"
-        message="Вы действительно хотите завершить текущий сеанс?"
+        message={
+          secretAtLogout
+            ? "Завершить сеанс? Открытая конфигурация агента с одноразовым паролем исчезнет из памяти страницы; повторная выдача невозможна. Сохраните её перед выходом."
+            : "Вы действительно хотите завершить текущий сеанс?"
+        }
         confirmText="Выйти"
         danger
         onCancel={cancelConfirmation}

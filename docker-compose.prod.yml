@@ -11,7 +11,7 @@ services:
       KAFKA_HOST_PORT: ${KAFKA_HOST_PORT:-9094}
       KAFKA_BROKER_PEM_FILE: /run/secrets/kafka_broker_pem
       KAFKA_CA_FILE: /run/secrets/kafka_ca
-    ports: ["${KAFKA_BIND_ADDRESS:-0.0.0.0}:${KAFKA_HOST_PORT:-9094}:9094"]
+    ports: ["${KAFKA_BIND_ADDRESS:-0.0.0.0}:${KAFKA_HOST_PORT:-9094}:${KAFKA_EXTERNAL_PORT:-9094}"]
     secrets: [kafka_admin_password, kafka_reader_password, kafka_broker_pem, kafka_ca]
   kafka-acls:
     environment:
@@ -27,6 +27,8 @@ services:
     environment:
       ENVIRONMENT: production
       KAFKA_SECURITY_PROTOCOL: SASL_SSL
+      KAFKA_AGENT_PUBLIC_HOST: ${KAFKA_PUBLIC_HOST:?Set public DNS name matching the Kafka certificate}
+      KAFKA_AGENT_PUBLIC_PORT: ${KAFKA_HOST_PORT:-9094}
       KAFKA_CA_FILE: /run/secrets/kafka_ca
       DATABASE_URL: ""
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -58,7 +60,12 @@ services:
       DATABASE_URL: ""
       DATABASE_URL_FILE: /run/secrets/database_url
       AGENT_CREDENTIALS_KEY_FILE: /run/secrets/agent_credentials_key
-    secrets: [database_url, kafka_reader_password, kafka_admin_password, kafka_ca, agent_credentials_key]
+      OIDC_STATE_SECRET_FILE: /run/secrets/oidc_state_secret
+      EXTERNAL_SECRET_KEY_FILE: /run/secrets/external_secret_key
+      SESSION_COOKIE_SECURE: "true"
+      TRUSTED_HOSTS: ${PUBLIC_HOST:?Set public web DNS name},localhost
+      FORWARDED_ALLOW_IPS: ${PROXY_IP:-172.30.0.10}
+    secrets: [database_url, kafka_reader_password, kafka_admin_password, kafka_ca, agent_credentials_key, oidc_state_secret, external_secret_key]
   proxy:
     ports:
       - "${HTTP_BIND:-0.0.0.0:80:80}"

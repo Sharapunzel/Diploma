@@ -50,6 +50,11 @@ const EventsPage = lazy(() =>
     default: EventsPage,
   })),
 );
+const AgentsPage = lazy(() =>
+  import("../../pages/agents/AgentsPage").then(({ AgentsPage }) => ({
+    default: AgentsPage,
+  })),
+);
 
 function LoadingStatus() {
   return (
@@ -167,6 +172,8 @@ export function AppRoutes() {
                     <NormalizersPage />
                   ) : page.path === "/events" ? (
                     <EventsPage />
+                  ) : page.path === "/agents" ? (
+                    <AgentsPage />
                   ) : (
                     <PlaceholderPage name={page.label} />
                   )}
@@ -174,6 +181,14 @@ export function AppRoutes() {
               }
             />
           ))}
+          <Route
+            path="/agents/:id"
+            element={
+              <Protected permission="agents.read">
+                <AgentsPage />
+              </Protected>
+            }
+          />
           <Route
             path="/normalizers/new"
             element={

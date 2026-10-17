@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     kafka_admin_password_file: Path | None = None
     agent_credentials_key_file: Path | None = None
     kafka_ca_file: Path | None = None
+    kafka_agent_public_host: str | None = None
+    kafka_agent_public_port: int | None = None
     kafka_dev_allowed_bootstrap_servers: list[str] = [
         "127.0.0.1:9092",
         "localhost:9092",
@@ -105,6 +107,17 @@ class Settings(BaseSettings):
                 raise ValueError("Kafka runtime credentials are required")
             if self.kafka_security_protocol == "SASL_SSL" and not self.kafka_ca_file:
                 raise ValueError("SASL_SSL requires a Kafka CA file")
+        if self.kafka_agent_public_port is not None and not 1 <= self.kafka_agent_public_port <= 65535:
+            raise ValueError("Kafka agent public port is invalid")
+        if self.kafka_agent_public_host and (not self.kafka_agent_public_port or (
+            self.kafka_agent_public_host != "[::1]" and any(
+                char in self.kafka_agent_public_host for char in "/:@ \t\r\n"
+            )
+        )):
+            raise ValueError("Kafka agent public endpoint is invalid")
+        if (self.kafka_agent_public_host and self.kafka_security_protocol == "SASL_PLAINTEXT"
+                and self.kafka_agent_public_host not in {"localhost", "127.0.0.1", "[::1]"}):
+            raise ValueError("Plaintext agent endpoint must use loopback")
         if self.process_role == "provisioner" and self.environment != "test" and self.kafka_admin_password_file is not None:
             if not self.kafka_admin_username:
                 raise ValueError("Kafka provisioning admin username is required")

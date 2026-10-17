@@ -23,6 +23,7 @@ export const navigationGroups = [
         permission: "connections.read",
       },
       { path: "/sources", label: "Источники", permission: "sources.read" },
+      { path: "/agents", label: "Агенты", permission: "agents.read" },
       {
         path: "/normalizers",
         label: "Нормализаторы",

@@ -1,12 +1,12 @@
 services:
   postgres:
     environment:
-      POSTGRES_PASSWORD_FILE: null
+      POSTGRES_PASSWORD_FILE: !reset null
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-diploma_password}
     secrets: []
     ports: ["${POSTGRES_BIND:-127.0.0.1:5432:5432}"]
   kafka:
-    ports: ["${KAFKA_BIND_ADDRESS:-127.0.0.1}:${KAFKA_HOST_PORT:-9092}:9094"]
+    ports: ["${KAFKA_BIND_ADDRESS:-127.0.0.1}:${KAFKA_HOST_PORT:-9092}:${KAFKA_EXTERNAL_PORT:-9094}"]
   migrate:
     environment:
       ENVIRONMENT: development

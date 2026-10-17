@@ -8,6 +8,7 @@ const appPackage = JSON.parse(
 
 export default defineConfig({
   plugins: [react()],
+  cacheDir: process.env.VITE_CACHE_DIR || "node_modules/.vite",
   define: { __APP_VERSION__: JSON.stringify(appPackage.version) },
   server: {
     host: "0.0.0.0",

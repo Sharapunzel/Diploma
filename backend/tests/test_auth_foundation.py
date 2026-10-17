@@ -1612,6 +1612,31 @@ def admin_headers(client, database):
     return {"X-CSRF-Token": client.get("/api/v1/auth/session").json()["csrf_token"]}
 
 
+def test_agent_transport_requires_write_permission_and_exposes_no_secrets(
+    auth_database, auth_settings
+):
+    auth_settings.kafka_security_protocol = "SASL_PLAINTEXT"
+    auth_settings.kafka_runtime_username = "reader"
+    auth_settings.kafka_agent_public_host = "127.0.0.1"
+    auth_settings.kafka_agent_public_port = 9092
+    with TestClient(create_app(auth_settings, database=auth_database)) as client:
+        add_local_user(auth_database)
+        assert login(client).status_code == 200
+        assert client.get("/api/v1/agents/transport").status_code == 403
+        guest_csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+        assert client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": guest_csrf}).status_code == 200
+        headers = admin_headers(client, auth_database)
+        response = client.get("/api/v1/agents/transport", headers=headers)
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.json() == {
+            "bootstrap_server": "127.0.0.1:9092",
+            "security_protocol": "SASL_PLAINTEXT",
+            "ca_pem": None,
+        }
+        assert b"reader" not in response.content
+
+
 def create_normalizer(client, headers, name="normalizer"):
     response = client.post(
         "/api/v1/normalizers",

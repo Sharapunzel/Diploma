@@ -1,4 +1,6 @@
 """Real PostgreSQL/Kafka regressions for interrupted agent provisioning."""
+# Imported pytest fixtures are resolved by name in test function parameters.
+# ruff: noqa: F401, F811
 
 import os
 import threading
@@ -13,6 +15,8 @@ from confluent_kafka.admin import AdminClient, NewTopic
 from sqlalchemy import select
 from test_auth_foundation import admin_headers
 from test_kafka_integration import (
+    integration_client,
+    integration_database,
     kafka_test_admin_config,
     kafka_test_profile,
 )
@@ -24,8 +28,6 @@ from app.models import FluentBitAgent, FluentBitAgentTopic, KafkaProvisioningOpe
 from app.repositories.sqlalchemy.connections import SqlAlchemyKafkaConnectionRepository
 from app.schemas.agents import AgentCreate
 from app.services.implementations.agents import AgentLifecycleServiceImpl
-
-pytest_plugins = ("test_kafka_integration",)
 
 
 def _worker(database, client, admin=None):

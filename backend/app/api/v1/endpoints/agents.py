@@ -1,9 +1,13 @@
+import re
 from uuid import UUID
 
+from cryptography import x509
 from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse
 
-from ....dependencies import get_agent_lifecycle_service, require_permission
+from ....config import Settings
+from ....core.errors import DomainError
+from ....dependencies import get_agent_lifecycle_service, get_settings, require_permission
 from ....schemas.agents import (
     AgentCreate,
     AgentDTO,
@@ -27,6 +31,55 @@ ERRORS = {
     "503": {"model": ErrorResponse},
 }
 
+_CERTIFICATE_BLOCK = re.compile(
+    rb"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----"
+)
+
+
+def _public_ca_bundle(path):
+    try:
+        with path.open("rb") as source:
+            raw = source.read(65537)
+            if source.read(1) or len(raw) > 65536:
+                raise ValueError("CA bundle is too large")
+        matches = list(_CERTIFICATE_BLOCK.finditer(raw))
+        if not matches or _CERTIFICATE_BLOCK.sub(b"", raw).strip():
+            raise ValueError("CA bundle contains non-certificate data")
+        for match in matches:
+            certificate = x509.load_pem_x509_certificate(match.group())
+            constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints)
+            if not constraints.value.ca:
+                raise ValueError("CA bundle contains an end-entity certificate")
+        return raw.decode("ascii")
+    except (OSError, UnicodeError, ValueError, x509.ExtensionNotFound) as error:
+        raise DomainError("agent_transport_unavailable", "Agent CA is unavailable", 503) from error
+
+
+@router.get("/transport", responses=ERRORS)
+def agent_transport(
+    settings: Settings = Depends(get_settings),
+    _: object = Depends(require_permission("agents.write")),
+):
+    """Public Kafka listener and optional trust anchor for a one-time agent config."""
+    if not settings.kafka_agent_public_host or not settings.kafka_agent_public_port:
+        raise DomainError("agent_transport_unavailable", "Agent transport is not configured", 503)
+    protocol = settings.kafka_security_protocol
+    if protocol not in {"SASL_SSL", "SASL_PLAINTEXT"}:
+        raise DomainError("agent_transport_unavailable", "Agent transport is not configured", 503)
+    ca_pem = None
+    if protocol == "SASL_SSL":
+        if not settings.kafka_ca_file:
+            raise DomainError("agent_transport_unavailable", "Agent CA is unavailable", 503)
+        ca_pem = _public_ca_bundle(settings.kafka_ca_file)
+    return JSONResponse(
+        content={
+            "bootstrap_server": f"{settings.kafka_agent_public_host}:{settings.kafka_agent_public_port}",
+            "security_protocol": protocol,
+            "ca_pem": ca_pem,
+        },
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
 
 def agent_dto(value):
     agent, topics = value["agent"], value["topics"]
@@ -37,6 +90,7 @@ def agent_dto(value):
             "description": agent.description,
             "state": agent.state,
             "access_revision": agent.access_revision,
+            "credentials_claimable": agent.state == "ready" and agent.pending_credentials_ciphertext is not None,
             "safe_error": agent.safe_error,
             "operation_id": value.get("operation_id"),
             "topics": [AgentTopicDTO.model_validate(item) for item in topics],

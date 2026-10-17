@@ -14,7 +14,7 @@ describe("navigation groups", () => {
       groups.map((group) => group.pages.map((page) => page.label)),
     ).toEqual([
       ["Главная"],
-      ["Подключения", "Источники", "Нормализаторы", "Диагностика"],
+      ["Подключения", "Источники", "Агенты", "Нормализаторы", "Диагностика"],
       ["События"],
       ["Администрирование", "Настройки приложения"],
     ]);
@@ -25,6 +25,9 @@ describe("navigation groups", () => {
     });
     expect(pages.find((page) => page.path === "/diagnostics")?.permission).toBe(
       "events.read",
+    );
+    expect(pages.find((page) => page.path === "/agents")?.permission).toBe(
+      "agents.read",
     );
   });
 

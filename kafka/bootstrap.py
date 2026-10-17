@@ -52,8 +52,11 @@ def main() -> None:
         raise ValueError("development Kafka must bind only to loopback")
     public_host = required("KAFKA_PUBLIC_HOST")
     public_port = int(required("KAFKA_HOST_PORT"))
+    external_port = int(os.environ.get("KAFKA_EXTERNAL_PORT", "9094"))
     if not 1 <= public_port <= 65535 or any(c in public_host for c in "\r\n, /\\"):
         raise ValueError("invalid advertised Kafka endpoint")
+    if not 1 <= external_port <= 65535 or external_port in {9092, 9093}:
+        raise ValueError("invalid Kafka external listener port")
     admin_name = "diploma-kafka-admin"
     reader_name = "diploma-reader"
     admin_password = secret("KAFKA_ADMIN_PASSWORD_FILE")
@@ -65,7 +68,7 @@ def main() -> None:
         "node.id=1", "process.roles=broker,controller",
         "controller.quorum.voters=1@127.0.0.1:9093",
         "controller.listener.names=CONTROLLER",
-        "listeners=INTERNAL://:9092,CONTROLLER://127.0.0.1:9093,EXTERNAL://:9094",
+        f"listeners=INTERNAL://:9092,CONTROLLER://127.0.0.1:9093,EXTERNAL://:{external_port}",
         f"advertised.listeners=INTERNAL://kafka:9092,EXTERNAL://{public_host}:{public_port}",
         f"listener.security.protocol.map=INTERNAL:{protocol},CONTROLLER:PLAINTEXT,EXTERNAL:{protocol}",
         "inter.broker.listener.name=INTERNAL",
