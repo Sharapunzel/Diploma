@@ -2,6 +2,7 @@
 /AGENTS.md
 /plan.md
 /tasks/
+/.harness/
 __pycache__/
 *.py[cod]
 .pytest_cache/
