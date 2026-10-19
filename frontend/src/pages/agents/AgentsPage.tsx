@@ -16,7 +16,13 @@ import {
 } from "antd";
 import { observer } from "mobx-react-lite";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { AgentsApi, type AgentTopicInput } from "../../app/api/agents";
+import {
+  AgentsApi,
+  type AgentCredentials,
+  type AgentTopicInput,
+  type AgentTransport,
+  type Agent as AgentRecord,
+} from "../../app/api/agents";
 import { ApiError } from "../../app/api/client";
 import {
   ResourcesApi,
@@ -26,7 +32,13 @@ import {
 import { useStores } from "../../app/providers/StoresProvider";
 import { AppRequestError } from "../../app/ui/AppRequestError";
 import { AgentStore } from "../../features/agents/AgentStore";
-import { fluentBitConfig } from "../../features/agents/fluentBitConfig";
+import {
+  fluentBitConfig,
+  agentHostPlatform,
+  type AgentInputKind,
+  type AgentInputSelection,
+  type AgentHostPlatform,
+} from "../../features/agents/fluentBitConfig";
 import { setAgentSecretVisible } from "../../features/agents/activeSecret";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
 import styles from "./AgentsPage.module.css";
@@ -99,6 +111,22 @@ export const AgentsPage = observer(() => {
   const [ownedTopics, setOwnedTopics] = useState<Set<string>>(new Set());
   const [optionError, setOptionError] = useState<unknown>(null);
   const [config, setConfig] = useState<string | null>(null);
+  const [configCredentials, setConfigCredentials] =
+    useState<AgentCredentials | null>(null);
+  const [configAgent, setConfigAgent] = useState<AgentRecord | null>(null);
+  const [configTransport, setConfigTransport] = useState<AgentTransport | null>(
+    null,
+  );
+  const [inputSelections, setInputSelections] = useState<AgentInputSelection>(
+    {},
+  );
+  const [inputError, setInputError] = useState("");
+  const [hostPlatform, setHostPlatform] = useState<AgentHostPlatform>("linux");
+  const [templateConfig, setTemplateConfig] = useState<string | null>(null);
+  const [templateOpen, setTemplateOpen] = useState(false);
+  const [templatePending, setTemplatePending] = useState(false);
+  const [templateError, setTemplateError] = useState<unknown>(null);
+  const [templateWarning, setTemplateWarning] = useState(false);
   const [ca, setCa] = useState<string | null>(null);
   const [claimPending, setClaimPending] = useState(false);
   const [claimError, setClaimError] = useState<unknown>(null);
@@ -135,6 +163,9 @@ export const AgentsPage = observer(() => {
   ]);
   useEffect(() => {
     setConfig(null);
+    setConfigCredentials(null);
+    setConfigAgent(null);
+    setConfigTransport(null);
     setCa(null);
     setClaimError(null);
     setClaimWarning("");
@@ -143,6 +174,71 @@ export const AgentsPage = observer(() => {
     setAgentSecretVisible(!!config);
     return () => setAgentSecretVisible(false);
   }, [config]);
+  useEffect(() => {
+    if (!configCredentials || !configAgent || !configTransport) return;
+    try {
+      setConfig(
+        fluentBitConfig(
+          configAgent,
+          configCredentials,
+          configTransport,
+          inputSelections,
+          hostPlatform,
+        ),
+      );
+    } catch (error) {
+      setInputError(
+        error instanceof Error
+          ? error.message
+          : "Не удалось собрать конфигурацию.",
+      );
+    }
+  }, [
+    configCredentials,
+    configAgent,
+    configTransport,
+    inputSelections,
+    hostPlatform,
+  ]);
+  function selectInput(topicId: string, value: AgentInputKind) {
+    const next = { ...inputSelections, [topicId]: value };
+    const kinds =
+      (configAgent ?? agent)?.topics.map((topic) => next[topic.id] ?? "tail") ??
+      [];
+    try {
+      const nextPlatform =
+        value === "winevtlog"
+          ? "windows"
+          : value === "systemd"
+            ? "linux"
+            : hostPlatform;
+      agentHostPlatform(kinds, nextPlatform);
+      setInputError("");
+      setInputSelections(next);
+      setHostPlatform(nextPlatform);
+    } catch (error) {
+      setInputError(
+        error instanceof Error ? error.message : "Несовместимые входы.",
+      );
+    }
+  }
+  function selectHostPlatform(value: AgentHostPlatform) {
+    try {
+      agentHostPlatform(
+        ((configAgent ?? agent)?.topics ?? []).map(
+          (topic) => inputSelections[topic.id] ?? "tail",
+        ),
+        value,
+      );
+      setHostPlatform(value);
+      setInputError("");
+    } catch (error) {
+      setInputError(
+        error instanceof Error ? error.message : "Несовместимая ОС агента.",
+      );
+    }
+  }
+  const selectedPlatform = hostPlatform;
   useEffect(() => {
     if (agent && agent.id === id)
       editForm.setFieldsValue({
@@ -438,6 +534,8 @@ export const AgentsPage = observer(() => {
           password: "preflight-password",
         },
         transport,
+        inputSelections,
+        hostPlatform,
       );
       if (
         claimContext.current.id !== expected.id ||
@@ -456,7 +554,16 @@ export const AgentsPage = observer(() => {
           );
         return;
       }
-      const rendered = fluentBitConfig(snapshot, credentials, transport);
+      const rendered = fluentBitConfig(
+        snapshot,
+        credentials,
+        transport,
+        inputSelections,
+        hostPlatform,
+      );
+      setConfigCredentials(credentials);
+      setConfigAgent(snapshot);
+      setConfigTransport(transport);
       setConfig(rendered);
       setCa(transport.ca_pem);
       if (
@@ -479,6 +586,40 @@ export const AgentsPage = observer(() => {
         );
     } finally {
       setClaimPending(false);
+    }
+  }
+  async function previewTemplate() {
+    if (!id || !canWrite || templatePending) return;
+    setTemplatePending(true);
+    setTemplateError(null);
+    try {
+      const [snapshot, transport] = await Promise.all([
+        agentsApi.get(id),
+        agentsApi.transport(),
+      ]);
+      const changedSinceCard =
+        snapshot.access_revision !== agent?.access_revision ||
+        snapshot.topics
+          .map((topic) => `${topic.id}:${topic.topic_name}`)
+          .join("|") !==
+          (agent?.topics
+            .map((topic) => `${topic.id}:${topic.topic_name}`)
+            .join("|") ?? "");
+      setTemplateWarning(changedSinceCard);
+      setTemplateConfig(
+        fluentBitConfig(
+          snapshot,
+          null,
+          transport,
+          inputSelections,
+          hostPlatform,
+        ),
+      );
+      setTemplateOpen(true);
+    } catch (error) {
+      setTemplateError(error);
+    } finally {
+      setTemplatePending(false);
     }
   }
   function download(name: string, content: string) {
@@ -662,6 +803,31 @@ export const AgentsPage = observer(() => {
             columns={[
               { title: "Топик", dataIndex: "topic_name" },
               {
+                title: "Вход Fluent Bit",
+                dataIndex: "id",
+                render: (topicId: string, row) => (
+                  <Select<AgentInputKind>
+                    aria-label={`Вход Fluent Bit для топика ${row.topic_name}`}
+                    value={inputSelections[topicId] ?? "tail"}
+                    disabled={!canWrite}
+                    className={styles.connection}
+                    options={[
+                      { value: "tail", label: "Файл (tail)" },
+                      {
+                        value: "winevtlog",
+                        label: "Журнал Windows (winevtlog)",
+                      },
+                      {
+                        value: "systemd",
+                        label: "Linux journald (systemd)",
+                      },
+                      { value: "other", label: "Другой вход" },
+                    ]}
+                    onChange={(value) => selectInput(topicId, value)}
+                  />
+                ),
+              },
+              {
                 title: "Состояние",
                 dataIndex: "state",
                 render: (state: string) => stateLabel[state] ?? state,
@@ -701,6 +867,32 @@ export const AgentsPage = observer(() => {
                   ) : null,
               },
             ]}
+          />
+          <Alert
+            type="info"
+            showIcon
+            message="Настройте каждый вход отдельно"
+            description={
+              <ul>
+                <li>
+                  Файл: укажите путь службы. Read_from_Head On читает и старые
+                  строки; DB хранит позицию между перезапусками.
+                </li>
+                <li>
+                  Windows: укажите каналы и проверьте права чтения; DB хранит
+                  позицию событий.
+                </li>
+                <li>
+                  journald: выберите unit и сохраните DB cursor в постоянном
+                  каталоге. Исходное время события остаётся в строке log, а
+                  timestamp получает время обработки агентом.
+                </li>
+                <li>
+                  Другой вход: замените секцию INPUT и адаптируйте пример FILTER
+                  так, чтобы на выходе оставалось строковое поле log.
+                </li>
+              </ul>
+            }
           />
           {canWrite && agent.state !== "revoked" && (
             <Space wrap>
@@ -750,6 +942,38 @@ export const AgentsPage = observer(() => {
               Получить конфигурацию
             </Button>
           )}
+          {canWrite && agent.state === "ready" && !config && (
+            <Space wrap>
+              <Button
+                loading={templatePending}
+                onClick={() => void previewTemplate()}
+              >
+                Просмотреть шаблон
+              </Button>
+            </Space>
+          )}
+          {templateError != null && (
+            <AppRequestError
+              error={templateError}
+              onRetry={() => void previewTemplate()}
+            />
+          )}
+          <Select<AgentHostPlatform>
+            aria-label="ОС хоста агента"
+            value={hostPlatform}
+            disabled={!canWrite}
+            options={[
+              { value: "linux", label: "Linux" },
+              { value: "windows", label: "Windows" },
+            ]}
+            onChange={selectHostPlatform}
+          />
+          <Alert
+            type="info"
+            showIcon
+            message={`Один конфиг работает на одном хосте: ${selectedPlatform === "windows" ? "Windows" : "Linux"}. Каталоги состояния и CA должны существовать и быть доступны учётной записи Fluent Bit.`}
+          />
+          {inputError && <Alert type="error" showIcon message={inputError} />}
           {claimError != null && (
             <AppRequestError
               error={claimError}
@@ -880,6 +1104,37 @@ export const AgentsPage = observer(() => {
         </Form>
       </Modal>
       <Modal
+        open={templateOpen}
+        title="Шаблон конфигурации Fluent Bit"
+        width={850}
+        onCancel={() => setTemplateOpen(false)}
+        footer={null}
+        destroyOnHidden
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message="Это шаблон без пароля. Он не авторизует агента. Если меняете вход, подставьте пароль из ранее безопасно сохранённого конфига. При утрате пароля выполните явный перевыпуск доступа."
+          description="Шаблон построен заново по текущим назначениям и выбранным входам. Он не считывает файл, установленный на хосте агента, и может отличаться от него."
+        />
+        {templateWarning && (
+          <Alert
+            type="warning"
+            showIcon
+            message="С момента загрузки карточки изменились ревизия доступа или назначения. Ранее установленный конфиг может отличаться."
+          />
+        )}
+        <pre className={styles.config}>{templateConfig}</pre>
+        <Button
+          onClick={() =>
+            templateConfig &&
+            download("fluent-bit-template.conf", templateConfig)
+          }
+        >
+          Скачать шаблон без пароля
+        </Button>
+      </Modal>
+      <Modal
         open={!!config}
         title="Однократная конфигурация Fluent Bit"
         width={850}
@@ -891,6 +1146,9 @@ export const AgentsPage = observer(() => {
             label: "Закрыть",
             execute: async () => {
               setConfig(null);
+              setConfigCredentials(null);
+              setConfigAgent(null);
+              setConfigTransport(null);
               setCa(null);
             },
           })
@@ -902,6 +1160,32 @@ export const AgentsPage = observer(() => {
           showIcon
           message="Содержит пароль. Сохраните файл с правами только для владельца; после ухода он не появится снова."
         />
+        {configAgent && (
+          <Space direction="vertical" style={{ width: "100%", marginTop: 16 }}>
+            {configAgent.topics.map((topic) => (
+              <Select<AgentInputKind>
+                key={topic.id}
+                aria-label={`Вход Fluent Bit для топика ${topic.topic_name}`}
+                value={inputSelections[topic.id] ?? "tail"}
+                disabled={!canWrite}
+                style={{ width: "100%" }}
+                options={[
+                  { value: "tail", label: "Файл (tail)" },
+                  { value: "winevtlog", label: "Журнал Windows (winevtlog)" },
+                  { value: "systemd", label: "Linux journald (systemd)" },
+                  { value: "other", label: "Другой вход" },
+                ]}
+                onChange={(value) => selectInput(topic.id, value)}
+              />
+            ))}
+          </Space>
+        )}
+        <Alert
+          type="info"
+          showIcon
+          message={`ОС агента: ${selectedPlatform === "windows" ? "Windows" : "Linux"}. Каталоги состояния и CA должны быть доступны Fluent Bit.`}
+        />
+        {inputError && <Alert type="error" showIcon message={inputError} />}
         <pre className={styles.config}>{config}</pre>
         <Space wrap>
           <Button onClick={() => config && download("fluent-bit.conf", config)}>

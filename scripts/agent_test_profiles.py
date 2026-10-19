@@ -8,6 +8,7 @@ smoke-production. Docker profiles use a unique Compose project and remove it in 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import http.cookiejar
 import json
@@ -386,6 +387,70 @@ def smoke_http(env: dict[str, str], production: bool) -> None:
     print(f"Proxy smoke passed: {url} (API{' and frontend' if not production else ''})", flush=True)
 
 
+def systemd_filter_smoke(env: dict[str, str], run: Path) -> None:
+    """Run the exact inline Lua callback from the generated template on a synthetic journal record."""
+    source = (ROOT / "frontend/src/features/agents/fluentBitConfig.ts").read_text(encoding="utf-8")
+    code_line = next(
+        (line.strip().rstrip(",") for line in source.splitlines()
+         if 'Code function diploma_systemd_envelope(' in line),
+        None,
+    )
+    if code_line is None:
+        raise RuntimeError("Generated systemd inline Code callback was not found")
+    code = ast.literal_eval(code_line)[len("    Code "):]
+    config = "\n".join([
+        "[SERVICE]", "    Flush 1", "    Log_Level info", "",
+        "[INPUT]", "    Name dummy", "    Tag diploma.agent.systemd-smoke",
+        '    Dummy {"MESSAGE":"synthetic journal message","_SYSTEMD_UNIT":"sample.service","PRIORITY":"6","_PID":"42","SYSLOG_IDENTIFIER":"sample"}',
+        "    Start_time_sec 946684800",  # 2000-01-01: deliberately older than processing time
+        "    Samples 1", "",
+        "[FILTER]", "    Name lua", "    Match diploma.agent.systemd-smoke",
+        "    Call diploma_systemd_envelope", f"    Code {code}", "",
+        "[OUTPUT]", "    Name stdout", "    Match diploma.agent.systemd-smoke", "    Format json_lines", "",
+        "    Json_Date_Key timestamp", "    Json_Date_Format iso8601", "",
+    ])
+    config_path = run / "systemd-filter-smoke.conf"
+    config_path.write_text(config, encoding="utf-8")
+    container = env["COMPOSE_PROJECT_NAME"] + "_systemd_smoke"
+    command([
+        "docker", "run", "-d", "--name", container, "--label",
+        f"task21.project={env['COMPOSE_PROJECT_NAME']}", "--memory", "128m", "--cpus", "1",
+        "-v", f"{config_path.resolve()}:/test/fluent-bit.conf:ro",
+        "fluent/fluent-bit:4.2.3", "-c", "/test/fluent-bit.conf",
+    ], env=env)
+    result = ""
+    try:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            result = command(["docker", "logs", container], env=env, capture=True)
+            if '"log"' in result:
+                break
+            time.sleep(0.5)
+    finally:
+        command(["docker", "rm", "-f", container], env=env)
+    records = []
+    for line in result.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and "log" in record:
+            records.append(record)
+    if len(records) != 1 or not isinstance(records[0].get("log"), str):
+        raise RuntimeError("Fluent Bit systemd callback did not emit one string log record")
+    if set(records[0]) != {"timestamp", "log"} or not isinstance(records[0]["timestamp"], str):
+        raise RuntimeError("Fluent Bit systemd callback did not emit the {timestamp, log} envelope")
+    envelope_time = datetime.fromisoformat(records[0]["timestamp"].replace("Z", "+00:00"))
+    now = datetime.now(UTC)
+    if not now - timedelta(seconds=30) <= envelope_time <= now + timedelta(seconds=5):
+        raise RuntimeError("Fluent Bit systemd envelope timestamp is not processing time")
+    log = records[0]["log"]
+    for value in ("synthetic journal message", "sample.service", "priority=6", "pid=42", "identifier=sample", "journal_time=2000-01-01T00:00:00Z"):
+        if value not in log:
+            raise RuntimeError(f"Fluent Bit systemd callback omitted expected field: {value}")
+    print("Fluent Bit 4.2.3 systemd inline Lua smoke passed on synthetic journald input", flush=True)
+
+
 def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path) -> None:
     """Use the real UI, Fluent Bit, Kafka and PostgreSQL on the same isolated Compose network."""
     password = secrets.token_urlsafe(24)
@@ -406,6 +471,7 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
         "raise SystemExit(cli.create_admin('task21admin','Task 21 admin'))"
     )
     command([sys.executable, "-c", create], env=profile_env, cwd=ROOT / "backend")
+    systemd_filter_smoke(env, run)
     command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "playwright")],
             env=profile_env, cwd=ROOT / "frontend")
     agent = json.loads((run / "agent.json").read_text(encoding="utf-8"))
@@ -417,6 +483,8 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
         raise RuntimeError("UI configuration does not use the advertised external listener")
     (run / "input.log").write_text("task21 smoke event\n", encoding="utf-8")
     (run / "input-2.log").write_text("", encoding="utf-8")
+    state_dir = run / "fluent-bit-state"
+    state_dir.mkdir()
     kafka_container = command([*compose, "ps", "-q", "kafka"], env=env, capture=True).strip()
     if not kafka_container:
         raise RuntimeError("Kafka container is unavailable for the external-listener agent check")
@@ -426,6 +494,7 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
               "-v", f"{(run / 'fluent-bit.conf').resolve()}:/test/fluent-bit.conf:ro",
               "-v", f"{(run / 'input.log').resolve()}:/REPLACE/WITH/SERVICE_1.log:ro",
               "-v", f"{(run / 'input-2.log').resolve()}:/REPLACE/WITH/SERVICE_2.log:ro",
+              "-v", f"{state_dir.resolve()}:/var/lib/fluent-bit",
               image, "-c", "/test/fluent-bit.conf"]
     command([*common, "-D"], env=env)
     container = project + "_fluentbit"
@@ -435,6 +504,7 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
                  "-v", f"{(run / 'fluent-bit.conf').resolve()}:/test/fluent-bit.conf:ro",
                  "-v", f"{(run / 'input.log').resolve()}:/REPLACE/WITH/SERVICE_1.log:ro",
                  "-v", f"{(run / 'input-2.log').resolve()}:/REPLACE/WITH/SERVICE_2.log:ro",
+                 "-v", f"{state_dir.resolve()}:/var/lib/fluent-bit",
                  image, "-c", "/test/fluent-bit.conf"], env=env)
         options = {
             "bootstrap.servers": env["KAFKA_TEST_BOOTSTRAP_SERVERS"],
@@ -459,6 +529,19 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
                 if payload.get("log", "").strip() == "task21 smoke event" and payload.get("timestamp"):
                     break
             else:
+                diagnostic = subprocess.run(
+                    ["docker", "logs", container], cwd=ROOT, env=env,
+                    check=False, text=True, capture_output=True,
+                )
+                agent_password = next(
+                    (line.strip().partition(" ")[2] for line in rendered.splitlines()
+                     if line.strip().startswith("rdkafka.sasl.password ")),
+                    "",
+                )
+                agent_logs = (diagnostic.stdout + diagnostic.stderr).replace(
+                    agent_password, "[REDACTED]",
+                ) if agent_password else diagnostic.stdout + diagnostic.stderr
+                print("Fluent Bit container log (secrets redacted):\n" + agent_logs[-12000:], file=sys.stderr)
                 raise RuntimeError("Fluent Bit record did not reach the assigned Kafka topic")
         finally:
             consumer.close()
@@ -565,12 +648,15 @@ def tls_agent_smoke(compose: list[str], project: str, env: dict[str, str], run: 
     if expected not in rendered or "rdkafka.security.protocol SASL_SSL" not in rendered:
         raise RuntimeError("Rendered TLS config does not use the external TLS listener")
     (run / "input.log").write_text("task21 TLS smoke event\n", encoding="utf-8")
+    state_dir = run / "fluent-bit-state"
+    state_dir.mkdir()
     kafka_container = command([*compose, "ps", "-q", "kafka"], env=env, capture=True).strip()
     if not kafka_container:
         raise RuntimeError("Kafka container is unavailable for the TLS agent check")
     image = "fluent/fluent-bit:4.2.3"
     volumes = ["-v", f"{(run / 'fluent-bit.conf').resolve()}:/test/fluent-bit.conf:ro",
                "-v", f"{(run / 'input.log').resolve()}:/REPLACE/WITH/SERVICE_1.log:ro",
+               "-v", f"{state_dir.resolve()}:/var/lib/fluent-bit",
                "-v", f"{(run / 'diploma-kafka-ca.pem').resolve()}:/etc/fluent-bit/diploma-kafka-ca.pem:ro"]
     base = ["docker", "run", "--rm", "--memory", "256m", "--cpus", "1",
             "--network", f"container:{kafka_container}", *volumes,

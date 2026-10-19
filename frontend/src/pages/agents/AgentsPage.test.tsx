@@ -340,6 +340,114 @@ describe("AgentsPage", () => {
     ).toHaveLength(1);
     expect(screen.getByText(/rdkafka.sasl.password secret/)).toBeDefined();
   });
+  it("previews a password-free template repeatedly without claiming credentials", async () => {
+    const request = setup(true);
+    const preview = await screen.findByRole("button", {
+      name: "Просмотреть шаблон",
+    });
+    await userEvent.click(preview);
+    expect(
+      await screen.findByText(/Шаблон конфигурации Fluent Bit/),
+    ).toBeDefined();
+    expect(screen.getByText(/__REPLACE_WITH_AGENT_PASSWORD__/)).toBeDefined();
+    expect(screen.queryByText(/rdkafka.sasl.password secret/)).toBeNull();
+    expect(
+      request.mock.calls.some(
+        ([path]) => path === "/agents/a/credentials/claim",
+      ),
+    ).toBe(false);
+    expect(sessionStorage.length).toBe(0);
+    const dialog = screen.getByRole("dialog", {
+      name: "Шаблон конфигурации Fluent Bit",
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close" }),
+    );
+    await userEvent.click(preview);
+    expect(
+      await screen.findByText(/__REPLACE_WITH_AGENT_PASSWORD__/),
+    ).toBeDefined();
+    expect(
+      request.mock.calls.filter(
+        ([path]) => path === "/agents/a/credentials/claim",
+      ),
+    ).toHaveLength(0);
+  });
+  it("keeps input choices per topic and claims once after selecting an input", async () => {
+    const multiTopicAgent = {
+      ...agent,
+      topics: [
+        agent.topics[0],
+        { ...agent.topics[0], id: "t2", topic_name: "audit" },
+      ],
+    };
+    const request = setup(true, multiTopicAgent);
+    await userEvent.click(
+      await screen.findByRole("combobox", {
+        name: "Вход Fluent Bit для топика logs",
+      }),
+    );
+    await userEvent.click(
+      await screen.findByText("Журнал Windows (winevtlog)", { exact: true }),
+    );
+    expect(
+      within(screen.getByRole("row", { name: /audit/ })).getAllByText(
+        "Файл (tail)",
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(
+      within(screen.getByRole("row", { name: /logs/ })).getAllByText(
+        "Журнал Windows (winevtlog)",
+      ).length,
+    ).toBeGreaterThan(0);
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Получить конфигурацию" }),
+    );
+    const configDialog = await screen.findByRole("dialog", {
+      name: "Однократная конфигурация Fluent Bit",
+    });
+    await userEvent.click(
+      within(configDialog).getByRole("combobox", {
+        name: "Вход Fluent Bit для топика logs",
+      }),
+    );
+    const systemdOptions = await screen.findAllByText(
+      "Linux journald (systemd)",
+      { exact: true },
+    );
+    await userEvent.click(
+      systemdOptions
+        .filter((element) =>
+          element.classList.contains("ant-select-item-option-content"),
+        )
+        .at(-1)!,
+    );
+    expect(
+      within(configDialog).getByText(/Systemd_Filter _SYSTEMD_UNIT/),
+    ).toBeDefined();
+    expect(
+      within(configDialog).getByText(/Call diploma_systemd_envelope/),
+    ).toBeDefined();
+    expect(within(configDialog).getByText(/journal_time=/)).toBeDefined();
+    expect(
+      screen.getByText(/Исходное время события остаётся в строке log/),
+    ).toBeDefined();
+    expect(screen.getByText(/время обработки агентом/)).toBeDefined();
+    expect(
+      screen.getByText(/выберите unit и сохраните DB cursor/),
+    ).toBeDefined();
+    expect(
+      within(configDialog).getByText(/rdkafka.sasl.password secret/),
+    ).toBeDefined();
+    expect(
+      screen.getByText(/Path \/REPLACE\/WITH\/SERVICE_2.log/),
+    ).toBeDefined();
+    expect(
+      request.mock.calls.filter(
+        ([path]) => path === "/agents/a/credentials/claim",
+      ),
+    ).toHaveLength(1);
+  });
   it("does not consume credentials when the configuration preflight fails", async () => {
     const request = setup(true, {
       ...agent,
@@ -349,6 +457,74 @@ describe("AgentsPage", () => {
       await screen.findByRole("button", { name: "Получить конфигурацию" }),
     );
     expect(await screen.findByText(/Пароль не запрашивался/)).toBeDefined();
+    expect(
+      request.mock.calls.some(
+        ([path]) => path === "/agents/a/credentials/claim",
+      ),
+    ).toBe(false);
+  });
+  it("rejects a mixed Windows and Linux input choice before claiming", async () => {
+    const multiTopicAgent = {
+      ...agent,
+      topics: [
+        agent.topics[0],
+        { ...agent.topics[0], id: "t2", topic_name: "audit" },
+      ],
+    };
+    const request = setup(true, multiTopicAgent);
+    await userEvent.click(
+      await screen.findByRole("combobox", {
+        name: "Вход Fluent Bit для топика logs",
+      }),
+    );
+    await userEvent.click(
+      await screen.findByText("Журнал Windows (winevtlog)", { exact: true }),
+    );
+    await userEvent.click(
+      screen.getByRole("combobox", {
+        name: "Вход Fluent Bit для топика audit",
+      }),
+    );
+    const systemdOptions = await screen.findAllByText(
+      "Linux journald (systemd)",
+      { exact: true },
+    );
+    await userEvent.click(
+      systemdOptions
+        .filter((element) =>
+          element.classList.contains("ant-select-item-option-content"),
+        )
+        .at(-1)!,
+    );
+    expect(await screen.findByText(/одной ОС/)).toBeDefined();
+    expect(
+      request.mock.calls.some(
+        ([path]) => path === "/agents/a/credentials/claim",
+      ),
+    ).toBe(false);
+    expect(
+      within(screen.getByRole("row", { name: /audit/ })).getAllByText(
+        "Файл (tail)",
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+  it("previews a Windows tail-only config before the one-time claim", async () => {
+    const request = setup(true);
+    await userEvent.click(
+      await screen.findByRole("combobox", { name: "ОС хоста агента" }),
+    );
+    await userEvent.click(await screen.findByText("Windows", { exact: true }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Просмотреть шаблон" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Шаблон конфигурации Fluent Bit",
+    });
+    expect(
+      within(dialog).getByText(
+        /DB C:\/ProgramData\/FluentBit\/state\/logs-t.db/,
+      ),
+    ).toBeDefined();
     expect(
       request.mock.calls.some(
         ([path]) => path === "/agents/a/credentials/claim",
