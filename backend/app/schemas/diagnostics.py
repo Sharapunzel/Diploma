@@ -38,6 +38,16 @@ class SourceStatePage(Page):
     items: list[SourceState]
 
 
+class SourceTopology(BaseModel):
+    source_id: UUID
+    normalizer_id: UUID | None
+    normalizer_name: str | None
+    agent_id: UUID | None
+    agent_name: str | None
+    agent_state: str | None
+    assignment_state: str | None
+
+
 class ProcessingErrorDTO(BaseModel):
     id: UUID
     source_id: UUID | None

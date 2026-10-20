@@ -8,12 +8,14 @@ from ...schemas.diagnostics import (
     ProcessingErrorPage,
     RawPayloadDTO,
     SourceStatePage,
+    SourceTopology,
 )
 
 
 class DiagnosticsService(Protocol):
-    def source_states(self, limit: int, offset: int) -> SourceStatePage: ...
+    def source_states(self, limit: int, offset: int, q: str = "") -> SourceStatePage: ...
     def source_state(self, source_id: UUID): ...
+    def source_topology(self, source_id: UUID) -> SourceTopology: ...
     def errors(
         self,
         source_id: UUID | None,

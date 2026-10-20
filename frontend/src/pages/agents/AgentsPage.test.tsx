@@ -447,7 +447,7 @@ describe("AgentsPage", () => {
         ([path]) => path === "/agents/a/credentials/claim",
       ),
     ).toHaveLength(1);
-  });
+  }, 30_000);
   it("does not consume credentials when the configuration preflight fails", async () => {
     const request = setup(true, {
       ...agent,

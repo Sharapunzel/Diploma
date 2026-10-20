@@ -14,6 +14,7 @@ import http.cookiejar
 import json
 import os
 import secrets
+import shlex
 import socket
 import ssl
 import subprocess
@@ -37,6 +38,15 @@ from cryptography.x509.oid import NameOID
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker-compose.yml")]
 NPM = "npm.cmd" if os.name == "nt" else "npm"
+
+
+def pytest_addopts(run: Path) -> str:
+    """Keep pytest's temporary files inside the run directory on every host OS."""
+    base_temp = (run / "pytest").as_posix()
+    options = f'-p no:cacheprovider --basetemp="{base_temp}"'
+    if f"--basetemp={base_temp}" not in shlex.split(options):
+        raise RuntimeError("Pytest temporary path was not preserved")
+    return options
 
 
 def command(args: list[str], *, env: dict[str, str], cwd: Path = ROOT, capture=False):
@@ -134,10 +144,22 @@ def remove_new_images(before: dict, env: dict[str, str], project: str) -> None:
 
 
 def compare_inventory(before: dict, after: dict, project: str) -> None:
-    for kind in ("containers", "networks", "volumes", "images", "builders", "default_cache"):
+    for kind in ("containers", "volumes", "images", "builders", "default_cache"):
         added = set(after[kind]) - set(before[kind])
         if added:
             raise RuntimeError(f"Resources remain after {project}: {kind}={sorted(added)[:8]}")
+    builtin_networks = {"bridge", "host", "none"}
+    before_networks = {
+        item for item in before["networks"] if item.split(" ", 1)[1] not in builtin_networks
+    }
+    after_networks = {
+        item for item in after["networks"] if item.split(" ", 1)[1] not in builtin_networks
+    }
+    added_networks = after_networks - before_networks
+    if added_networks:
+        raise RuntimeError(
+            f"Resources remain after {project}: networks={sorted(added_networks)[:8]}"
+        )
 
 
 def frontend_artifact_snapshot() -> dict[str, tuple[int, str]]:
@@ -201,7 +223,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
            "TEMP": str(run), "TMP": str(run), "TMPDIR": str(run),
            "PYTHONDONTWRITEBYTECODE": "1", "PIP_CACHE_DIR": str(run / "pip-cache"),
            "npm_config_cache": str(run / "npm-cache"),
-           "PYTEST_ADDOPTS": f"-p no:cacheprovider --basetemp={run / 'pytest'}",
+           "PYTEST_ADDOPTS": pytest_addopts(run),
            "TEST_DATABASE_URL": f"postgresql+psycopg://diploma_user:{db_password}@127.0.0.1:{db_port}/diploma_test",
            "KAFKA_TEST_BOOTSTRAP_SERVERS": f"127.0.0.1:{kafka_port}",
            "KAFKA_TEST_SECURITY_PROTOCOL": "SASL_PLAINTEXT",
@@ -599,6 +621,9 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
             "kind": "map_ecs", "target": "message", "source": {"ref": "log"},
             "required": True}]}]}
     normalizer = request("/normalizers", "POST", {"name": "Task 21 normalizer", "rule": rule}, csrf)
+    agent_artifact = json.loads((run / "agent.json").read_text(encoding="utf-8"))
+    agent_artifact["normalizerId"] = normalizer["id"]
+    (run / "agent.json").write_text(json.dumps(agent_artifact), encoding="utf-8")
     source = agent["sourceId"]
     request(f"/sources/{source}/normalizer", "PUT", {"normalizer_id": normalizer["id"]}, csrf)
     request(f"/sources/{source}/enable", "POST", csrf=csrf)
@@ -617,9 +642,41 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
             time.sleep(1)
         else:
             raise RuntimeError("The source did not persist the normalized event in PostgreSQL")
+        diagnostic_delivery = []
+        diagnostic_producer = Producer({**agent_options, "message.timeout.ms": 10000})
+        diagnostic_producer.produce(topic, b"task23-invalid-envelope", callback=lambda error, _: diagnostic_delivery.append(error))
+        diagnostic_producer.flush(15)
+        if diagnostic_delivery != [None]:
+            raise RuntimeError("The synthetic malformed Kafka record was not delivered")
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            with engine.connect() as connection:
+                error_count = connection.execute(sql_text(
+                    "SELECT count(*) FROM logs.processing_errors WHERE source_identity=:id AND stage='decode'"
+                ), {"id": source}).scalar_one()
+            if error_count:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("The malformed Kafka record did not produce a saved decode error")
+        with engine.begin() as connection:
+            inserted = connection.execute(sql_text(
+                "INSERT INTO logs.kafka_operational_events "
+                "(kind, reason_code, source_id, source_identity, source_name, connection_id, "
+                "connection_identity, connection_name, cluster_identity, topic_name, "
+                "old_topic_identity, kafka_partition, offset_start, offset_end) "
+                "SELECT 'retention_gap', 'retention_gap_detected', s.id, s.id, s.name, "
+                "s.connection_id, s.connection_id, c.name, a.cluster_identity, s.topic_name, "
+                "s.kafka_topic_identity, 0, 1000000, 1000002 "
+                "FROM app.sources s JOIN app.kafka_connections c ON c.id=s.connection_id "
+                "JOIN app.fluentbit_agents a ON a.id=:agent_id WHERE s.id=:source_id"
+            ), {"agent_id": agent["agentId"], "source_id": source})
+            if inserted.rowcount != 1:
+                raise RuntimeError("The synthetic Kafka history event was not saved")
     finally:
         engine.dispose()
     profile_env["TASK21_PHASE"] = "verify"
+    profile_env["TASK23_DIAGNOSTIC_FIXTURES"] = "1"
     command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "playwright")],
             env=profile_env, cwd=ROOT / "frontend")
     print("UI Events page shows the normalized PostgreSQL record", flush=True)
@@ -707,7 +764,7 @@ def main() -> None:
     env = {**os.environ, "TEMP": str(run), "TMP": str(run), "TMPDIR": str(run),
            "npm_config_cache": str(run / "npm-cache"), "PYTHONDONTWRITEBYTECODE": "1",
            "VITE_CACHE_DIR": str(run / "vite-cache"),
-           "PYTEST_ADDOPTS": f"-p no:cacheprovider --basetemp={run / 'pytest'}"}
+           "PYTEST_ADDOPTS": pytest_addopts(run)}
     compose = None
     project = None
     builder = None

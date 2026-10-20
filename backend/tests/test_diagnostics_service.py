@@ -32,6 +32,11 @@ class Repository:
     def source(self, source_id):
         return self._source if self._source and self._source.id == source_id else None
 
+    def topology(self, source):
+        return SimpleNamespace(id=source.normalizer_id, name="rule"), (
+            SimpleNamespace(state="ready"), SimpleNamespace(id=uuid4(), name="agent", state="ready")
+        )
+
     def error(self, error_id):
         return self._error if self._error and self._error.id == error_id else None
 
@@ -143,3 +148,12 @@ def test_raw_payload_is_byte_exact_and_bounded():
     result = DiagnosticsServiceImpl(Repository(error=exact), Supervisor(None)).raw_payload(exact.id)
     assert base64.b64decode(result.data) == b"\xff\x00"
     assert result.truncated is False
+
+
+def test_addressed_topology_only_uses_saved_links():
+    source = SimpleNamespace(id=uuid4(), normalizer_id=uuid4())
+    result = DiagnosticsServiceImpl(Repository(source), Supervisor(None)).source_topology(source.id)
+    assert result.normalizer_id == source.normalizer_id
+    assert result.normalizer_name == "rule"
+    assert result.agent_name == "agent"
+    assert result.assignment_state == "ready"

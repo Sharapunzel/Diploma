@@ -13,6 +13,7 @@ from ...schemas.diagnostics import (
     RawPayloadDTO,
     SourceState,
     SourceStatePage,
+    SourceTopology,
 )
 
 PAYLOAD_LIMIT = 700 * 1024
@@ -184,9 +185,25 @@ class DiagnosticsServiceImpl:
             return "running", worker_state.reason
         return "unknown", "worker_starting"
 
-    def source_states(self, limit: int, offset: int) -> SourceStatePage:
-        items, total = self.repository.sources(limit, offset)
+    def source_states(self, limit: int, offset: int, q: str = "") -> SourceStatePage:
+        items, total = self.repository.sources(limit, offset, q)
         return SourceStatePage(items=self._states(items), total=total, limit=limit, offset=offset)
+
+    def source_topology(self, source_id: UUID) -> SourceTopology:
+        source = self.repository.source(source_id)
+        if source is None:
+            raise DomainError("source_not_found", "Source not found", 404)
+        normalizer, assignment = self.repository.topology(source)
+        topic, agent = assignment if assignment else (None, None)
+        return SourceTopology(
+            source_id=source.id,
+            normalizer_id=source.normalizer_id,
+            normalizer_name=normalizer.name if normalizer else None,
+            agent_id=agent.id if agent else None,
+            agent_name=agent.name if agent else None,
+            agent_state=agent.state if agent else None,
+            assignment_state=topic.state if topic else None,
+        )
 
     def source_state(self, source_id: UUID):
         source = self.repository.source(source_id)

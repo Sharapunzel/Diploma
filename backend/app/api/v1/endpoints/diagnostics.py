@@ -15,6 +15,7 @@ from ....schemas.diagnostics import (
     RawPayloadDTO,
     SourceState,
     SourceStatePage,
+    SourceTopology,
 )
 from ....services.protocols.diagnostics import DiagnosticsService
 
@@ -40,10 +41,16 @@ def check_interval(start: datetime | None, end: datetime | None):
 def source_states(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    q: str = Query("", max_length=100),
     _: object = ReadPermission,
     service: DiagnosticsService = Service,
 ):
-    return service.source_states(limit, offset)
+    return service.source_states(limit, offset, q)
+
+
+@router.get("/sources/{source_id}/topology", response_model=SourceTopology, responses=READ)
+def source_topology(source_id: UUID, _: object = ReadPermission, service: DiagnosticsService = Service):
+    return service.source_topology(source_id)
 
 
 @router.get("/sources/{source_id}", response_model=SourceState, responses=READ)

@@ -4,22 +4,43 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ...models import KafkaConnection, KafkaOperationalEvent, ProcessingError, Source
+from ...models import (
+    FluentBitAgent,
+    FluentBitAgentTopic,
+    KafkaConnection,
+    KafkaOperationalEvent,
+    Normalizer,
+    ProcessingError,
+    Source,
+)
 
 
 class SqlAlchemyDiagnosticsRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def sources(self, limit: int, offset: int):
-        total = self.session.scalar(select(func.count()).select_from(Source).where(Source.source_type == "kafka")) or 0
+    def sources(self, limit: int, offset: int, q: str = ""):
+        conditions = [Source.source_type == "kafka"]
+        if q:
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conditions.append(Source.name.ilike(f"%{escaped}%", escape="\\"))
+        total = self.session.scalar(select(func.count()).select_from(Source).where(*conditions)) or 0
         rows = self.session.scalars(
-            select(Source).where(Source.source_type == "kafka").order_by(Source.id).limit(limit).offset(offset)
+            select(Source).where(*conditions).order_by(Source.name, Source.id).limit(limit).offset(offset)
         ).all()
         return list(rows), total
 
     def source(self, source_id: UUID):
         return self.session.scalar(select(Source).where(Source.id == source_id, Source.source_type == "kafka"))
+
+    def topology(self, source: Source):
+        normalizer = self.session.get(Normalizer, source.normalizer_id) if source.normalizer_id else None
+        row = self.session.execute(
+            select(FluentBitAgentTopic, FluentBitAgent)
+            .join(FluentBitAgent, FluentBitAgent.id == FluentBitAgentTopic.agent_id)
+            .where(FluentBitAgentTopic.source_id == source.id)
+        ).first()
+        return normalizer, row
 
     def connection_names(self, connection_ids: list[UUID]) -> dict[UUID, str]:
         if not connection_ids:

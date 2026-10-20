@@ -15,7 +15,7 @@ import {
   Typography,
 } from "antd";
 import { observer } from "mobx-react-lite";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   type ExternalConnection,
   type ExternalConnectionInput,
@@ -57,6 +57,9 @@ export const ConnectionsPage = observer(() => {
   const [verificationError, setVerificationError] = useState<unknown>(null);
   const [notice, setNotice] = useState("");
   const [activeKind, setActiveKind] = useState<Kind>("kafka");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [missingAddressedConnection, setMissingAddressedConnection] =
+    useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [operationError, setOperationError] = useState<unknown>(null);
   const [verificationName, setVerificationName] = useState("");
@@ -100,6 +103,39 @@ export const ConnectionsPage = observer(() => {
     void lists.kafkaConnections.load(0);
     void lists.externalConnections.load(0);
   }, [lists]);
+  useEffect(() => {
+    const id = searchParams.get("id");
+    if (!id || connections.detail?.item.id === id) {
+      setMissingAddressedConnection(false);
+      return;
+    }
+    const controller = new AbortController();
+    setMissingAddressedConnection(false);
+    void (async () => {
+      try {
+        const item =
+          lists.kafkaConnections.items.find(
+            (connection) => connection.id === id,
+          ) ??
+          (await lists.kafkaConnections.resources.kafkaConnection(
+            id,
+            controller.signal,
+          ));
+        if (controller.signal.aborted) return;
+        setActiveKind("kafka");
+        connections.openDetail("kafka", item, canWrite, canReadSources);
+      } catch {
+        if (!controller.signal.aborted) setMissingAddressedConnection(true);
+      }
+    })();
+    return () => controller.abort();
+  }, [
+    searchParams,
+    lists.kafkaConnections,
+    connections,
+    canWrite,
+    canReadSources,
+  ]);
   useEffect(() => {
     if (!notice) return;
     const timeout = window.setTimeout(() => setNotice(""), 5000);
@@ -145,6 +181,14 @@ export const ConnectionsPage = observer(() => {
             }
         : { name: "", bootstrap: "", base_url: "", username: "", password: "" },
     );
+  };
+  const openConnectionDetail = (kind: Kind, item: RecordType) => {
+    setActiveKind(kind);
+    connections.openDetail(kind, item, canWrite, canReadSources);
+    const next = new URLSearchParams(searchParams);
+    if (kind === "kafka") next.set("id", item.id);
+    else next.delete("id");
+    setSearchParams(next, { replace: true });
   };
   const save = async (values: Record<string, string>) => {
     if (!editing || saving) return;
@@ -504,7 +548,7 @@ export const ConnectionsPage = observer(() => {
         <div className={styles.actions}>
           <Button
             onClick={() => {
-              connections.openDetail(kind, item, canWrite, canReadSources);
+              openConnectionDetail(kind, item);
             }}
           >
             Наборы
@@ -560,6 +604,14 @@ export const ConnectionsPage = observer(() => {
   );
   return (
     <main className={styles.page}>
+      {missingAddressedConnection && (
+        <Alert
+          type="warning"
+          showIcon
+          message="Kafka-подключение недоступно"
+          description="Подключение могло быть удалено или у вас нет доступа к нему. Обновите список подключений."
+        />
+      )}
       <div className={styles.pageToolbar}>
         <nav
           aria-label="Категория подключений"
@@ -776,7 +828,12 @@ export const ConnectionsPage = observer(() => {
       <Modal
         open={!!detail}
         title={`Наборы данных для подключения «${detail?.item.name || ""}»`}
-        onCancel={() => connections.closeDetail()}
+        onCancel={() => {
+          connections.closeDetail();
+          const next = new URLSearchParams(searchParams);
+          next.delete("id");
+          setSearchParams(next, { replace: true });
+        }}
         footer={null}
         width={720}
       >

@@ -30,6 +30,7 @@ setupTest(
       },
     });
     expect(connection.status()).toBe(201);
+    const connectionId = (await connection.json()).id as string;
     await page.goto("/agents");
     await page.getByRole("button", { name: "Зарегистрировать агента" }).click();
     const form = page.getByRole("dialog");
@@ -55,9 +56,18 @@ setupTest(
         `Agent registration did not navigate: ${JSON.stringify({ validation, alerts })}`,
       );
     }
-    await expect(
-      page.getByRole("button", { name: "Получить конфигурацию" }),
-    ).toBeEnabled({ timeout: 60_000 });
+    try {
+      await expect(
+        page.getByRole("button", { name: "Получить конфигурацию" }),
+      ).toBeEnabled({ timeout: 60_000 });
+    } catch {
+      const agentId = new URL(page.url()).pathname.split("/").at(-1)!;
+      const agent = await page.request.get(`/api/v1/agents/${agentId}`);
+      const card = await page.locator("main").innerText();
+      throw new Error(
+        `Agent did not become claimable: ${JSON.stringify({ status: agent.status(), body: await agent.json(), card })}`,
+      );
+    }
     await page.getByRole("button", { name: "Получить конфигурацию" }).click();
     const config = page
       .getByRole("dialog")
@@ -86,7 +96,12 @@ setupTest(
     expect(data.credentials_claimable).toBe(false);
     writeFileSync(
       join(run!, "agent.json"),
-      JSON.stringify({ agentId, sourceId: data.topics[0].source_id, topic }),
+      JSON.stringify({
+        agentId,
+        sourceId: data.topics[0].source_id,
+        topic,
+        connectionId,
+      }),
       { encoding: "utf8", mode: 0o600 },
     );
     expect(page.url()).not.toContain("sasl.password");
@@ -162,3 +177,160 @@ verifyTest("shows the stored event in the Events page", async ({ page }) => {
     timeout: 30_000,
   });
 });
+
+verifyTest(
+  "shows the real source topology through the proxy",
+  async ({ page }) => {
+    const { agentId, sourceId, topic } = JSON.parse(
+      readFileSync(join(run!, "agent.json"), "utf8"),
+    );
+    const login = await page.request.post("/api/v1/auth/local/login", {
+      data: { username: "task21admin", password },
+    });
+    expect(login.ok()).toBeTruthy();
+    const topology = await page.request.get(
+      `/api/v1/diagnostics/sources/${sourceId}/topology`,
+    );
+    expect(topology.ok()).toBeTruthy();
+    expect((await topology.json()).agent_id).toBe(agentId);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`/diagnostics?source=${sourceId}`);
+    await expect(
+      page.getByRole("heading", { name: "Диагностика конвейера" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("list", { name: "Путь событий" }),
+    ).toContainText(topic);
+    const originalTheme = await page.locator("html").getAttribute("data-theme");
+    for (const theme of ["light", "dark"] as const) {
+      await page.locator("html").evaluate((element, value) => {
+        element.setAttribute("data-theme", value);
+      }, theme);
+      for (const viewport of [
+        { width: 1280, height: 900 },
+        { width: 320, height: 800 },
+      ]) {
+        await page.setViewportSize(viewport);
+        const palette = await page
+          .getByRole("list", { name: "Путь событий" })
+          .evaluate((list) => {
+            const firstEdge = list.querySelector("li[data-edge]");
+            if (!firstEdge) throw new Error("No topology edge found");
+            firstEdge.setAttribute("data-edge", "broken");
+            const label = firstEdge.querySelector<HTMLElement>(
+              ":scope > span:last-child",
+            );
+            if (!label) throw new Error("No topology edge label found");
+            const probe = document.createElement("span");
+            probe.style.backgroundColor = "var(--color-surface-solid)";
+            probe.style.color = "var(--color-warning)";
+            document.body.append(probe);
+            const expected = getComputedStyle(probe);
+            const actual = getComputedStyle(label);
+            const result = {
+              background: actual.backgroundColor,
+              expectedBackground: expected.backgroundColor,
+              color: actual.color,
+              expectedColor: expected.color,
+              scrollFits: document.documentElement.scrollWidth <= innerWidth,
+            };
+            probe.remove();
+            return result;
+          });
+        expect(palette.background).toBe(palette.expectedBackground);
+        expect(palette.color).toBe(palette.expectedColor);
+        expect(palette.scrollFits).toBe(true);
+      }
+    }
+    if (originalTheme)
+      await page.locator("html").evaluate((element, value) => {
+        element.setAttribute("data-theme", value);
+      }, originalTheme);
+    else
+      await page
+        .locator("html")
+        .evaluate((element) => element.removeAttribute("data-theme"));
+    await page.setViewportSize({ width: 390, height: 844 });
+    if (process.env.TASK23_DIAGNOSTIC_FIXTURES === "1") {
+      await expect(
+        page.getByText("Декодирование", { exact: false }).last(),
+      ).toBeVisible();
+      await expect(
+        page.getByText("Потеря диапазона Kafka", { exact: false }).last(),
+      ).toBeVisible();
+      await page
+        .getByRole("button", { name: /Декодирование/ })
+        .last()
+        .click();
+      const errorDialog = page.getByRole("dialog", {
+        name: "Сохранённая диагностическая запись",
+      });
+      await errorDialog
+        .getByRole("button", { name: "Показать payload" })
+        .click();
+      await expect(errorDialog.locator("pre")).toContainText(
+        "task23-invalid-envelope",
+      );
+      await page.keyboard.press("Escape");
+      await expect(errorDialog).toBeHidden();
+      await page
+        .getByRole("button", { name: /Потеря диапазона Kafka/ })
+        .last()
+        .click();
+      await expect(page.getByRole("dialog")).toContainText(
+        "не равен точному числу потерянных сообщений",
+      );
+      await page.getByRole("dialog").locator(".ant-modal-close").click();
+      await expect(page.getByRole("dialog")).toBeHidden();
+    }
+    await page.getByRole("button", { name: /1\. Агент и сбор/ }).click();
+    await expect(
+      page.getByRole("link", { name: "Перейти к агенту" }),
+    ).toHaveAttribute("href", `/agents/${agentId}`);
+    await page.getByRole("button", { name: /2\. Kafka/ }).click();
+    const connectionLink = page.getByRole("link", {
+      name: "Перейти к Kafka-подключению",
+    });
+    const { connectionId } = JSON.parse(
+      readFileSync(join(run!, "agent.json"), "utf8"),
+    );
+    await expect(connectionLink).toHaveAttribute(
+      "href",
+      `/connections?id=${connectionId}`,
+    );
+    await connectionLink.click();
+    await expect(page).toHaveURL(/\/connections\?id=[0-9a-f-]+$/);
+    await expect(
+      page.getByRole("dialog", { name: /Наборы данных для подключения/ }),
+    ).toBeVisible();
+    await page.getByRole("dialog").locator(".ant-modal-close").click();
+    await page.goto(`/diagnostics?source=${sourceId}`);
+    await page.getByRole("button", { name: /3\. Источник/ }).click();
+    const sourceLink = page.getByRole("link", { name: "Перейти к источнику" });
+    await expect(sourceLink).toHaveAttribute(
+      "href",
+      `/sources?kind=kafka&id=${sourceId}`,
+    );
+    await sourceLink.click();
+    await expect(page).toHaveURL(
+      new RegExp(`/sources\\?kind=kafka&id=${sourceId}`),
+    );
+    await page.goto(`/diagnostics?source=${sourceId}`);
+    await page.getByRole("button", { name: /4\. .*Нормализатор/ }).click();
+    const normalizerLink = page.getByRole("link", {
+      name: "Перейти к нормализатору",
+    });
+    await expect(normalizerLink).toHaveAttribute(
+      "href",
+      /\/normalizers\/[0-9a-f-]+$/,
+    );
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    await normalizerLink.click();
+    await expect(page).toHaveURL(/\/normalizers\/[0-9a-f-]+$/);
+    await expect(page.getByText("Task 21 normalizer")).toBeVisible();
+  },
+);

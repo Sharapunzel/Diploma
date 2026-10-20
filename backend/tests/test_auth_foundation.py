@@ -2602,8 +2602,10 @@ def test_kafka_connections_topics_and_source_lifecycle(client, auth_database):
 def test_diagnostics_read_access_raw_payload_boundary_and_openapi(client, auth_database):
     paths = client.get("/openapi.json").json()["paths"]
     assert "/api/v1/diagnostics/sources" in paths
+    assert "/api/v1/diagnostics/sources/{source_id}/topology" in paths
     assert "/api/v1/diagnostics/processing-errors/{error_id}/raw" in paths
     assert client.get("/api/v1/diagnostics/overview").status_code == 401
+    assert client.get(f"/api/v1/diagnostics/sources/{uuid4()}/topology").status_code == 401
 
     add_local_user(auth_database)
     assert login(client).status_code == 200
@@ -2684,6 +2686,13 @@ def test_diagnostics_error_and_event_snapshots_survive_source_deletion(client, a
     source_detail = client.get(f"/api/v1/diagnostics/sources/{source_id}")
     assert source_detail.status_code == 200
     assert source_detail.json()["connection_name"] == "diagnostic-connection"
+    searched = client.get("/api/v1/diagnostics/sources", params={"q": "diagnostic-source"})
+    assert searched.status_code == 200
+    assert any(item["source_id"] == str(source_id) for item in searched.json()["items"])
+    topology = client.get(f"/api/v1/diagnostics/sources/{source_id}/topology")
+    assert topology.status_code == 200
+    assert topology.json()["agent_id"] is None
+    assert topology.json()["normalizer_id"] is None
     errors = client.get("/api/v1/diagnostics/processing-errors", params={"source_id": str(source_id)})
     assert errors.status_code == 200 and errors.json()["total"] == 1
     assert "raw_payload" not in errors.json()["items"][0]
@@ -2724,6 +2733,7 @@ def test_diagnostics_error_and_event_snapshots_survive_source_deletion(client, a
         params={"source_id": str(source_id)}, headers=headers)
     assert detached_error.json()["source_id"] == str(source_id)
     assert detached_event.json()["total"] == 1
+    assert client.get(f"/api/v1/diagnostics/sources/{source_id}/topology").status_code == 404
 
 
 def test_diagnostics_overview_aggregates_large_source_set_without_loading_source_rows(

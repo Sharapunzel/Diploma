@@ -55,6 +55,11 @@ const AgentsPage = lazy(() =>
     default: AgentsPage,
   })),
 );
+const DiagnosticsPage = lazy(() =>
+  import("../../pages/diagnostics/DiagnosticsPage").then(
+    ({ DiagnosticsPage }) => ({ default: DiagnosticsPage }),
+  ),
+);
 
 function LoadingStatus() {
   return (
@@ -174,6 +179,8 @@ export function AppRoutes() {
                     <EventsPage />
                   ) : page.path === "/agents" ? (
                     <AgentsPage />
+                  ) : page.path === "/diagnostics" ? (
+                    <DiagnosticsPage />
                   ) : (
                     <PlaceholderPage name={page.label} />
                   )}
