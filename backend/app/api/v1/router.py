@@ -9,10 +9,12 @@ from .endpoints.ecs import router as ecs_router
 from .endpoints.events import router as events_router
 from .endpoints.external import router as external_router
 from .endpoints.health import router as health_router
+from .endpoints.home import router as home_router
 from .endpoints.parsed_logs import router as parsed_logs_router
 
 router = APIRouter(prefix="/api/v1")
 router.include_router(health_router)
+router.include_router(home_router)
 router.include_router(auth_router)
 router.include_router(administration_router)
 router.include_router(agents_router)

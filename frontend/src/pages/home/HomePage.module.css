@@ -1,0 +1,195 @@
+.page {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.intro,
+.module,
+.inventory {
+  min-width: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-surface);
+}
+.intro {
+  padding-block: 20px;
+}
+.intro h2,
+.module h3,
+.inventory h3,
+.card h4 {
+  margin: 0;
+  color: var(--color-text);
+}
+.intro h2 {
+  font-size: clamp(1.25rem, 2vw, 1.7rem);
+}
+.intro p:last-child {
+  margin: 8px 0 0;
+  max-width: 85ch;
+  color: var(--color-text-secondary);
+}
+.eyebrow {
+  margin: 0 0 5px;
+  color: var(--color-accent-strong);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.modules {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 16px;
+}
+.links {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 18px;
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+}
+.links li,
+.analysisLink {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.links li > span,
+.analysisLink p,
+.muted {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 0.86rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.links a,
+.analysisLink a {
+  width: fit-content;
+  color: var(--color-text);
+  font-weight: 700;
+  text-decoration: none;
+}
+.links a:hover,
+.analysisLink a:hover {
+  color: var(--color-accent-strong);
+  text-decoration: underline;
+}
+.links a:focus-visible,
+.analysisLink a:focus-visible {
+  outline: 2px solid var(--color-accent-strong);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+.analysisLink {
+  margin-top: 12px;
+}
+.inventoryHeader {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+.inventoryHeader p {
+  margin-top: 4px;
+}
+.timestamp {
+  margin: 12px 0;
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 235px), 1fr));
+  gap: 10px;
+}
+.card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-solid);
+}
+.card h4 {
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+}
+.counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 15px;
+}
+.count {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.count strong {
+  color: var(--color-text);
+  font-size: 1.35rem;
+  line-height: 1;
+}
+.count span {
+  max-width: 15ch;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+.card > p {
+  margin-top: 10px;
+}
+.bar {
+  display: block;
+  width: 100%;
+  height: 10px;
+  margin-bottom: 12px;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.enabled {
+  fill: var(--color-accent);
+}
+.disabled {
+  fill: var(--color-warning);
+}
+.archived {
+  fill: var(--color-text-secondary);
+}
+.enabledLabel::before,
+.disabledLabel::before,
+.archivedLabel::before {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  margin-right: 0.35em;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+.enabledLabel::before {
+  background: var(--color-accent);
+}
+.disabledLabel::before {
+  background: var(--color-warning);
+}
+.archivedLabel::before {
+  background: var(--color-text-secondary);
+}
+@media (max-width: 760px) {
+  .modules {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 420px) {
+  .intro,
+  .module,
+  .inventory {
+    padding: 14px;
+  }
+  .links {
+    grid-template-columns: 1fr;
+  }
+}

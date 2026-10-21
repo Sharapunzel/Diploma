@@ -1,5 +1,6 @@
 import base64
 import getpass
+import json
 import os
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
@@ -28,6 +30,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.api.v1.endpoints.auth import ERRORS
+from app.api.v1.endpoints.home import overview as home_overview
 from app.cli import create_admin
 from app.config import Settings
 from app.core.errors import DomainError
@@ -127,6 +130,222 @@ def simple_normalizer_rule():
             }],
         }],
     }
+
+
+def test_home_overview_counts_and_permission_blocks(auth_database):
+    with auth_database.session_factory() as session:
+        empty = home_overview(
+            (
+                None,
+                None,
+                SimpleNamespace(
+                    permissions={
+                        "connections.read",
+                        "sources.read",
+                        "agents.read",
+                        "normalizers.read",
+                    }
+                ),
+            ),
+            session,
+        )
+        assert empty.connections.model_dump() == {"own": 0, "external": 0}
+        assert all(value == 0 for value in empty.sources.model_dump().values())
+        assert all(value == 0 for value in empty.agents.model_dump().values())
+        assert empty.normalizers == 0
+    with auth_database.engine.begin() as connection:
+        kafka_id = connection.execute(
+            text("""
+            INSERT INTO app.kafka_connections (name, bootstrap_servers)
+            VALUES ('home-kafka', ARRAY['broker:9092']) RETURNING id
+        """)
+        ).scalar_one()
+        external_id = connection.execute(
+            text("""
+            INSERT INTO app.external_connections (name, base_url, username, encrypted_password)
+            VALUES ('home-external', 'https://indexer.test', 'user', 'cipher') RETURNING id
+        """)
+        ).scalar_one()
+        for name, enabled, archived in (
+            ("on", True, False),
+            ("off", False, False),
+            ("old", True, True),
+        ):
+            connection.execute(
+                text("""
+                INSERT INTO app.sources (name, connection_id, topic_name, is_enabled, is_archived)
+                VALUES (:name, :connection_id, :topic, :enabled, :archived)
+            """),
+                {
+                    "name": name,
+                    "connection_id": kafka_id,
+                    "topic": name,
+                    "enabled": enabled,
+                    "archived": archived,
+                },
+            )
+        for name, enabled in (("external-on", True), ("external-off", False)):
+            connection.execute(
+                text("""
+                INSERT INTO app.sources (name, source_type, external_connection_id,
+                    target_type, index_name, is_enabled)
+                VALUES (:name, 'external', :connection_id, 'index', :name, :enabled)
+            """),
+                {"name": name, "connection_id": external_id, "enabled": enabled},
+            )
+        for state in (
+            "ready",
+            "ready",
+            "provisioning",
+            "error",
+            "revocation_pending",
+            "revoked",
+        ):
+            connection.execute(
+                text("""
+                INSERT INTO app.fluentbit_agents (name, connection_id, cluster_identity, state)
+                VALUES (:name, :connection_id, 'home-cluster', :state)
+            """),
+                {"name": f"agent-{state}-{uuid4()}", "connection_id": kafka_id, "state": state},
+            )
+    with auth_database.session_factory() as session:
+        session.add(Normalizer(name="home-rule", rule=simple_normalizer_rule()))
+        session.commit()
+        principal = lambda permissions: (None, None, SimpleNamespace(permissions=permissions))
+        denied = home_overview(principal(set()), session)
+        assert denied.connections is denied.sources is denied.agents is denied.normalizers is None
+        source_only = home_overview(principal({"sources.read"}), session)
+        assert source_only.connections is source_only.agents is source_only.normalizers is None
+        assert source_only.sources.model_dump() == {
+            "own_enabled": 1,
+            "own_disabled": 1,
+            "own_archived": 1,
+            "external_enabled": 1,
+            "external_disabled": 1,
+        }
+        statements = []
+
+        def capture(_connection, _cursor, statement, _parameters, _context, _many):
+            statements.append(statement.lower())
+
+        event.listen(auth_database.engine, "before_cursor_execute", capture)
+        try:
+            full = home_overview(
+                principal(
+                    {
+                        "connections.read",
+                        "sources.read",
+                        "agents.read",
+                        "normalizers.read",
+                    }
+                ),
+                session,
+            )
+        finally:
+            event.remove(auth_database.engine, "before_cursor_execute", capture)
+        assert len(statements) == 5
+        assert all("logs.parsed_logs" not in statement for statement in statements)
+        assert full.connections.model_dump() == {"own": 1, "external": 1}
+        assert full.agents.ready == 2
+        assert full.agents.provisioning == 1
+        assert full.agents.error == 1
+        assert full.agents.revocation_pending == 1
+        assert full.agents.revoked == 1
+        assert full.normalizers == 1
+
+
+def test_home_overview_http_omits_forbidden_fields(client, auth_database):
+    assert client.get("/api/v1/home/overview").status_code == 401
+    with auth_database.engine.begin() as connection:
+        original = connection.execute(
+            text("SELECT permissions::text FROM app.roles WHERE id = :id"), {"id": GUEST_ID}
+        ).scalar_one()
+        connection.execute(
+            text("UPDATE app.roles SET permissions = '[]'::jsonb WHERE id = :id"), {"id": GUEST_ID}
+        )
+    try:
+        add_local_user(auth_database)
+        assert login(client).status_code == 200
+        response = client.get("/api/v1/home/overview")
+        assert response.status_code == 200
+        assert set(response.json()) == {"captured_at"}
+        assert "/api/v1/home/overview" in client.get("/openapi.json").json()["paths"]
+    finally:
+        with auth_database.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE app.roles SET permissions = CAST(:permissions AS jsonb) WHERE id = :id"
+                ),
+                {"permissions": original, "id": GUEST_ID},
+            )
+
+
+def test_home_overview_http_returns_only_individually_permitted_blocks(client, auth_database):
+    assert client.get("/api/v1/home/overview").status_code == 401
+    with auth_database.engine.begin() as connection:
+        original = connection.execute(
+            text("SELECT permissions::text FROM app.roles WHERE id = :id"),
+            {"id": GUEST_ID},
+        ).scalar_one()
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    try:
+        for permission, block, expected in (
+            ("connections.read", "connections", {"own": 0, "external": 0}),
+            (
+                "sources.read",
+                "sources",
+                {
+                    "own_enabled": 0,
+                    "own_disabled": 0,
+                    "own_archived": 0,
+                    "external_enabled": 0,
+                    "external_disabled": 0,
+                },
+            ),
+            (
+                "agents.read",
+                "agents",
+                {
+                    "provisioning": 0,
+                    "ready": 0,
+                    "error": 0,
+                    "revocation_pending": 0,
+                    "revoked": 0,
+                },
+            ),
+            ("normalizers.read", "normalizers", 0),
+        ):
+            with auth_database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE app.roles SET permissions = CAST(:permissions AS jsonb) WHERE id = :id"
+                    ),
+                    {"permissions": json.dumps([permission]), "id": GUEST_ID},
+                )
+            response = client.get("/api/v1/home/overview")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert set(body) == {"captured_at", block}
+            assert body[block] == expected
+
+        with auth_database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE app.roles SET permissions = '[]'::jsonb WHERE id = :id"),
+                {"id": GUEST_ID},
+            )
+        response = client.get("/api/v1/home/overview")
+        assert response.status_code == 200
+        assert set(response.json()) == {"captured_at"}
+        assert "/api/v1/home/overview" in client.get("/openapi.json").json()["paths"]
+    finally:
+        with auth_database.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE app.roles SET permissions = CAST(:permissions AS jsonb) WHERE id = :id"
+                ),
+                {"permissions": original, "id": GUEST_ID},
+            )
 
 
 def test_normalizer_preview_catalog_and_permissions(client, auth_database):

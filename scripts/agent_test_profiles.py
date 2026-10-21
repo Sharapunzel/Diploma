@@ -496,6 +496,30 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
     systemd_filter_smoke(env, run)
     command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "playwright")],
             env=profile_env, cwd=ROOT / "frontend")
+    from sqlalchemy import create_engine, text as sql_text
+    home_engine = create_engine(env["TEST_DATABASE_URL"])
+    try:
+        with home_engine.begin() as connection:
+            external_id = connection.execute(sql_text(
+                "INSERT INTO app.external_connections "
+                "(name, base_url, username, encrypted_password) "
+                "VALUES (:name, 'https://indexer.example.test:9200', 'reader', 'synthetic-unreadable') "
+                "RETURNING id"
+            ), {"name": f"Home synthetic indexer {project}"}).scalar_one()
+            connection.execute(sql_text(
+                "INSERT INTO app.sources (name, source_type, external_connection_id, "
+                "target_type, index_name, is_enabled) "
+                "VALUES (:name, 'external', :external_id, 'index', 'home-events', false)"
+            ), {"name": f"Home synthetic ECS {project}", "external_id": external_id})
+            guest_permissions = connection.execute(sql_text(
+                "UPDATE app.roles SET permissions = '[]'::jsonb WHERE name = 'Guest'"
+            ))
+            if guest_permissions.rowcount != 1:
+                raise RuntimeError("The isolated Guest role was not prepared")
+    finally:
+        home_engine.dispose()
+    command([NPM, "run", "test:browser", "--", "home.live.spec.ts", "--output", str(run / "home-playwright")],
+            env=profile_env, cwd=ROOT / "frontend")
     agent = json.loads((run / "agent.json").read_text(encoding="utf-8"))
     if agent["topic"] != topic:
         raise RuntimeError("UI agent topic differs from the isolated test topic")

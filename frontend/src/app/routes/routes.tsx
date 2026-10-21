@@ -20,6 +20,11 @@ const LoginPage = lazy(() =>
     default: LoginPage,
   })),
 );
+const HomePage = lazy(() =>
+  import("../../pages/home/HomePage").then(({ HomePage }) => ({
+    default: HomePage,
+  })),
+);
 const PlaceholderPage = lazy(() =>
   import("../../pages/home/PlaceholderPage").then(({ PlaceholderPage }) => ({
     default: PlaceholderPage,
@@ -159,7 +164,7 @@ export function AppRoutes() {
             path={homePage.path}
             element={
               <Protected>
-                <PlaceholderPage name={homePage.label} demoLoading />
+                <HomePage />
               </Protected>
             }
           />
