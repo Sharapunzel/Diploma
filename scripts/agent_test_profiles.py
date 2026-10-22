@@ -494,12 +494,31 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
     )
     command([sys.executable, "-c", create], env=profile_env, cwd=ROOT / "backend")
     systemd_filter_smoke(env, run)
-    command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "playwright")],
-            env=profile_env, cwd=ROOT / "frontend")
     from sqlalchemy import create_engine, text as sql_text
     home_engine = create_engine(env["TEST_DATABASE_URL"])
     try:
+        with home_engine.connect() as connection:
+            guest_permissions = connection.execute(sql_text(
+                "SELECT permissions FROM app.roles "
+                "WHERE id = '00000000-0000-4000-8000-000000000002'"
+            )).scalar_one()
+            if "users.read" in guest_permissions or not ("events.read" in guest_permissions or "settings.read" in guest_permissions):
+                raise RuntimeError("The migrated Guest role does not preserve read-only permissions without users.read")
+    finally:
+        home_engine.dispose()
+    command([NPM, "run", "test:browser", "--", "administration.live.spec.ts", "--output", str(run / "administration-playwright")],
+            env=profile_env, cwd=ROOT / "frontend")
+    command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "playwright")],
+            env=profile_env, cwd=ROOT / "frontend")
+    home_engine = create_engine(env["TEST_DATABASE_URL"])
+    try:
         with home_engine.begin() as connection:
+            guest_permissions = connection.execute(sql_text(
+                "UPDATE app.roles SET permissions = '[]'::jsonb WHERE id = "
+                "'00000000-0000-4000-8000-000000000002'"
+            ))
+            if guest_permissions.rowcount != 1:
+                raise RuntimeError("The isolated Guest role was not prepared for the home smoke")
             external_id = connection.execute(sql_text(
                 "INSERT INTO app.external_connections "
                 "(name, base_url, username, encrypted_password) "
@@ -511,11 +530,6 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
                 "target_type, index_name, is_enabled) "
                 "VALUES (:name, 'external', :external_id, 'index', 'home-events', false)"
             ), {"name": f"Home synthetic ECS {project}", "external_id": external_id})
-            guest_permissions = connection.execute(sql_text(
-                "UPDATE app.roles SET permissions = '[]'::jsonb WHERE name = 'Guest'"
-            ))
-            if guest_permissions.rowcount != 1:
-                raise RuntimeError("The isolated Guest role was not prepared")
     finally:
         home_engine.dispose()
     command([NPM, "run", "test:browser", "--", "home.live.spec.ts", "--output", str(run / "home-playwright")],
@@ -853,6 +867,10 @@ def main() -> None:
         if args.profile == "backend-db":
             command([*compose, "up", "-d", "--wait", "postgres"], env=env)
             command([sys.executable, "-m", "pytest", "-q", *(args.pytest or ["tests/test_auth_foundation.py", "tests/test_agent_contracts.py"])], env=env, cwd=ROOT / "backend")
+            migration_env = {**env, "DATABASE_URL": env["TEST_DATABASE_URL"]}
+            migration_env.pop("DATABASE_URL_FILE", None)
+            command([sys.executable, "-m", "alembic", "upgrade", "head"], env=migration_env, cwd=ROOT / "backend")
+            command([sys.executable, "-m", "alembic", "check"], env=migration_env, cwd=ROOT / "backend")
         elif args.profile == "kafka-integration":
             command([*compose, "up", "-d", "--build", "--wait", "postgres", "kafka", "kafka-acls"], env=env)
             verify_kafka_metadata(compose, env)

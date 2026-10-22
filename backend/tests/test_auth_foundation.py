@@ -1071,6 +1071,7 @@ def test_oidc_provision_mapping_list_guest_and_no_email_link(auth_database, auth
         )
         assert guest_role.id == GUEST_ID
         assert guest_user.role_id == GUEST_ID
+        assert "users.read" not in guest_role.permissions
     finally:
         session.close()
 
@@ -1175,7 +1176,15 @@ def test_oidc_router_uses_adapter_and_clears_handshake(auth_database, auth_setti
         assert callback.status_code == 307
         assert callback.headers["location"] == "/success"
         assert fake.cleared is True
-        assert oidc_client.get("/api/v1/auth/session").json()["authenticated"] is True
+        current = oidc_client.get("/api/v1/auth/session").json()
+        assert current["authenticated"] is True
+        assert "users.read" not in current["permissions"]
+        for path in (
+            "/api/v1/users", f"/api/v1/users/{current['user']['id']}",
+            "/api/v1/roles", f"/api/v1/roles/{GUEST_ID}",
+            "/api/v1/oidc-role-mappings", f"/api/v1/oidc-role-mappings/{uuid4()}",
+        ):
+            assert oidc_client.get(path).status_code == 403
 
 
 def test_authlib_oidc_flow_uses_local_discovery_jwks_and_signed_id_token(
@@ -1675,12 +1684,17 @@ def add_admin_user(database, username="admin", password="correct-password"):
         return user.id
 
 
-def test_guest_reads_administration_but_cannot_mutate(client, auth_database):
+def test_guest_cannot_read_or_mutate_administration(client, auth_database):
     add_local_user(auth_database)
     assert login(client).status_code == 200
-    assert client.get("/api/v1/users").status_code == 200
-    assert client.get("/api/v1/roles").status_code == 200
-    assert client.get("/api/v1/oidc-role-mappings").status_code == 200
+    for path in (
+        "/api/v1/users", f"/api/v1/users/{uuid4()}",
+        "/api/v1/roles", f"/api/v1/roles/{GUEST_ID}",
+        "/api/v1/oidc-role-mappings", f"/api/v1/oidc-role-mappings/{uuid4()}",
+    ):
+        response = client.get(path)
+        assert response.status_code == 403
+        assert response.json()["code"] == "permission_denied"
     assert client.get("/api/v1/app-settings").status_code == 200
     assert client.get("/api/v1/normalizers").status_code == 200
     csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
@@ -1696,6 +1710,36 @@ def test_guest_reads_administration_but_cannot_mutate(client, auth_database):
         response = getattr(client, method)(path, json=body, headers=headers)
         assert response.status_code == 403
         assert response.json()["code"] == "permission_denied"
+
+
+def test_existing_guest_session_uses_current_role_permissions(client, auth_database):
+    add_local_user(auth_database)
+    assert login(client).status_code == 200
+    with auth_database.engine.begin() as connection:
+        original = connection.execute(
+            text("SELECT permissions::text FROM app.roles WHERE id = :id"),
+            {"id": GUEST_ID},
+        ).scalar_one()
+        connection.execute(
+            text("UPDATE app.roles SET permissions = permissions || '[\"users.read\"]'::jsonb WHERE id = :id"),
+            {"id": GUEST_ID},
+        )
+    try:
+        assert client.get("/api/v1/users").status_code == 200
+        with auth_database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE app.roles SET name = 'Visitor', permissions = permissions - 'users.read' WHERE id = :id"),
+                {"id": GUEST_ID},
+            )
+        assert client.get("/api/v1/users").status_code == 403
+        assert "users.read" not in client.get("/api/v1/auth/session").json()["permissions"]
+        assert client.get("/api/v1/app-settings").status_code == 200
+    finally:
+        with auth_database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE app.roles SET name = 'Guest', permissions = CAST(:permissions AS jsonb) WHERE id = :id"),
+                {"permissions": original, "id": GUEST_ID},
+            )
 
 
 def test_administrator_can_manage_users_roles_mappings_and_normalizers(
@@ -1915,8 +1959,8 @@ def test_administration_dto_validation_and_safe_errors(client, auth_database):
 
 def test_administration_permissions_csrf_and_dependency_override(client, auth_database):
     assert client.get("/api/v1/users").status_code == 401
-    add_local_user(auth_database)
-    assert login(client).status_code == 200
+    add_admin_user(auth_database)
+    assert login(client, "admin").status_code == 200
     invalid_csrf = client.post(
         "/api/v1/normalizers", json={"name": "x", "rule": "opaque"}
     )
@@ -3028,22 +3072,25 @@ def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_
     assert "processing_errors.raw.read" in before[ADMIN_ID][1]
     assert "processing_errors.raw.read" not in before[GUEST_ID][1]
     run_alembic(auth_database_url, "downgrade", "0007_kafka_generations_and_gaps")
-    with psycopg.connect(url) as connection:
-        downgraded = {
-            row[0]: (row[1], set(row[2]))
-            for row in connection.execute(
-                "SELECT id, name, permissions FROM app.roles WHERE id IN (%s, %s)",
-                (ADMIN_ID, GUEST_ID),
-            )
-        }
-    for role_id in (ADMIN_ID, GUEST_ID):
-        assert downgraded[role_id][0] == before[role_id][0]
-        assert downgraded[role_id][1] == before[role_id][1] - {
-            "processing_errors.raw.read",
-            "agents.read",
-            "agents.write",
-        }
-    run_alembic(auth_database_url, "upgrade", "head")
+    try:
+        with psycopg.connect(url) as connection:
+            downgraded = {
+                row[0]: (row[1], set(row[2]))
+                for row in connection.execute(
+                    "SELECT id, name, permissions FROM app.roles WHERE id IN (%s, %s)",
+                    (ADMIN_ID, GUEST_ID),
+                )
+            }
+        for role_id in (ADMIN_ID, GUEST_ID):
+            assert downgraded[role_id][0] == before[role_id][0]
+            expected = before[role_id][1] - {
+                "processing_errors.raw.read", "agents.read", "agents.write",
+            }
+            if role_id == GUEST_ID:
+                expected.add("users.read")  # Rolling back 0013 restores the former permission.
+            assert downgraded[role_id][1] == expected
+    finally:
+        run_alembic(auth_database_url, "upgrade", "head")
     with psycopg.connect(url) as connection:
         upgraded = connection.execute(
             "SELECT permissions FROM app.roles WHERE id = %s", (ADMIN_ID,)

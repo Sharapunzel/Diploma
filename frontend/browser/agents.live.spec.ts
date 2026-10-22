@@ -36,11 +36,17 @@ setupTest(
     const form = page.getByRole("dialog");
     await form.getByLabel("Название").fill("Task 21 agent");
     await form.getByLabel("Подключение Kafka").click();
-    await page.getByText("Task 21 Kafka", { exact: true }).last().click();
+    await page
+      .locator(".ant-select-dropdown:visible .ant-select-item-option-content")
+      .getByText("Task 21 Kafka", { exact: true })
+      .click();
     await form.getByLabel("Имя нового топика").fill(topic!);
     await form.getByRole("button", { name: "Ещё топик" }).click();
     await form.getByLabel("Подключение Kafka").nth(1).click();
-    await page.getByText("Task 21 Kafka", { exact: true }).last().click();
+    await page
+      .locator(".ant-select-dropdown:visible .ant-select-item-option-content")
+      .getByText("Task 21 Kafka", { exact: true })
+      .click();
     await form.getByLabel("Имя нового топика").nth(1).fill(`${topic}-other`);
     await form.getByRole("button", { name: "Отправить" }).click();
     try {

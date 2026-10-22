@@ -31,7 +31,6 @@ ADMIN_PERMISSIONS = [
     "agents.write",
 ]
 GUEST_PERMISSIONS = [
-    "users.read",
     "settings.read",
     "connections.read",
     "sources.read",
@@ -130,6 +129,33 @@ def test_agent_cluster_route_migration_backfills_without_topics(db, database_url
     db.execute("DELETE FROM app.fluentbit_agents WHERE id = %s", (agent_id,))
     db.execute("DELETE FROM app.kafka_connections WHERE id = %s", (connection_id,))
     db.commit()
+
+
+def test_guest_read_revocation_migrates_existing_role_without_other_changes(db, database_urls):
+    sqlalchemy_url, _ = database_urls
+    run_alembic(sqlalchemy_url, "downgrade", "0012_agent_cluster_route")
+    permissions = ["users.read", "settings.read", "connections.read", "custom.permission"]
+    db.execute(
+        "UPDATE app.roles SET name = %s, permissions = %s WHERE id = %s",
+        ("Renamed guest", Jsonb(permissions), GUEST_ID),
+    )
+    db.commit()
+    run_alembic(sqlalchemy_url, "upgrade", "head")
+    role = db.execute(
+        "SELECT name, permissions FROM app.roles WHERE id = %s", (GUEST_ID,)
+    ).fetchone()
+    assert role[0] == "Renamed guest"
+    assert role[1] == [permission for permission in permissions if permission != "users.read"]
+    assert "users.read" in db.execute(
+        "SELECT permissions FROM app.roles WHERE id = %s", (ADMIN_ID,)
+    ).fetchone()[0]
+    db.rollback()
+    run_alembic(sqlalchemy_url, "downgrade", "0012_agent_cluster_route")
+    assert db.execute(
+        "SELECT permissions FROM app.roles WHERE id = %s", (GUEST_ID,)
+    ).fetchone()[0] == [permission for permission in permissions if permission != "users.read"] + ["users.read"]
+    db.rollback()
+    run_alembic(sqlalchemy_url, "upgrade", "head")
 
 
 def insert_user(db, **overrides):

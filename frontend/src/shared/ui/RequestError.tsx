@@ -8,11 +8,13 @@ export function RequestError({
   message,
   requestId,
   onRetry,
+  actionLabel = "Повторить",
   variant = "inline",
 }: {
   message: string;
   requestId?: string | null;
   onRetry?: () => void;
+  actionLabel?: string;
   variant?: "inline" | "page";
 }) {
   const [copyState, setCopyState] = useState("");
@@ -49,7 +51,7 @@ export function RequestError({
         )}
         {onRetry && (
           <Button onClick={onRetry} type="primary">
-            Повторить
+            {actionLabel}
           </Button>
         )}
       </div>
@@ -87,7 +89,7 @@ export function RequestError({
       role="alert"
       showIcon
       type="error"
-      action={onRetry && <Button onClick={onRetry}>Повторить</Button>}
+      action={onRetry && <Button onClick={onRetry}>{actionLabel}</Button>}
     />
   );
 }
