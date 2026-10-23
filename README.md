@@ -147,6 +147,8 @@ docker compose --env-file .env.production -f docker-compose.yml -f docker-compos
 docker compose --env-file .env.production -f docker-compose.yml -f docker-compose.prod.yml up --build -d
 ```
 
+Production proxy собирает React по `frontend/package-lock.json` и обслуживает готовые файлы через HTTPS. Для обновления фронтенда пересоберите и пересоздайте только proxy: `docker compose --env-file .env.production -f docker-compose.yml -f docker-compose.prod.yml up --build -d proxy`. Проверьте `https://<публичное DNS-имя>/login`, локальный вход, обновление защищённой страницы и `/api/v1/health/ready` на том же адресе. Сертификат и ключ берутся из защищённых файлов `WEB_CERTIFICATE_FILE` и `WEB_PRIVATE_KEY_FILE`; остальные секреты также передаются файлами хоста. Development по-прежнему доступен через `http://localhost:8080` и Vite за proxy. Настройка OIDC через интерфейс относится к TASK-27.
+
 Наружу публикуются только Nginx 80/443 и TLS-порт Kafka 9094. Порт 80 перенаправляет на HTTPS. Ограничьте 9094 сетями агентов. FastAPI, PostgreSQL и внутренний `SASL_SSL` listener Kafka не публикуются. Веб- и Kafka-сертификаты имеют независимые имена и процедуры продления. Обновите файлы на месте и выполните `docker compose ... restart proxy kafka`, сохранив тома. Ротация секретов описана в [инструкции по TLS](docs/tls.md). Не используйте `down -v` для обычной остановки. Kafka-подключение приложения использует внутренний `kafka:9092`; внешние агенты используют TLS-адрес и 9094.
 
 Учётные записи агентов и индивидуальные ACL создаёт provisioner. Runtime principal приложения читает существующие топики; он не может создавать топики или записывать сообщения. Готовую конфигурацию администратор однократно получает в разделе «Агенты».

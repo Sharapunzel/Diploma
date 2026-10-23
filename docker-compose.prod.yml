@@ -67,11 +67,14 @@ services:
       FORWARDED_ALLOW_IPS: ${PROXY_IP:-172.30.0.10}
     secrets: [database_url, kafka_reader_password, kafka_admin_password, kafka_ca, agent_credentials_key, oidc_state_secret, external_secret_key]
   proxy:
+    image: ${COMPOSE_PROJECT_NAME:-diploma}-proxy
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile.prod
     ports:
       - "${HTTP_BIND:-0.0.0.0:80:80}"
       - "${HTTPS_BIND:-0.0.0.0:443:443}"
-    volumes:
-      - ./nginx/prod.conf:/etc/nginx/conf.d/default.conf:ro
+    volumes: !reset []
     secrets: [web_certificate, web_private_key]
 
 secrets:

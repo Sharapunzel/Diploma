@@ -1,0 +1,25 @@
+FROM node:20.19.5-alpine AS frontend-build
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/index.html frontend/vite.config.ts frontend/tsconfig.json ./
+COPY frontend/src/ ./src/
+COPY frontend/public/ ./public/
+RUN test ! -d .ruff_cache \
+    && test ! -d .harness \
+    && test ! -d .pytest_cache \
+    && test ! -e tsconfig.tsbuildinfo \
+    && test ! -d dist \
+    && test ! -d test-results \
+    && test ! -d coverage \
+    && test ! -d .vite \
+    && test ! -d .npm-cache \
+    && test ! -d .playwright \
+    && test ! -e .coverage \
+    && test ! -e .npmrc \
+    && test ! -e .env
+RUN npm run build && ! find dist -name '*.map' -print -quit | grep -q .
+
+FROM nginx:1.30.5-alpine
+COPY nginx/prod.conf /etc/nginx/conf.d/default.conf
+COPY --from=frontend-build /app/dist/ /usr/share/nginx/html/

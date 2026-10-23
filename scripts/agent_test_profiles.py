@@ -49,9 +49,13 @@ def pytest_addopts(run: Path) -> str:
     return options
 
 
-def command(args: list[str], *, env: dict[str, str], cwd: Path = ROOT, capture=False):
-    result = subprocess.run(args, cwd=cwd, env=env, check=False,
-                            text=True, capture_output=capture)
+def command(args: list[str], *, env: dict[str, str], cwd: Path = ROOT, capture=False,
+            timeout: int | None = None):
+    try:
+        result = subprocess.run(args, cwd=cwd, env=env, check=False,
+                                text=True, capture_output=capture, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(args[:5])}") from exc
     if result.returncode:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(args[:5])}")
     return result.stdout if capture else ""
@@ -126,6 +130,7 @@ def remove_new_images(before: dict, env: dict[str, str], project: str) -> None:
     prior = set(before["images"])
     prior_ids = {entry.split(" ", 1)[0] for entry in prior}
     allowed = (f"{project}-", "fluent/fluent-bit:4.2.3", "moby/buildkit:buildx-stable-1",
+               "node:20.19.5-bookworm-slim",
                "python:3.12-slim", "node:20.19.5-alpine", "nginx:1.30.5-alpine",
                "postgres:18", "apache/kafka:4.2.0")
     for entry in inventory(env)["images"]:
@@ -276,7 +281,7 @@ def check_config(compose: list[str], project: str, env: dict[str, str], run: Pat
             raise RuntimeError(f"Missing resource limit for {name}")
         if service.get("build"):
             context = Path(service["build"]["context"]).resolve()
-            if context not in {ROOT / "backend", ROOT / "frontend", ROOT / "kafka"}:
+            if context not in {ROOT, ROOT / "backend", ROOT / "frontend", ROOT / "kafka"}:
                 raise RuntimeError(f"Unexpected build context for {name}")
         for port in service.get("ports", []):
             if port.get("host_ip") not in {"127.0.0.1", "::1"}:
@@ -402,11 +407,38 @@ def smoke_http(env: dict[str, str], production: bool) -> None:
         if time.monotonic() >= deadline:
             raise RuntimeError("API readiness through proxy failed")
         time.sleep(1)
-    if not production:
+    if production:
+        import re
+        def response(path: str):
+            try:
+                with urllib.request.urlopen(url + path, context=context, timeout=15) as result:
+                    return result.status, result.headers, result.read()
+            except urllib.error.HTTPError as error:
+                return error.code, error.headers, error.read()
+
+        status, headers, html = response("/login")
+        if status != 200 or "text/html" not in headers.get("Content-Type", "") or b"/assets/" not in html:
+            raise RuntimeError("Production login route did not serve React HTML")
+        for path in ("/", "/agents", "/events", "/administration", "/normalizers/new"):
+            route_status, route_headers, _ = response(path)
+            if route_status != 200 or "text/html" not in route_headers.get("Content-Type", ""):
+                raise RuntimeError(f"Production UI route failed: {path}")
+        assets = re.findall(rb'(?:src|href)="(/assets/[^\"]+)"', html)
+        if not assets or not any(asset.endswith(b".js") for asset in assets):
+            raise RuntimeError("Production HTML has no JavaScript assets")
+        for asset in assets:
+            asset_status, asset_headers, asset_body = response(asset.decode("ascii"))
+            if asset_status != 200 or not asset_body or "text/html" in asset_headers.get("Content-Type", ""):
+                raise RuntimeError(f"Production asset failed: {asset.decode('ascii')}")
+        for path in ("/api", "/api/v1/does-not-exist", "/assets/missing.js", "/docs", "/redoc", "/openapi.json"):
+            error_status, _, error_body = response(path)
+            if error_status < 400 or b'<div id="root"' in error_body:
+                raise RuntimeError(f"Production route unexpectedly served React: {path}")
+    else:
         with urllib.request.urlopen(url + "/agents", timeout=15) as response:
             if response.status != 200 or "text/html" not in response.headers.get("Content-Type", ""):
                 raise RuntimeError("Frontend route through proxy failed")
-    print(f"Proxy smoke passed: {url} (API{' and frontend' if not production else ''})", flush=True)
+    print(f"Proxy smoke passed: {url} (API and frontend)", flush=True)
 
 
 def systemd_filter_smoke(env: dict[str, str], run: Path) -> None:
@@ -727,7 +759,14 @@ def tls_agent_smoke(compose: list[str], project: str, env: dict[str, str], run: 
     profile_env = {**env, "TASK21_ADMIN_PASSWORD": password, "TASK21_TOPIC": topic,
                    "TASK21_RUN_DIR": str(run),
                    "PLAYWRIGHT_BASE_URL": f"https://localhost:{env['HTTPS_BIND'].split(':')[1]}",
+                   "TASK21_SECURE_COOKIE": "true",
                    "DATABASE_URL": env["TEST_DATABASE_URL"], "ENVIRONMENT": "test"}
+    if not profile_env.get("PLAYWRIGHT_CHROME_PATH"):
+        for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                          r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"):
+            if Path(candidate).is_file():
+                profile_env["PLAYWRIGHT_CHROME_PATH"] = candidate
+                break
     profile_env.pop("DATABASE_URL_FILE", None)
     create = (
         "import os,app.cli as cli; "
@@ -736,6 +775,61 @@ def tls_agent_smoke(compose: list[str], project: str, env: dict[str, str], run: 
     )
     command([*compose, "exec", "-T", "-e", f"TASK21_ADMIN_PASSWORD={password}",
              "api", "python", "-c", create], env=profile_env)
+    proxy_container = command([*compose, "ps", "-q", "proxy"], env=profile_env, capture=True).strip()
+    if not proxy_container:
+        raise RuntimeError("Production proxy is unavailable for the browser smoke")
+    browser_result = run / "production-session-playwright"
+    browser_result.mkdir()
+    source = ROOT / "frontend"
+    browser_context = run / "browser-context"
+    browser_context.mkdir()
+    for name in ("package.json", "package-lock.json", "playwright.config.ts"):
+        (browser_context / name).write_bytes((source / name).read_bytes())
+    (browser_context / "proxy.session.spec.ts").write_bytes(
+        (source / "browser" / "proxy.session.spec.ts").read_bytes()
+    )
+    (browser_context / "Dockerfile").write_text(
+        "FROM node:20.19.5-bookworm-slim\n"
+        "RUN apt-get update && apt-get install -y --no-install-recommends "
+        "ca-certificates libnss3-tools libasound2 libatk1.0-0 libatk-bridge2.0-0 "
+        "libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1 "
+        "libglib2.0-0 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 "
+        "libxdamage1 libxext6 libxfixes3 libxrandr2 libxkbcommon0 "
+        "fonts-liberation "
+        "&& rm -rf /var/lib/apt/lists/*\n"
+        "WORKDIR /test\n"
+        "COPY package.json package-lock.json ./\n"
+        "RUN npm ci --ignore-scripts --no-audit --no-fund\n"
+        "RUN npx playwright install --only-shell chromium\n"
+        "COPY playwright.config.ts ./\n"
+        "COPY proxy.session.spec.ts ./browser/proxy.session.spec.ts\n",
+        encoding="utf-8",
+    )
+    browser_image = f"{project}-browser"
+    command(["docker", "buildx", "build", "--load", "-t", browser_image,
+             str(browser_context)], env=profile_env, timeout=600)
+    browser_container = f"{project}-browser-smoke"
+    browser_command = [
+        "docker", "run", "--rm", "--name", browser_container,
+        "--user", "root", "--memory", "2g", "--cpus", "2",
+        "--network", f"container:{proxy_container}", "--label", f"task26.project={project}",
+        "-v", f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/test-ca.pem:ro",
+        "-v", f"{browser_result.resolve()}:/results",
+        "-e", f"TASK21_ADMIN_PASSWORD={password}", "-e", "TASK21_SECURE_COOKIE=true",
+        "-e", "PLAYWRIGHT_BASE_URL=https://localhost",
+        browser_image, "sh", "-lc",
+        "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb && "
+        "cp /tmp/test-ca.pem /usr/local/share/ca-certificates/task26-smoke.crt && "
+        "update-ca-certificates >/dev/null && "
+        "certutil -d sql:/root/.pki/nssdb -N --empty-password && "
+        "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n task26-smoke -i /tmp/test-ca.pem && "
+        "npx playwright test browser/proxy.session.spec.ts --output /results",
+    ]
+    try:
+        command(browser_command, env=profile_env, timeout=180)
+    finally:
+        subprocess.run(["docker", "rm", "-f", browser_container], env=profile_env,
+                       cwd=ROOT, check=False, capture_output=True, timeout=30)
     command([NPM, "run", "test:browser", "--", "agents.tls.spec.ts", "--output", str(run / "playwright")],
             env=profile_env, cwd=ROOT / "frontend")
     rendered = (run / "fluent-bit.conf").read_text(encoding="utf-8")
@@ -889,6 +983,33 @@ def main() -> None:
             if args.profile in {"end-to-end", "smoke-production"}:
                 verify_agent_metadata(compose, project, env)
             smoke_http(env, production)
+            if args.profile == "smoke-development":
+                password = secrets.token_urlsafe(24)
+                browser_env = {**env, "TASK21_ADMIN_PASSWORD": password,
+                               "TASK21_SECURE_COOKIE": "false",
+                               "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{env['PROXY_BIND'].split(':')[1]}"}
+                if not browser_env.get("PLAYWRIGHT_CHROME_PATH"):
+                    for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                                      r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"):
+                        if Path(candidate).is_file():
+                            browser_env["PLAYWRIGHT_CHROME_PATH"] = candidate
+                            break
+                create = (
+                    "import os,app.cli as cli; "
+                    "cli.getpass.getpass=lambda prompt: os.environ['TASK21_ADMIN_PASSWORD']; "
+                    "raise SystemExit(cli.create_admin('task21admin','Task 21 admin'))"
+                )
+                command([*compose, "exec", "-T", "-e", f"TASK21_ADMIN_PASSWORD={password}",
+                         "api", "python", "-c", create], env=browser_env)
+                command([NPM, "run", "test:browser", "--", "proxy.session.spec.ts",
+                         "--output", str(run / "development-session-playwright")],
+                        env=browser_env, cwd=ROOT / "frontend")
+            if production:
+                command([*compose, "exec", "-T", "proxy", "sh", "-c",
+                         "test ! -e /usr/bin/node && test ! -e /app && "
+                         "test -z \"$(find /usr/share/nginx/html -name '*.map' -print -quit)\""], env=env)
+                command([*compose, "up", "-d", "--no-deps", "--force-recreate", "--wait", "proxy"], env=env)
+                smoke_http(env, True)
             if args.profile == "end-to-end":
                 end_to_end(compose, project, env, run)
             if args.profile == "smoke-production":
@@ -903,7 +1024,7 @@ def main() -> None:
                 )]
                 print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
             command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
-            for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend"):
+            for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend", "proxy", "browser"):
                 image = f"{project}-{service}"
                 matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
                 if image in matches:
