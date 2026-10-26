@@ -13,7 +13,7 @@ import { AppLayout } from "../../widgets/layout/AppLayout";
 import { AppRequestError } from "../ui/AppRequestError";
 import { ThemeToggleControl } from "../ui/ThemeToggleControl";
 import styles from "./routes.module.css";
-import { homePage, pages } from "./permissions";
+import { canAccessPage, homePage, pages } from "./permissions";
 
 const LoginPage = lazy(() =>
   import("../../pages/login/LoginPage").then(({ LoginPage }) => ({
@@ -113,7 +113,13 @@ function ErrorStatus({
 }
 
 export const Protected = observer(
-  ({ permission, children }: { permission?: string; children: ReactNode }) => {
+  ({
+    permission,
+    children,
+  }: {
+    permission?: string | readonly string[];
+    children: ReactNode;
+  }) => {
     const { session } = useStores();
     const location = useLocation();
     if (session.state === "loading") return <LoadingStatus />;
@@ -132,7 +138,8 @@ export const Protected = observer(
     }
     return (
       <AppLayout>
-        {permission && !session.has(permission) ? (
+        {permission &&
+        !canAccessPage(permission, (value) => session.has(value)) ? (
           <Alert
             type="warning"
             message="Недостаточно прав для просмотра раздела"

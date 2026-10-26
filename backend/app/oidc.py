@@ -6,17 +6,20 @@ from .config import Settings
 
 
 class AuthlibOidcClient:
-    def __init__(self, settings: Settings, transport=None):
+    def __init__(self, settings: Settings, transport=None, metadata=None, verify=None):
         self.redirect_uri = settings.oidc_redirect_uri
         self.oauth = OAuth()
         client_kwargs = {"scope": " ".join(settings.oidc_scopes)}
         if transport is not None:
             client_kwargs["transport"] = transport
+        if verify is not None:
+            client_kwargs["verify"] = verify
+            client_kwargs["trust_env"] = False
         self.oauth.register(
             name="oidc",
             server_metadata_url=(
                 settings.oidc_issuer_url.rstrip("/") + "/.well-known/openid-configuration"
-                if settings.oidc_issuer_url
+                if settings.oidc_issuer_url and metadata is None
                 else None
             ),
             client_id=settings.oidc_client_id,
@@ -27,6 +30,8 @@ class AuthlibOidcClient:
             ),
             client_kwargs=client_kwargs,
         )
+        if metadata is not None:
+            self.oauth.oidc.server_metadata.update(metadata)
 
     async def authorization_redirect(self, request: Any, nonce: str):
         return await self.oauth.oidc.authorize_redirect(

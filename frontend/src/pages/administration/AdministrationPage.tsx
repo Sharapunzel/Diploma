@@ -37,6 +37,7 @@ import { useStores } from "../../app/providers/StoresProvider";
 import { AppRequestError } from "../../app/ui/AppRequestError";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
 import styles from "./AdministrationPage.module.css";
+import { OidcMethodsBlock } from "./OidcMethodsBlock";
 
 const ADMIN_ID = "00000000-0000-4000-8000-000000000001";
 const PAGE_SIZE = 20;
@@ -96,6 +97,7 @@ export const AdministrationPage = observer(() => {
   const { api, session } = useStores();
   const service = useMemo(() => new AdministrationApi(api), [api]);
   const canWrite = session.has("users.write");
+  const canReadUsers = session.has("users.read");
   const [users, setUsers] = useState<Page<ManagedUser> | null>(null);
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [mappings, setMappings] = useState<Page<Mapping> | null>(null);
@@ -285,17 +287,17 @@ export const AdministrationPage = observer(() => {
     }
   }, [service]);
   useEffect(() => {
-    void loadUsers();
-  }, [loadUsers]);
+    if (canReadUsers) void loadUsers();
+  }, [canReadUsers, loadUsers]);
   useEffect(() => {
-    void loadRoles();
-  }, [loadRoles]);
+    if (canReadUsers) void loadRoles();
+  }, [canReadUsers, loadRoles]);
   useEffect(() => {
-    if (tab === "mappings") void loadMappings();
-  }, [tab, loadMappings]);
+    if (canReadUsers && tab === "mappings") void loadMappings();
+  }, [canReadUsers, tab, loadMappings]);
   useEffect(() => {
-    void loadMethods();
-  }, [loadMethods]);
+    if (canReadUsers) void loadMethods();
+  }, [canReadUsers, loadMethods]);
 
   const run = async (
     action: () => Promise<unknown>,
@@ -564,6 +566,15 @@ export const AdministrationPage = observer(() => {
       ),
     },
   ];
+
+  if (!canReadUsers) {
+    return (
+      <main className={styles.page}>
+        <Typography.Title level={2}>Администрирование</Typography.Title>
+        {session.has("settings.read") && <OidcMethodsBlock />}
+      </main>
+    );
+  }
 
   return (
     <main className={styles.page}>
@@ -884,6 +895,7 @@ export const AdministrationPage = observer(() => {
           </div>
         </div>
       </section>
+      {session.has("settings.read") && <OidcMethodsBlock />}
       <Modal
         open={userForm !== null}
         title={

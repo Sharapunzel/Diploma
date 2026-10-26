@@ -11,7 +11,11 @@ class AuthenticationService(Protocol):
         self, username: str, password: str, previous_token: str | None = None
     ) -> AuthResult: ...
     def oidc_login(
-        self, claims: dict[str, Any], previous_token: str | None = None
+        self,
+        claims: dict[str, Any],
+        previous_token: str | None = None,
+        *,
+        allow_managed: bool = False,
     ) -> AuthResult: ...
     def inspect_session(self, token: str | None) -> Principal | None: ...
     def csrf_matches(

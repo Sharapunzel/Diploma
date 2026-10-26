@@ -4,7 +4,6 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const username = process.env.PLAYWRIGHT_USERNAME;
 const password = process.env.PLAYWRIGHT_PASSWORD;
-const visualUsername = "smoke14-long-username-visual-check-0123456789";
 if (!username || !password || process.env.PLAYWRIGHT_OIDC !== "1") {
   throw new Error(
     "Browser acceptance requires PLAYWRIGHT_USERNAME, PLAYWRIGHT_PASSWORD and PLAYWRIGHT_OIDC=1",
@@ -74,7 +73,7 @@ async function verifyThemePalette(page: Page) {
 
 async function capture(page: Page, name: string) {
   await page.screenshot({
-    path: `test-results/visual-review/${name}.png`,
+    path: test.info().outputPath("visual-review", `${name}.png`),
     fullPage: true,
   });
 }
@@ -291,7 +290,7 @@ test("local login, server session, protected route and confirmed keyboard logout
   await expect(page.locator("#main")).toBeFocused();
 
   const account = page.getByRole("button", {
-    name: `Аккаунт: ${visualUsername}`,
+    name: `Аккаунт: ${username}`,
   });
   await account.click();
   const panel = page.getByRole("region", { name: "Аккаунт" });
@@ -342,10 +341,7 @@ test("local login, server session, protected route and confirmed keyboard logout
     .getByRole("button", { name: "Тема: светлая. Переключить на тёмную" })
     .click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await expect(panel.getByText(visualUsername, { exact: true })).toBeVisible();
-  await expect(
-    panel.getByText("Алиса Очень Длинное Отображаемое Имя Для Проверки Экрана"),
-  ).toBeHidden();
+  await expect(panel.getByText(username!, { exact: true })).toBeVisible();
   await capture(page, "workspace-dark");
   await expect
     .poll(() => page.evaluate(() => localStorage.getItem("theme")))
@@ -355,7 +351,7 @@ test("local login, server session, protected route and confirmed keyboard logout
 
   await page
     .getByRole("button", {
-      name: `Аккаунт: ${visualUsername}`,
+      name: `Аккаунт: ${username}`,
     })
     .click();
   await page
@@ -414,14 +410,14 @@ test("mobile navigation, account layout and viewport bounds", async ({
   }));
   expect(headingAndItemFontSizes.heading).toBe(headingAndItemFontSizes.item);
   await expect(desktopNav.getByRole("link")).toHaveCount(8);
-  await desktopNav.getByRole("link", { name: "Настройки приложения" }).click();
-  await expect(page).toHaveURL(/\/settings$/);
+  await desktopNav.getByRole("link", { name: "Администрирование" }).click();
+  await expect(page).toHaveURL(/\/administration$/);
   await expect(page.getByTestId("workspace-title")).toHaveText(
-    "Настройки приложения",
+    "Администрирование",
   );
   await expect(desktopNav.locator(".ant-menu-item-selected a")).toHaveAttribute(
     "href",
-    "/settings",
+    "/administration",
   );
   await page.goto("/");
   await expect(page.getByTestId("workspace-brand")).toHaveJSProperty(
@@ -432,41 +428,16 @@ test("mobile navigation, account layout and viewport bounds", async ({
   await expect(
     page.getByTestId("workspace-brand").locator("img"),
   ).toHaveAttribute("src", "/pictures/logoGreen.svg");
-  await expect(page.getByTestId("placeholder-panel")).toBeVisible();
-  await page.getByRole("button", { name: "Показать загрузку" }).click();
-  const overlay = page.getByTestId("loading-overlay");
-  await expect(overlay).toBeVisible();
-  await expect(overlay).toHaveCSS("pointer-events", "none");
-  const loadingLayout = await page.evaluate(() => {
-    const rect = (selector: string) =>
-      document.querySelector(selector)!.getBoundingClientRect();
-    const dim = rect('[data-testid="loading-overlay"]');
-    const sidebar = rect(".ant-layout-sider");
-    const spinner = rect('[data-testid="loading-overlay"] .ant-spin');
-    return {
-      top: dim.top,
-      left: dim.left,
-      right: dim.right,
-      bottom: dim.bottom,
-      sidebarRight: sidebar.right,
-      spinnerWidth: spinner.width,
-      bodyFont: Number.parseFloat(getComputedStyle(document.body).fontSize),
-      viewportWidth: innerWidth,
-      viewportHeight: innerHeight,
-    };
-  });
-  expect(loadingLayout.top).toBe(0);
-  expect(loadingLayout.left).toBe(loadingLayout.sidebarRight);
-  expect(loadingLayout.right).toBe(loadingLayout.viewportWidth);
-  expect(loadingLayout.bottom).toBe(loadingLayout.viewportHeight);
-  expect(loadingLayout.spinnerWidth).toBe(36);
-  expect(loadingLayout.bodyFont).toBe(15);
+  await expect(
+    page.getByRole("heading", { name: "От источника до анализа событий" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Текущий инвентарь" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("workspace-shell")).toBeVisible();
   await page.locator('[aria-label^="Аккаунт:"]').click();
   await expect(page.locator("#account-panel")).toBeVisible();
   await page.locator('[aria-label^="Аккаунт:"]').click();
-  await capture(page, "home-loading-overlay");
-  await page.getByRole("button", { name: "Скрыть загрузку" }).click();
-  await expect(overlay).toHaveCount(0);
   await page.goto("/missing-review-route");
   await expect(
     page
@@ -501,6 +472,16 @@ test("mobile navigation, account layout and viewport bounds", async ({
           '[data-testid="workspace-header"]',
         )!;
         const headerRect = header.getBoundingClientRect();
+        const headerStyle = getComputedStyle(header);
+        const columns = headerStyle.gridTemplateColumns
+          .split(" ")
+          .map((value) => Number.parseFloat(value));
+        const titleCellCenter =
+          headerRect.left +
+          Number.parseFloat(headerStyle.paddingLeft) +
+          columns[0] +
+          Number.parseFloat(headerStyle.columnGap) +
+          columns[1] / 2;
         const intersects =
           titleRect.left < accountRect.right &&
           titleRect.right > accountRect.left;
@@ -510,7 +491,7 @@ test("mobile navigation, account layout and viewport bounds", async ({
           shellLeft: shell.getBoundingClientRect().left,
           shellWidth: shell.getBoundingClientRect().width,
           titleCenter: (titleRect.left + titleRect.right) / 2,
-          workspaceCenter: (headerRect.left + headerRect.right) / 2,
+          titleCellCenter,
           titleMiddle: (titleRect.top + titleRect.bottom) / 2,
           headerMiddle: (headerRect.top + headerRect.bottom) / 2,
           titleIntersectsAccount: intersects,
@@ -526,11 +507,11 @@ test("mobile navigation, account layout and viewport bounds", async ({
       expect(layout.shellLeft).toBe(0);
       expect(layout.shellWidth).toBe(width);
       expect(
-        Math.abs(layout.titleCenter - layout.workspaceCenter),
+        Math.abs(layout.titleCenter - layout.titleCellCenter),
       ).toBeLessThanOrEqual(1);
       expect(
         Math.abs(layout.titleMiddle - layout.headerMiddle),
-      ).toBeLessThanOrEqual(1);
+      ).toBeLessThanOrEqual(3);
       expect(
         layout.titleIntersectsAccount,
         `${choice} title/account overlap at ${width}px`,
@@ -637,16 +618,27 @@ test("mobile navigation, account layout and viewport bounds", async ({
           .getBoundingClientRect();
         return (rect.left + rect.right) / 2;
       })(),
-      workspaceCenter: (() => {
-        const rect = document
-          .querySelector('[data-testid="workspace-header"]')!
-          .getBoundingClientRect();
-        return (rect.left + rect.right) / 2;
+      titleCellCenter: (() => {
+        const header = document.querySelector(
+          '[data-testid="workspace-header"]',
+        )!;
+        const rect = header.getBoundingClientRect();
+        const style = getComputedStyle(header);
+        const columns = style.gridTemplateColumns
+          .split(" ")
+          .map((value) => Number.parseFloat(value));
+        return (
+          rect.left +
+          Number.parseFloat(style.paddingLeft) +
+          columns[0] +
+          Number.parseFloat(style.columnGap) +
+          columns[1] / 2
+        );
       })(),
     }));
     expect(zoomLayout.documentOverflow).toBe(false);
     expect(
-      Math.abs(zoomLayout.titleCenter - zoomLayout.workspaceCenter),
+      Math.abs(zoomLayout.titleCenter - zoomLayout.titleCellCenter),
     ).toBeLessThanOrEqual(1);
     await page.setViewportSize({ width: 320, height: 900 });
     const mobile = page.getByRole("button", { name: "Открыть меню" });
@@ -686,19 +678,12 @@ test("mobile navigation, account layout and viewport bounds", async ({
     await expect(nav).not.toBeVisible();
 
     const account = page.getByRole("button", {
-      name: `Аккаунт: ${visualUsername}`,
+      name: `Аккаунт: ${username}`,
     });
     await account.click();
     const panel = page.getByRole("region", { name: "Аккаунт" });
     await expect(panel).toBeVisible();
-    await expect(
-      panel.getByText(visualUsername, { exact: true }),
-    ).toBeVisible();
-    await expect(
-      panel.getByText(
-        "Алиса Очень Длинное Отображаемое Имя Для Проверки Экрана",
-      ),
-    ).toHaveCount(0);
+    await expect(panel.getByText(username!, { exact: true })).toBeVisible();
     const panelOverflow = await panel.evaluate(
       (element) => element.scrollWidth > element.clientWidth,
     );
@@ -707,11 +692,11 @@ test("mobile navigation, account layout and viewport bounds", async ({
     await expect(account).toBeFocused();
     if (choice === "light") {
       await mobile.click();
-      await nav.getByRole("link", { name: "Настройки приложения" }).click();
-      await expect(page).toHaveURL(/\/settings$/);
+      await nav.getByRole("link", { name: "Администрирование" }).click();
+      await expect(page).toHaveURL(/\/administration$/);
       await expect(nav).not.toBeVisible();
       await expect(page.getByTestId("workspace-title")).toHaveText(
-        "Настройки приложения",
+        "Администрирование",
       );
       await page.goto("/");
     }

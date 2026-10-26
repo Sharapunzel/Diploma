@@ -228,6 +228,34 @@ export function errorText(error: unknown): string {
     index_not_found: "Цель не найдена в индексере.",
     invalid_ca: "CA не прошёл проверку. Загрузите публичный PEM сертификат.",
     invalid_ca_media_type: "Для CA требуется PEM файл.",
+    oidc_key_unavailable:
+      "Ключ шифрования OIDC недоступен. Проверьте защищённый файл на хосте.",
+    oidc_configuration_unavailable:
+      "Активная конфигурация OIDC недоступна. Войдите локальным администратором и восстановите настройки.",
+    oidc_version_conflict:
+      "Черновик изменился. Обновите состояние перед следующим действием.",
+    oidc_secret_required: "Укажите client secret для проверки провайдера.",
+    oidc_trial_required: "Выполните пробный вход для текущей версии черновика.",
+    oidc_ca_invalid:
+      "CA не прошёл проверку. Загрузите публичный PEM сертификат.",
+    oidc_url_invalid: "Введите допустимый абсолютный адрес.",
+    oidc_https_required:
+      "Для провайдера требуется HTTPS; локальный HTTP допускается только на loopback.",
+    oidc_callback_invalid:
+      "Callback должен указывать на /api/v1/auth/oidc/callback.",
+    oidc_callback_origin_invalid:
+      "Callback не совпадает с текущим публичным адресом приложения. Исправьте адрес в черновике.",
+    oidc_public_origin_invalid:
+      "Публичный адрес приложения на хосте некорректен. Исправьте PUBLIC_ORIGIN; локальный вход доступен.",
+    oidc_tls_invalid: "Сертификат провайдера не прошёл проверку.",
+    oidc_hostname_mismatch: "Имя провайдера не совпадает с его сертификатом.",
+    oidc_unreachable: "Провайдер недоступен.",
+    oidc_metadata_invalid: "Discovery провайдера вернул некорректные данные.",
+    oidc_metadata_origin_invalid:
+      "Адреса OIDC endpoint отличаются от адреса issuer.",
+    oidc_jwks_invalid: "Ключи подписи провайдера недоступны или некорректны.",
+    oidc_trial_failed:
+      "Пробный вход не завершился. Проверьте настройки провайдера и повторите попытку.",
   };
   if (known[error.code]) return known[error.code];
   let message: string;

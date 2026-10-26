@@ -1,7 +1,7 @@
 type NavigationPage = {
   path: string;
   label: string;
-  permission: string | null;
+  permission: string | readonly string[] | null;
 };
 
 type NavigationGroup = {
@@ -42,12 +42,7 @@ export const navigationGroups = [
       {
         path: "/administration",
         label: "Администрирование",
-        permission: "users.read",
-      },
-      {
-        path: "/settings",
-        label: "Настройки приложения",
-        permission: "settings.read",
+        permission: ["users.read", "settings.read"],
       },
     ],
   },
@@ -58,9 +53,21 @@ export const homePage = navigationGroups[0].pages[0];
 export const pages = navigationGroups
   .reduce<NavigationPage[]>((result, group) => [...result, ...group.pages], [])
   .filter(
-    (page): page is NavigationPage & { permission: string } =>
+    (
+      page,
+    ): page is NavigationPage & { permission: string | readonly string[] } =>
       page.permission !== null,
   );
+
+export function canAccessPage(
+  permission: NavigationPage["permission"],
+  hasPermission: (permission: string) => boolean,
+): boolean {
+  if (permission === null) return true;
+  return typeof permission === "string"
+    ? hasPermission(permission)
+    : permission.some(hasPermission);
+}
 
 export function availableNavigationGroups(
   hasPermission: (permission: string) => boolean,
@@ -68,8 +75,8 @@ export function availableNavigationGroups(
   return navigationGroups
     .map((group) => ({
       label: group.label,
-      pages: group.pages.filter(
-        (page) => page.permission === null || hasPermission(page.permission),
+      pages: group.pages.filter((page) =>
+        canAccessPage(page.permission, hasPermission),
       ),
     }))
     .filter((group) => group.pages.length > 0);

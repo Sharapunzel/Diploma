@@ -22,6 +22,7 @@ services:
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
       OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost:8080/api/v1/auth/oidc/callback}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8080}
       OIDC_SCOPES: ${OIDC_SCOPES:-openid,profile,email}
       OIDC_STATE_SECRET: ${OIDC_STATE_SECRET:-development-only-change-me-please-32-bytes}
       OIDC_SUCCESS_REDIRECT_URL: ${OIDC_SUCCESS_REDIRECT_URL:-/}

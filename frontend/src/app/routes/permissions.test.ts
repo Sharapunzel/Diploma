@@ -16,13 +16,15 @@ describe("navigation groups", () => {
       ["Главная"],
       ["Подключения", "Источники", "Агенты", "Нормализаторы", "Диагностика"],
       ["События"],
-      ["Администрирование", "Настройки приложения"],
+      ["Администрирование"],
     ]);
     expect(homePage.path).toBe("/");
-    expect(pages.find((page) => page.path === "/settings")).toMatchObject({
-      label: "Настройки приложения",
-      permission: "settings.read",
-    });
+    expect(pages.find((page) => page.path === "/settings")).toBeUndefined();
+    expect(pages.find((page) => page.path === "/administration")).toMatchObject(
+      {
+        permission: ["users.read", "settings.read"],
+      },
+    );
     expect(pages.find((page) => page.path === "/diagnostics")?.permission).toBe(
       "events.read",
     );

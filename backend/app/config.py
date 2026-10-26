@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     oidc_client_id: str | None = None
     oidc_client_secret: SecretStr | None = None
     oidc_redirect_uri: str | None = None
+    public_origin: str = "http://localhost:8080"
     oidc_scopes: list[str] = ["openid", "profile", "email"]
     oidc_success_redirect_url: str = "/"
     oidc_error_redirect_url: str = "/login?error=oidc"

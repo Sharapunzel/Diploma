@@ -1,6 +1,7 @@
-"""Synthetic local OIDC provider for isolated TASK-14 proxy smoke tests."""
+"""Synthetic OIDC provider for the permanent isolated proxy smoke profiles."""
 import json
 import os
+import ssl
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -10,12 +11,17 @@ from joserfc import jwt
 from joserfc.jwk import RSAKey
 
 PORT = int(os.environ.get("OIDC_STUB_PORT", "19095"))
-ISSUER = f"http://host.docker.internal:{PORT}"
+SCHEME = "https" if os.environ.get("OIDC_STUB_CERT_FILE") else "http"
+ISSUER = f"{SCHEME}://{os.environ.get('OIDC_STUB_HOST', 'oidc-idp')}:{PORT}"
+BROWSER_HOST = os.environ.get("OIDC_STUB_BROWSER_HOST", "oidc-idp")
 KEY = RSAKey.import_key(rsa.generate_private_key(65537, 2048))
 CODES = {}
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
     def send_json(self, data):
         body = json.dumps(data).encode()
         self.send_response(200)
@@ -29,9 +35,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/.well-known/openid-configuration":
             self.send_json({
                 "issuer": ISSUER,
-                "authorization_endpoint": f"http://localhost:{PORT}/authorize",
+                "authorization_endpoint": f"{SCHEME}://{BROWSER_HOST}:{PORT}/authorize",
                 "token_endpoint": f"{ISSUER}/token",
                 "jwks_uri": f"{ISSUER}/jwks",
+                "response_types_supported": ["code"],
                 "id_token_signing_alg_values_supported": ["RS256"],
             })
         elif parsed.path == "/jwks":
@@ -72,4 +79,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    # This process runs only in the temporary smoke container on its internal network.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    if SCHEME == "https":
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(os.environ["OIDC_STUB_CERT_FILE"], os.environ["OIDC_STUB_KEY_FILE"])
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()

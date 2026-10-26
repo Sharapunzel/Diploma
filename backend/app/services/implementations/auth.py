@@ -62,9 +62,13 @@ class AuthService:
         return self._replace_session(user, role, "local", previous_token)
 
     def oidc_login(
-        self, claims: dict[str, Any], previous_token: str | None = None
+        self,
+        claims: dict[str, Any],
+        previous_token: str | None = None,
+        *,
+        allow_managed: bool = False,
     ) -> tuple[str, str, User, Role]:
-        if not self.settings.oidc_enabled:
+        if not self.settings.oidc_enabled and not allow_managed:
             raise auth_method_disabled()
         issuer = claims.get("iss")
         subject = claims.get("sub")

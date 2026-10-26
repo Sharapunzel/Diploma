@@ -13,6 +13,7 @@ from .app import (
 )
 from .auth import AuthSession
 from .logs import KafkaOperationalEvent, ParsedLog, ProcessedKafkaRecord, ProcessingError
+from .oidc_provider import OidcProvider
 
 __all__ = [
     "AppSetting",
@@ -24,6 +25,7 @@ __all__ = [
     "KafkaOperationalEvent",
     "KafkaProvisioningOperation",
     "Normalizer",
+    "OidcProvider",
     "OidcRoleMapping",
     "ParsedLog",
     "ProcessedKafkaRecord",

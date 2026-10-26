@@ -51,6 +51,7 @@ afterEach(() => {
 function mount(
   handler?: (path: string, options?: RequestInit) => Promise<unknown>,
   selfId = "self",
+  permissions = ["users.read", "users.write"],
 ) {
   const stores = new AppStores();
   stores.session.accept(
@@ -63,7 +64,7 @@ function mount(
         display_name: "Admin",
       },
       role: "Administrator",
-      permissions: ["users.read", "users.write"],
+      permissions,
       authentication_method: "local",
       csrf_token: "csrf",
     },
@@ -92,6 +93,30 @@ function mount(
   );
   return request;
 }
+
+it("renders login methods independently when only settings.read is granted", async () => {
+  const request = mount(
+    (path) => {
+      if (path === "/oidc-provider")
+        return Promise.resolve({
+          mode: "disabled",
+          env_enabled: false,
+          version: 1,
+          active_version: null,
+          active: null,
+          draft: null,
+          checked: false,
+          trial_succeeded: false,
+        });
+      return Promise.resolve(undefined);
+    },
+    "self",
+    ["settings.read"],
+  );
+  expect(await screen.findByText("Способы входа")).toBeDefined();
+  expect(screen.queryByText("Пользователи")).toBeNull();
+  expect(request.mock.calls.map(([path]) => path)).toEqual(["/oidc-provider"]);
+});
 
 function chooseOption(dialog: HTMLElement, field: string, option: string) {
   fireEvent.mouseDown(within(dialog).getByRole("combobox", { name: field }));

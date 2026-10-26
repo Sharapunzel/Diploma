@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import http.client
 import http.cookiejar
 import json
 import os
@@ -112,6 +113,34 @@ def certificates(run: Path) -> dict[str, Path]:
     return result
 
 
+def oidc_certificates(run: Path) -> dict[str, Path]:
+    """A provider-only CA and certificate; neither is trusted globally."""
+    now = datetime.now(UTC)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "OIDC smoke CA")])
+    ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+          .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+          .not_valid_before(now - timedelta(minutes=5)).not_valid_after(now + timedelta(days=2))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+          .sign(ca_key, hashes.SHA256()))
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "oidc-idp")])
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(ca_name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5)).not_valid_after(now + timedelta(days=2))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("oidc-idp")]), critical=False)
+            .sign(ca_key, hashes.SHA256()))
+    paths = {"OIDC_STUB_CA_FILE": run / "oidc_ca.pem",
+             "OIDC_STUB_CERT_FILE": run / "oidc_cert.pem",
+             "OIDC_STUB_KEY_FILE": run / "oidc_key.pem"}
+    paths["OIDC_STUB_CA_FILE"].write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    paths["OIDC_STUB_CERT_FILE"].write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    paths["OIDC_STUB_KEY_FILE"].write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+    return paths
+
+
 def inventory(env: dict[str, str]) -> dict:
     return {
         "containers": command(["docker", "ps", "-a", "--format", "{{.ID}} {{.Names}}"], env=env, capture=True).splitlines(),
@@ -131,6 +160,7 @@ def remove_new_images(before: dict, env: dict[str, str], project: str) -> None:
     prior_ids = {entry.split(" ", 1)[0] for entry in prior}
     allowed = (f"{project}-", "fluent/fluent-bit:4.2.3", "moby/buildkit:buildx-stable-1",
                "node:20.19.5-bookworm-slim",
+               "mcr.microsoft.com/playwright:v1.63.0-noble",
                "python:3.12-slim", "node:20.19.5-alpine", "nginx:1.30.5-alpine",
                "postgres:18", "apache/kafka:4.2.0")
     for entry in inventory(env)["images"]:
@@ -194,6 +224,72 @@ def frontend_artifact_snapshot() -> dict[str, tuple[int, str]]:
     return snapshot
 
 
+def oidc_compose_overlay(run: Path, env: dict[str, str], project: str) -> Path:
+    """Build a temporary IdP image and keep its listener on an internal project network."""
+    context = run / "oidc-idp"
+    context.mkdir()
+    (context / "oidc_proxy_stub.py").write_bytes(
+        (ROOT / "backend/tests/oidc_proxy_stub.py").read_bytes()
+    )
+    versions = subprocess.run(
+        [sys.executable, "-c", (
+            "import importlib.metadata as m; "
+            "print(m.version('cryptography')); print(m.version('joserfc'))"
+        )],
+        cwd=ROOT, env=env, check=True, text=True, capture_output=True,
+    ).stdout.splitlines()
+    if len(versions) != 2:
+        raise RuntimeError("Unable to resolve the pinned synthetic IdP dependencies")
+    (context / "Dockerfile").write_text(
+        "FROM python:3.12-slim\n"
+        f"RUN python -m pip install --no-cache-dir cryptography=={versions[0]} joserfc=={versions[1]}\n"
+        "WORKDIR /app\nCOPY oidc_proxy_stub.py ./oidc_proxy_stub.py\n"
+        "CMD [\"python\", \"/app/oidc_proxy_stub.py\"]\n",
+        encoding="utf-8",
+    )
+    overlay = {
+        "services": {
+            "oidc-idp": {
+                "image": f"{project}-oidc-idp",
+                "build": {"context": str(context), "dockerfile": "Dockerfile"},
+                "environment": {
+                    "OIDC_STUB_PORT": "19095",
+                    "OIDC_STUB_HOST": "oidc-idp",
+                    "OIDC_STUB_BROWSER_HOST": "oidc-idp",
+                    "OIDC_STUB_CERT_FILE": "/run/oidc/cert.pem",
+                    "OIDC_STUB_KEY_FILE": "/run/oidc/key.pem",
+                },
+                "volumes": [
+                    f"{Path(env['OIDC_STUB_CERT_FILE']).resolve()}:/run/oidc/cert.pem:ro",
+                    f"{Path(env['OIDC_STUB_KEY_FILE']).resolve()}:/run/oidc/key.pem:ro",
+                ],
+                "networks": ["oidc-private"],
+                "healthcheck": {
+                    "test": ["CMD", "python", "-c",
+                             "import socket; s=socket.create_connection(('127.0.0.1',19095),3); s.close()"],
+                    "interval": "1s", "timeout": "3s", "retries": 30,
+                },
+                "mem_limit": "256m", "cpus": 1.0,
+                "restart": "no",
+            },
+            "api": {
+                "depends_on": {"oidc-idp": {"condition": "service_healthy"}},
+                "networks": ["internal", "oidc-private"],
+            },
+            "proxy": {
+                "networks": {
+                    "internal": {"ipv4_address": env["PROXY_IP"]},
+                    "oidc-private": {},
+                },
+            },
+        },
+        "networks": {"oidc-private": {"driver": "bridge", "internal": True}},
+    }
+    path = run / "oidc-compose.json"
+    path.write_text(json.dumps(overlay, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
     suffix = uuid4().hex[:10]
     project = f"diploma_t21_{suffix}"
@@ -207,6 +303,8 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
         "AGENT_CREDENTIALS_KEY_FILE": secret_file(run, "agent_credentials_key", Fernet.generate_key().decode()),
     }
     production = profile == "smoke-production"
+    if profile in {"smoke-development", "smoke-production"}:
+        files.update(oidc_certificates(run))
     if production:
         files.update(certificates(run))
         files.update({
@@ -224,6 +322,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
            "KAFKA_BIND_ADDRESS": "127.0.0.1", "KAFKA_PUBLIC_HOST": "127.0.0.1",
            "KAFKA_HOST_PORT": str(kafka_port), "KAFKA_EXTERNAL_PORT": str(kafka_port),
            "PROXY_BIND": f"127.0.0.1:{proxy_port}:8080",
+           "PUBLIC_ORIGIN": f"http://localhost:{proxy_port}",
            "COMPOSE_SUBNET": subnet, "PROXY_IP": subnet.replace("0/24", "10"),
            "TEMP": str(run), "TMP": str(run), "TMPDIR": str(run),
            "PYTHONDONTWRITEBYTECODE": "1", "PIP_CACHE_DIR": str(run / "pip-cache"),
@@ -236,12 +335,18 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
            "KAFKA_TEST_ADMIN_PASSWORD_FILE": str(files["KAFKA_ADMIN_PASSWORD_FILE"]),
            "KAFKA_TEST_DEV_ALLOWED_BOOTSTRAP_SERVERS": f"127.0.0.1:{kafka_port},kafka:9092",
            }
+    if profile in {"smoke-development", "smoke-production"}:
+        env.update({"OIDC_STUB_PORT": "19095", "OIDC_STUB_HOST": "oidc-idp",
+                    "OIDC_STUB_BROWSER_HOST": "oidc-idp"})
+    if profile == "smoke-development":
+        env["EXTERNAL_SECRET_KEY"] = Fernet.generate_key().decode()
     if production:
         env.update({
             "KAFKA_PUBLIC_HOST": "127.0.0.1",
             "PUBLIC_HOST": "localhost",
             "HTTP_BIND": f"127.0.0.1:{proxy_port}:80",
             "HTTPS_BIND": f"127.0.0.1:{https_port}:443",
+            "PUBLIC_ORIGIN": f"https://localhost:{https_port}",
             "KAFKA_TEST_BOOTSTRAP_SERVERS": f"127.0.0.1:{kafka_port}",
             "KAFKA_TEST_SECURITY_PROTOCOL": "SASL_SSL",
             "KAFKA_TEST_CA_FILE": str(files["KAFKA_CA_FILE"]),
@@ -250,6 +355,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
     limits = run / "compose-limits.yml"
     limits.write_text("services:\n" + "".join(
         f"  {service}:\n    mem_limit: {memory}\n    cpus: 2.0\n"
+        + ("    build:\n      network: host\n" if service in {"kafka", "kafka-acls"} else "")
         for service, memory in {
             "postgres": "768m", "kafka": "2g", "kafka-acls": "512m",
             "migrate": "512m", "api": "1g", "provisioner": "768m",
@@ -258,6 +364,8 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
     ), encoding="utf-8")
     compose = [*COMPOSE, "-f", str(ROOT / ("docker-compose.prod.yml" if production else "docker-compose.dev.yml")),
                "-f", str(limits), "-p", project]
+    if profile in {"smoke-development", "smoke-production"}:
+        compose += ["-f", str(oidc_compose_overlay(run, env, project))]
     return env, compose, project
 
 
@@ -271,6 +379,17 @@ def check_config(compose: list[str], project: str, env: dict[str, str], run: Pat
     for name, network in config.get("networks", {}).items():
         if network.get("external") or not network.get("name", "").startswith(project + "_"):
             raise RuntimeError(f"Unsafe Compose network {name}")
+    if "oidc-idp" in config.get("services", {}):
+        private = config.get("networks", {}).get("oidc-private", {})
+        if not private.get("internal"):
+            raise RuntimeError("Synthetic OIDC network is not marked internal")
+        idp = config["services"]["oidc-idp"]
+        if idp.get("ports") or idp.get("network_mode") or idp.get("networks") != {"oidc-private": None}:
+            raise RuntimeError("Synthetic OIDC provider is not isolated from host ports")
+        if "oidc-private" not in config["services"]["api"].get("networks", {}):
+            raise RuntimeError("API cannot reach the isolated synthetic OIDC provider")
+        if "oidc-private" not in config["services"]["proxy"].get("networks", {}):
+            raise RuntimeError("Browser smoke network cannot reach the synthetic OIDC provider")
     for name, secret in config.get("secrets", {}).items():
         if not secret.get("file") or not Path(secret["file"]).resolve().is_relative_to(run):
             raise RuntimeError(f"Secret {name} is not isolated to this run")
@@ -281,7 +400,8 @@ def check_config(compose: list[str], project: str, env: dict[str, str], run: Pat
             raise RuntimeError(f"Missing resource limit for {name}")
         if service.get("build"):
             context = Path(service["build"]["context"]).resolve()
-            if context not in {ROOT, ROOT / "backend", ROOT / "frontend", ROOT / "kafka"}:
+            if (context not in {ROOT, ROOT / "backend", ROOT / "frontend", ROOT / "kafka"}
+                    and not context.is_relative_to(run.resolve())):
                 raise RuntimeError(f"Unexpected build context for {name}")
         for port in service.get("ports", []):
             if port.get("host_ip") not in {"127.0.0.1", "::1"}:
@@ -291,11 +411,12 @@ def check_config(compose: list[str], project: str, env: dict[str, str], run: Pat
                 source = Path(mount["source"]).resolve()
                 if "docker.sock" in str(source).lower():
                     raise RuntimeError("Docker socket mount is forbidden")
-                if source.is_relative_to(run):
-                    pass
-                elif source == ROOT / "frontend" and name == "frontend":
-                    pass
-                elif source in {ROOT / "nginx" / "dev.conf", ROOT / "nginx" / "prod.conf"} and mount.get("read_only"):
+                if (
+                    source.is_relative_to(run)
+                    or source == ROOT / "frontend" and name == "frontend"
+                    or source in {ROOT / "nginx" / "dev.conf", ROOT / "nginx" / "prod.conf"}
+                    and mount.get("read_only")
+                ):
                     pass
                 else:
                     raise RuntimeError(f"Unexpected bind mount for {name}: {source}")
@@ -441,6 +562,237 @@ def smoke_http(env: dict[str, str], production: bool) -> None:
     print(f"Proxy smoke passed: {url} (API and frontend)", flush=True)
 
 
+def oidc_administration_smoke(compose: list[str], env: dict[str, str], production: bool) -> None:
+    """Exercise managed OIDC through the same proxy and database as the smoke profile."""
+    port = (env["HTTPS_BIND"] if production else env["PROXY_BIND"]).split(":")[1]
+    base = f"{'https' if production else 'http'}://localhost:{port}"
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=env["OIDC_STUB_CA_FILE"])
+    if production:
+        context.load_verify_locations(cafile=env["KAFKA_CA_FILE"])
+    class FixtureHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, host, **kwargs):
+            super().__init__(host, **kwargs)
+            original_connect = self._create_connection
+
+            def mapped_connect(address, *args, **kwargs):
+                if address[0] == "oidc-idp":
+                    address = ("127.0.0.1", address[1])
+                return original_connect(address, *args, **kwargs)
+
+            self._create_connection = mapped_connect
+
+    class FixtureHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, request):
+            return self.do_open(FixtureHTTPSConnection, request, context=self._context)
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                         urllib.request.HTTPCookieProcessor(jar),
+                                         FixtureHTTPSHandler(context=context))
+    password = secrets.token_urlsafe(24)
+    create = (
+        "import os,app.cli as cli; "
+        "cli.getpass.getpass=lambda prompt: os.environ['TASK27_ADMIN_PASSWORD']; "
+        "raise SystemExit(cli.create_admin('task27admin','OIDC smoke admin'))"
+    )
+    command([*compose, "exec", "-T", "-e", f"TASK27_ADMIN_PASSWORD={password}",
+             "api", "python", "-c", create], env=env)
+
+    def call(path: str, method="GET", payload=None, csrf=None, content_type="application/json"):
+        headers = {"Content-Type": content_type} if payload is not None else {}
+        if csrf:
+            headers["X-CSRF-Token"] = csrf
+        data = (json.dumps(payload).encode() if content_type == "application/json"
+                else payload) if payload is not None else None
+        request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+        try:
+            with opener.open(request, timeout=20) as response:
+                body = response.read()
+                return response.status, json.loads(body) if response.headers.get_content_type() == "application/json" else None
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            try:
+                return error.code, json.loads(body)
+            except ValueError:
+                return error.code, None
+
+    status, local = call("/api/v1/auth/local/login", "POST", {
+        "username": "task27admin", "password": password,
+    })
+    if status != 200 or not local.get("csrf_token"):
+        raise RuntimeError("OIDC smoke local admin login failed")
+    csrf = local["csrf_token"]
+    status, current = call("/api/v1/oidc-provider")
+    if status != 200 or current["mode"] != "env":
+        raise RuntimeError("OIDC smoke initial configuration invalid")
+    issuer = f"https://oidc-idp:{env['OIDC_STUB_PORT']}"
+    status, saved = call("/api/v1/oidc-provider/draft", "PUT", {
+        "version": current["version"], "issuer_url": issuer, "client_id": "smoke-client",
+        "client_secret": "synthetic-smoke-secret",
+        "redirect_uri": base + "/api/v1/auth/oidc/callback",
+        "scopes": ["openid", "profile", "email"],
+    }, csrf)
+    if status != 200 or not saved["draft"]["has_secret"]:
+        raise RuntimeError("OIDC smoke draft save failed")
+    status, failure = call("/api/v1/oidc-provider/draft/check", "POST", {"version": saved["version"]}, csrf)
+    if status != 422 or failure["code"] not in {"oidc_tls_invalid", "oidc_hostname_mismatch"}:
+        if isinstance(failure, dict) and failure.get("code") == "oidc_unreachable":
+            diagnostic = (
+                "import socket; h='oidc-idp'; p=" + env["OIDC_STUB_PORT"] + "; "
+                "print('DNS', socket.getaddrinfo(h,p,type=socket.SOCK_STREAM)); "
+                "s=socket.create_connection((h,p),timeout=5); print('TCP connected'); s.close()"
+            )
+            result = subprocess.run([*compose, "exec", "-T", "api", "python", "-c", diagnostic],
+                                    env=env, text=True, capture_output=True, check=False)
+            print(f"OIDC route diagnostic: exit={result.returncode}; stdout={result.stdout[-1200:]}; stderr={result.stderr[-1200:]}", flush=True)
+        raise RuntimeError(f"OIDC smoke untrusted CA refusal: HTTP {status}, code {failure.get('code') if isinstance(failure, dict) else None}")
+    ca = Path(env["OIDC_STUB_CA_FILE"]).read_bytes()
+    status, saved = call(f"/api/v1/oidc-provider/draft/ca?version={saved['version']}",
+                         "PUT", ca, csrf, "application/x-pem-file")
+    if status != 200 or not saved["draft"]["has_ca"]:
+        raise RuntimeError("OIDC smoke CA upload failed")
+    idp_ip = command([*compose, "exec", "-T", "api", "python", "-c",
+                      "import socket; print(socket.gethostbyname('oidc-idp'))"],
+                     env=env, capture=True).strip()
+    status, wrong_host = call("/api/v1/oidc-provider/draft", "PUT", {
+        "version": saved["version"],
+        "issuer_url": f"https://{idp_ip}:{env['OIDC_STUB_PORT']}",
+        "client_id": "smoke-client",
+        "redirect_uri": base + "/api/v1/auth/oidc/callback",
+        "scopes": ["openid", "profile", "email"],
+    }, csrf)
+    if status != 200:
+        raise RuntimeError("OIDC smoke hostname setup failed")
+    status, failure = call("/api/v1/oidc-provider/draft/check", "POST", {"version": wrong_host["version"]}, csrf)
+    if status != 422 or failure["code"] != "oidc_hostname_mismatch":
+        raise RuntimeError(f"OIDC smoke wrong hostname refusal: HTTP {status}, code {failure.get('code') if isinstance(failure, dict) else None}")
+    status, saved = call("/api/v1/oidc-provider/draft", "PUT", {
+        "version": wrong_host["version"], "issuer_url": issuer,
+        "client_id": "smoke-client",
+        "redirect_uri": base + "/api/v1/auth/oidc/callback",
+        "scopes": ["openid", "profile", "email"],
+    }, csrf)
+    if status != 200:
+        raise RuntimeError("OIDC smoke valid issuer restore failed")
+    status, checked = call("/api/v1/oidc-provider/draft/check", "POST", {"version": saved["version"]}, csrf)
+    if status != 200 or not checked["checked"]:
+        raise RuntimeError("OIDC smoke discovery check failed")
+    oidc_browser_trial(compose, env, production, password)
+    status, tried = call("/api/v1/oidc-provider")
+    if status != 200 or tried["mode"] != "managed":
+        raise RuntimeError("OIDC smoke activation did not persist")
+    status, session = call("/api/v1/auth/session")
+    if status != 200 or session["user"]["username"] != "task27admin":
+        raise RuntimeError("OIDC trial replaced local admin session")
+    if call("/api/v1/auth/methods")[1]["oidc_enabled"] is not True:
+        raise RuntimeError("OIDC smoke runtime method did not update")
+    call("/api/v1/auth/logout", "POST", {}, csrf)
+    status, local = call("/api/v1/auth/local/login", "POST", {
+        "username": "task27admin", "password": password,
+    })
+    if status != 200:
+        raise RuntimeError("OIDC smoke local fallback failed")
+    status, disabled = call("/api/v1/oidc-provider/disable", "POST", {"version": checked["version"]}, local["csrf_token"])
+    if status != 200 or disabled["mode"] != "disabled":
+        raise RuntimeError("OIDC smoke disable failed")
+    command([*compose, "restart", "api"], env=env)
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            status, methods = call("/api/v1/auth/methods")
+        except urllib.error.URLError:
+            status, methods = 0, None
+        if status == 200 and isinstance(methods, dict):
+            if methods["oidc_enabled"] is not False:
+                raise RuntimeError("OIDC smoke disabled state did not survive restart")
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"OIDC smoke API did not recover after restart: HTTP {status}")
+        time.sleep(1)
+    print(f"OIDC administration smoke passed: {base} with isolated IdP {issuer}", flush=True)
+
+
+def oidc_browser_trial(compose: list[str], env: dict[str, str], production: bool,
+                       password: str) -> None:
+    """Verify the checked draft in Chromium with temporary, provider-scoped CA trust."""
+    run = Path(env["TEMP"])
+    context = run / "oidc-browser-context"
+    context.mkdir()
+    source = ROOT / "frontend"
+    locked = json.loads((source / "package-lock.json").read_text(encoding="utf-8"))
+    packages = locked["packages"]
+    browser_packages = (
+        "node_modules/@playwright/test", "node_modules/playwright",
+        "node_modules/playwright-core",
+    )
+    version = packages[browser_packages[0]]["version"]
+    if version != "1.63.0":
+        raise RuntimeError(
+            f"Update the pinned Playwright browser image with package version {version}"
+        )
+    manifest = {
+        "name": "diploma-oidc-browser-smoke", "version": "1.0.0",
+        "private": True, "type": "module",
+        "devDependencies": {"@playwright/test": version},
+    }
+    browser_lock = {
+        "name": manifest["name"], "version": manifest["version"],
+        "lockfileVersion": 3, "requires": True,
+        "packages": {"": manifest, **{name: packages[name] for name in browser_packages}},
+    }
+    (context / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (context / "package-lock.json").write_text(
+        json.dumps(browser_lock, indent=2) + "\n", encoding="utf-8"
+    )
+    (context / "playwright.config.ts").write_bytes((source / "playwright.config.ts").read_bytes())
+    browser_dir = context / "browser"
+    browser_dir.mkdir()
+    (browser_dir / "oidc.trial.spec.ts").write_bytes(
+        (source / "browser" / "oidc.trial.spec.ts").read_bytes()
+    )
+    project = env["COMPOSE_PROJECT_NAME"]
+    image = "mcr.microsoft.com/playwright:v1.63.0-noble"
+    proxy = command([*compose, "ps", "-q", "proxy"], env=env, capture=True).strip()
+    if not proxy:
+        raise RuntimeError("OIDC browser smoke proxy is unavailable")
+    results = run / "oidc-browser-results"
+    results.mkdir()
+    script = [
+        "set -e",
+        "apt-get update >/dev/null",
+        "apt-get install -y --no-install-recommends libnss3-tools socat >/dev/null",
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb",
+        "cp /tmp/oidc-ca.pem /usr/local/share/ca-certificates/oidc-smoke.crt",
+    ]
+    mounts = ["-v", f"{Path(env['OIDC_STUB_CA_FILE']).resolve()}:/tmp/oidc-ca.pem:ro"]
+    if production:
+        mounts += ["-v", f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/proxy-ca.pem:ro"]
+        script.append("cp /tmp/proxy-ca.pem /usr/local/share/ca-certificates/proxy-smoke.crt")
+    script += [
+        "update-ca-certificates >/dev/null",
+        "certutil -d sql:/root/.pki/nssdb -N --empty-password",
+        "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n oidc-smoke -i /tmp/oidc-ca.pem",
+    ]
+    if production:
+        script.append("certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n proxy-smoke -i /tmp/proxy-ca.pem")
+    public_port = (env["HTTPS_BIND"] if production else env["PROXY_BIND"]).split(":")[1]
+    proxy_port = "443" if production else "8080"
+    script.append(
+        f"socat TCP-LISTEN:{public_port},bind=127.0.0.1,reuseaddr,fork "
+        f"TCP:127.0.0.1:{proxy_port} & npx playwright test browser/oidc.trial.spec.ts --output /results"
+    )
+    command(["docker", "run", "--rm", "--name", f"{project}-oidc-browser-smoke",
+             "--user", "0:0", "--memory", "2g", "--cpus", "2", "--network", f"container:{proxy}",
+             "--label", f"task27.project={project}", *mounts,
+             "-w", "/test", "-v", f"{context.resolve()}:/test",
+             "-v", f"{results.resolve()}:/results",
+             "-e", f"TASK27_ADMIN_PASSWORD={password}",
+             "-e", f"PLAYWRIGHT_BASE_URL={'https://localhost:443' if production else 'http://localhost:8080'}",
+             image, "sh", "-c", "; ".join(script)], env=env, timeout=600)
+
+
 def systemd_filter_smoke(env: dict[str, str], run: Path) -> None:
     """Run the exact inline Lua callback from the generated template on a synthetic journal record."""
     source = (ROOT / "frontend/src/features/agents/fluentBitConfig.ts").read_text(encoding="utf-8")
@@ -526,7 +878,10 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
     )
     command([sys.executable, "-c", create], env=profile_env, cwd=ROOT / "backend")
     systemd_filter_smoke(env, run)
-    from sqlalchemy import create_engine, text as sql_text
+
+    from sqlalchemy import create_engine
+    from sqlalchemy import text as sql_text
+
     home_engine = create_engine(env["TEST_DATABASE_URL"])
     try:
         with home_engine.connect() as connection:
@@ -785,48 +1140,38 @@ def tls_agent_smoke(compose: list[str], project: str, env: dict[str, str], run: 
     browser_context.mkdir()
     for name in ("package.json", "package-lock.json", "playwright.config.ts"):
         (browser_context / name).write_bytes((source / name).read_bytes())
-    (browser_context / "proxy.session.spec.ts").write_bytes(
+    browser_dir = browser_context / "browser"
+    browser_dir.mkdir()
+    (browser_dir / "proxy.session.spec.ts").write_bytes(
         (source / "browser" / "proxy.session.spec.ts").read_bytes()
     )
-    (browser_context / "Dockerfile").write_text(
-        "FROM node:20.19.5-bookworm-slim\n"
-        "RUN apt-get update && apt-get install -y --no-install-recommends "
-        "ca-certificates libnss3-tools libasound2 libatk1.0-0 libatk-bridge2.0-0 "
-        "libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1 "
-        "libglib2.0-0 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 "
-        "libxdamage1 libxext6 libxfixes3 libxrandr2 libxkbcommon0 "
-        "fonts-liberation "
-        "&& rm -rf /var/lib/apt/lists/*\n"
-        "WORKDIR /test\n"
-        "COPY package.json package-lock.json ./\n"
-        "RUN npm ci --ignore-scripts --no-audit --no-fund\n"
-        "RUN npx playwright install --only-shell chromium\n"
-        "COPY playwright.config.ts ./\n"
-        "COPY proxy.session.spec.ts ./browser/proxy.session.spec.ts\n",
-        encoding="utf-8",
-    )
-    browser_image = f"{project}-browser"
-    command(["docker", "buildx", "build", "--load", "-t", browser_image,
-             str(browser_context)], env=profile_env, timeout=600)
+    browser_image = "mcr.microsoft.com/playwright:v1.63.0-noble"
     browser_container = f"{project}-browser-smoke"
     browser_command = [
         "docker", "run", "--rm", "--name", browser_container,
-        "--user", "root", "--memory", "2g", "--cpus", "2",
+        "--user", "0:0", "--memory", "2g", "--cpus", "2",
         "--network", f"container:{proxy_container}", "--label", f"task26.project={project}",
         "-v", f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/test-ca.pem:ro",
         "-v", f"{browser_result.resolve()}:/results",
+        "-v", f"{browser_context.resolve()}:/test",
+        "-w", "/test",
         "-e", f"TASK21_ADMIN_PASSWORD={password}", "-e", "TASK21_SECURE_COOKIE=true",
         "-e", "PLAYWRIGHT_BASE_URL=https://localhost",
-        browser_image, "sh", "-lc",
-        "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb && "
-        "cp /tmp/test-ca.pem /usr/local/share/ca-certificates/task26-smoke.crt && "
-        "update-ca-certificates >/dev/null && "
-        "certutil -d sql:/root/.pki/nssdb -N --empty-password && "
-        "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n task26-smoke -i /tmp/test-ca.pem && "
-        "npx playwright test browser/proxy.session.spec.ts --output /results",
+        browser_image, "sh", "-c",
+        (
+            "set -e; apt-get update >/dev/null; "
+            "apt-get install -y --no-install-recommends libnss3-tools >/dev/null; "
+            "npm ci --ignore-scripts --no-audit --no-fund; "
+            "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb; "
+            "cp /tmp/test-ca.pem /usr/local/share/ca-certificates/task26-smoke.crt; "
+            "update-ca-certificates >/dev/null; "
+            "certutil -d sql:/root/.pki/nssdb -N --empty-password; "
+            "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n task26-smoke -i /tmp/test-ca.pem; "
+            "npx playwright test browser/proxy.session.spec.ts --output /results"
+        ),
     ]
     try:
-        command(browser_command, env=profile_env, timeout=180)
+        command(browser_command, env=profile_env, timeout=600)
     finally:
         subprocess.run(["docker", "rm", "-f", browser_container], env=profile_env,
                        cwd=ROOT, check=False, capture_output=True, timeout=30)
@@ -955,7 +1300,8 @@ def main() -> None:
             return
         if args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end"}:
             builder = project + "_builder"
-            command(["docker", "buildx", "create", "--name", builder, "--driver", "docker-container", "--bootstrap"], env=env)
+            command(["docker", "buildx", "create", "--name", builder, "--driver", "docker-container",
+                     "--driver-opt", "network=host", "--bootstrap"], env=env)
             env["BUILDX_BUILDER"] = builder
             env["COMPOSE_DOCKER_CLI_BUILD"] = "1"
         if args.profile == "backend-db":
@@ -975,19 +1321,37 @@ def main() -> None:
         elif args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
             production = args.profile == "smoke-production"
             services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "proxy"]
+            if args.profile in {"smoke-development", "smoke-production"}:
+                services.append("oidc-idp")
             if not production:
                 services.append("frontend")
             command([*compose, "up", "-d", "--build", "--wait", *services], env=env)
+            if args.profile in {"smoke-development", "smoke-production"}:
+                idp_container = command([*compose, "ps", "-q", "oidc-idp"], env=env, capture=True).strip()
+                inspection = json.loads(command(["docker", "inspect", idp_container], env=env, capture=True))[0]
+                bindings = inspection["NetworkSettings"]["Ports"]
+                if any(binding for values in bindings.values() if values for binding in values):
+                    raise RuntimeError("Synthetic OIDC provider has a published host port")
+                attached = inspection["NetworkSettings"]["Networks"]
+                network_name = f"{project}_oidc-private"
+                if set(attached) != {network_name}:
+                    raise RuntimeError(f"Synthetic OIDC provider escaped its private network: {sorted(attached)}")
+                print(f"Synthetic IdP isolation passed: {network_name}, no host port, service oidc-idp:19095", flush=True)
             verify_kafka_metadata(compose, env)
             verify_api_metadata(compose, env)
             if args.profile in {"end-to-end", "smoke-production"}:
                 verify_agent_metadata(compose, project, env)
             smoke_http(env, production)
+            if args.profile in {"smoke-development", "smoke-production"}:
+                oidc_administration_smoke(compose, env, production)
             if args.profile == "smoke-development":
                 password = secrets.token_urlsafe(24)
                 browser_env = {**env, "TASK21_ADMIN_PASSWORD": password,
                                "TASK21_SECURE_COOKIE": "false",
-                               "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{env['PROXY_BIND'].split(':')[1]}"}
+                               "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{env['PROXY_BIND'].split(':')[1]}",
+                               "PLAYWRIGHT_USERNAME": "task21admin",
+                               "PLAYWRIGHT_PASSWORD": password,
+                               "PLAYWRIGHT_OIDC": "1"}
                 if not browser_env.get("PLAYWRIGHT_CHROME_PATH"):
                     for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                                       r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"):
@@ -1004,10 +1368,20 @@ def main() -> None:
                 command([NPM, "run", "test:browser", "--", "proxy.session.spec.ts",
                          "--output", str(run / "development-session-playwright")],
                         env=browser_env, cwd=ROOT / "frontend")
+                command([NPM, "run", "test:browser", "--", "auth.spec.ts",
+                         "--grep", "mobile navigation, account layout and viewport bounds",
+                         "--output", str(run / "development-navigation-playwright")],
+                        env=browser_env, cwd=ROOT / "frontend")
+                command([NPM, "run", "test:browser", "--", "administration.live.spec.ts",
+                         "--output", str(run / "development-administration-playwright")],
+                        env={**browser_env, "TASK21_ADMIN_PASSWORD": password},
+                        cwd=ROOT / "frontend")
             if production:
                 command([*compose, "exec", "-T", "proxy", "sh", "-c",
-                         "test ! -e /usr/bin/node && test ! -e /app && "
-                         "test -z \"$(find /usr/share/nginx/html -name '*.map' -print -quit)\""], env=env)
+                         (
+                             "test ! -e /usr/bin/node && test ! -e /app && "
+                             "test -z \"$(find /usr/share/nginx/html -name '*.map' -print -quit)\""
+                         )], env=env)
                 command([*compose, "up", "-d", "--no-deps", "--force-recreate", "--wait", "proxy"], env=env)
                 smoke_http(env, True)
             if args.profile == "end-to-end":
@@ -1024,7 +1398,7 @@ def main() -> None:
                 )]
                 print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
             command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
-            for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend", "proxy", "browser"):
+            for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
                 image = f"{project}-{service}"
                 matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
                 if image in matches:

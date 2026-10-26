@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import getpass
 import json
@@ -19,12 +20,13 @@ import httpx2
 import jsonschema
 import psycopg
 import pytest
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends
 from fastapi.testclient import TestClient
 from joserfc import jwt
 from joserfc.jwk import RSAKey
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import event, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -45,6 +47,7 @@ from app.dependencies import (
     get_readiness_repository,
     get_role_admin,
     get_setting_admin,
+    get_settings,
     get_source_snapshot_service,
     get_user_admin,
     require_permission,
@@ -68,6 +71,9 @@ from app.models import (
 )
 from app.normalization.schema import ValueSource
 from app.oidc import AuthlibOidcClient
+from app.oidc_provider import ProviderInput
+from app.oidc_provider import check as check_oidc_provider
+from app.oidc_provider import save as save_oidc_provider
 from app.repositories.sqlalchemy import (
     SqlAlchemyOidcMappingRepository,
     SqlAlchemyRoleRepository,
@@ -651,6 +657,12 @@ def clear_auth_state(auth_database):
         connection.execute(text("DELETE FROM app.kafka_connections"))
         connection.execute(text("DELETE FROM app.normalizers"))
         connection.execute(text("DELETE FROM app.app_settings"))
+        connection.execute(text("""
+            UPDATE app.oidc_provider SET version = 0, active_version = NULL,
+                mode = 'env', draft = NULL, active = NULL, checked_version = NULL,
+                trial_version = NULL, trial_session_id = NULL, trial_expires_at = NULL
+            WHERE id = 1
+        """))
         connection.execute(text("DELETE FROM app.users"))
         connection.execute(
             text("UPDATE app.roles SET name = 'Administrator' WHERE id = :id"),
@@ -718,6 +730,131 @@ def service_for(database, settings, now_provider=None):
         now_provider=now_provider or (lambda: datetime.now(UTC)),
     )
     return session, service
+
+
+def test_oidc_draft_keeps_env_active_and_encrypts_secret(auth_database, auth_settings):
+    configured = auth_settings.model_copy(
+        update={
+            "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+            "oidc_enabled": False,
+            "public_origin": "https://events.example.test",
+        }
+    )
+    with auth_database.session_factory() as session:
+        admin = User(
+            username="oidc-admin",
+            password_hash=hash_password("correct-password"),
+            display_name="OIDC admin",
+            role_id=ADMIN_ID,
+        )
+        session.add(admin)
+        session.commit()
+    with TestClient(create_app(configured, database=auth_database)) as api:
+        assert login(api, "oidc-admin").status_code == 200
+        csrf = api.get("/api/v1/auth/session").json()["csrf_token"]
+        headers = {"X-CSRF-Token": csrf}
+        draft = {
+            "version": 0,
+            "issuer_url": "https://identity.example.test",
+            "client_id": "client",
+            "client_secret": "synthetic-secret",
+            "redirect_uri": "https://events.example.test/api/v1/auth/oidc/callback",
+            "scopes": ["openid", "profile", "email"],
+        }
+        assert api.put("/api/v1/oidc-provider/draft", json=draft).status_code == 403
+        foreign = {**draft, "redirect_uri": "https://other.example/api/v1/auth/oidc/callback"}
+        rejected = api.put("/api/v1/oidc-provider/draft", json=foreign, headers=headers)
+        assert rejected.status_code == 422
+        assert rejected.json()["code"] == "oidc_callback_origin_invalid"
+        assert api.get("/api/v1/oidc-provider").json()["version"] == 0
+        saved = api.put("/api/v1/oidc-provider/draft", json=draft, headers=headers)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["draft"]["has_secret"] is True
+        assert "synthetic-secret" not in saved.text
+        schema = api.get("/openapi.json").json()["components"]["schemas"]["ProviderStatus"]
+        assert "client_secret" not in json.dumps(schema)
+        rejected_ca = api.put(
+            "/api/v1/oidc-provider/draft/ca?version=1",
+            content=b"-----BEGIN PRIVATE KEY-----\ninvalid\n-----END PRIVATE KEY-----\n",
+            headers={**headers, "Content-Type": "application/x-pem-file"},
+        )
+        assert rejected_ca.status_code == 422
+        assert api.get("/api/v1/oidc-provider").json()["version"] == 1
+        assert api.get("/api/v1/auth/methods").json()["oidc_enabled"] is False
+        with auth_database.session_factory() as session:
+            stored = session.execute(
+                text("SELECT draft FROM app.oidc_provider WHERE id = 1")
+            ).scalar_one()
+            assert "synthetic-secret" not in json.dumps(stored)
+            assert (
+                Fernet(configured.external_secret_key.get_secret_value().encode()).decrypt(
+                    stored["secret_ciphertext"].encode()
+                )
+                == b"synthetic-secret"
+            )
+        draft["version"] = 1
+        draft["client_secret"] = ""
+        assert (
+            api.put("/api/v1/oidc-provider/draft", json=draft, headers=headers).json()["draft"][
+                "has_secret"
+            ]
+            is True
+        )
+        # The narrow delete request has no form values: unsaved UI edits cannot
+        # be persisted as a side effect of removing the current secret.
+        deleted = api.delete(
+            "/api/v1/oidc-provider/draft/secret?version=2", headers=headers
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["draft"]["has_secret"] is False
+        assert deleted.json()["draft"]["issuer_url"] == draft["issuer_url"]
+        assert deleted.json()["draft"]["client_id"] == draft["client_id"]
+        assert deleted.json()["draft"]["redirect_uri"] == draft["redirect_uri"]
+        assert deleted.json()["draft"]["scopes"] == draft["scopes"]
+        assert deleted.json()["version"] == 3
+        assert (
+            api.put("/api/v1/oidc-provider/draft", json=draft, headers=headers).status_code == 409
+        )
+
+
+def test_oidc_check_rejects_cross_origin_metadata_without_changing_active(
+    auth_database, auth_settings, monkeypatch
+):
+    configured = auth_settings.model_copy(update={
+        "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+        "public_origin": "https://events.example.test",
+    })
+    with auth_database.session_factory() as session:
+        saved = save_oidc_provider(session, configured, ProviderInput(
+            issuer_url="https://identity.example.test", client_id="client",
+            client_secret="synthetic-secret",
+            redirect_uri="https://events.example.test/api/v1/auth/oidc/callback",
+        ), 0)
+
+        class FakeHttp:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def get(self, _):
+                return SimpleNamespace(
+                    content=b"{}", raise_for_status=lambda: None,
+                    json=lambda: {
+                        "issuer": "https://identity.example.test",
+                        "authorization_endpoint": "https://identity.example.test/authorize",
+                        "token_endpoint": "https://unexpected.example.test/token",
+                        "jwks_uri": "https://identity.example.test/jwks",
+                        "response_types_supported": ["code"],
+                    },
+                )
+
+        monkeypatch.setattr("app.oidc_provider.httpx.AsyncClient", lambda **_: FakeHttp())
+        with pytest.raises(DomainError) as refusal:
+            asyncio.run(check_oidc_provider(session, configured, saved["version"]))
+        assert refusal.value.code == "oidc_metadata_origin_invalid"
+        assert session.execute(text("SELECT mode FROM app.oidc_provider WHERE id = 1")).scalar_one() == "env"
 
 
 def test_0002_schema_permission_and_downgrade(auth_database_url):
@@ -1076,6 +1213,23 @@ def test_oidc_provision_mapping_list_guest_and_no_email_link(auth_database, auth
         session.close()
 
 
+def test_managed_oidc_login_can_use_verified_provider_when_env_oidc_is_disabled(
+    auth_database, auth_settings
+):
+    assert auth_settings.oidc_enabled is False
+    session, service = service_for(auth_database, auth_settings)
+    claims = {"iss": "https://managed-idp.test", "sub": "managed-subject"}
+    try:
+        with pytest.raises(DomainError) as error:
+            service.oidc_login(claims)
+        assert error.value.code == "auth_method_disabled"
+        _, _, user, role = service.oidc_login(claims, allow_managed=True)
+        assert user.oidc_subject == "managed-subject"
+        assert role.id == GUEST_ID
+    finally:
+        session.close()
+
+
 def test_oidc_manual_role_is_preserved_and_missing_role_is_rejected(
     auth_database, auth_settings
 ):
@@ -1150,6 +1304,107 @@ class FakeOidcClient:
         self.cleared = True
 
 
+def test_oidc_trial_isolated_then_activation_and_disable_survive_restart(
+    auth_database, auth_settings, monkeypatch
+):
+    configured = oidc_settings(auth_settings).model_copy(
+        update={
+            "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+            "public_origin": "https://events.example.test",
+        }
+    )
+    with auth_database.session_factory() as session:
+        session.add(
+            User(
+                username="oidc-admin",
+                password_hash=hash_password("correct-password"),
+                display_name="OIDC admin",
+                role_id=ADMIN_ID,
+            )
+        )
+        session.commit()
+    fake = FakeOidcClient({"iss": "https://identity.example.test", "sub": "subject"})
+    monkeypatch.setattr("app.api.v1.endpoints.auth.managed_client", lambda *_: fake)
+    with TestClient(create_app(configured, auth_database, fake)) as api:
+        assert login(api, "oidc-admin").status_code == 200
+        before = api.get("/api/v1/auth/session").json()
+        headers = {"X-CSRF-Token": before["csrf_token"]}
+        saved = api.put(
+            "/api/v1/oidc-provider/draft",
+            headers=headers,
+            json={
+                "version": 0,
+                "issuer_url": "https://identity.example.test",
+                "client_id": "client",
+                "client_secret": "synthetic-secret",
+                "redirect_uri": "https://events.example.test/api/v1/auth/oidc/callback",
+                "scopes": ["openid"],
+            },
+        )
+        assert saved.status_code == 200
+        assert api.get("/api/v1/auth/methods").json()["oidc_enabled"] is True
+        with auth_database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE app.oidc_provider SET checked_version = 1 WHERE id = 1")
+            )
+        start = api.get("/api/v1/auth/oidc/trial/start?version=1", follow_redirects=False)
+        assert start.status_code == 307
+        result = api.get("/api/v1/auth/oidc/callback", follow_redirects=False)
+        assert result.headers["location"] == "/administration?oidc_trial=success"
+        assert api.get("/api/v1/auth/session").json()["user"] == before["user"]
+        assert api.get("/api/v1/oidc-provider").json()["trial_succeeded"] is True
+        revised = api.put(
+            "/api/v1/oidc-provider/draft", headers=headers,
+            json={
+                "version": 1, "issuer_url": "https://identity.example.test",
+                "client_id": "client", "redirect_uri": "https://events.example.test/api/v1/auth/oidc/callback",
+                "scopes": ["openid"],
+            },
+        )
+        assert revised.status_code == 200
+        assert revised.json()["trial_succeeded"] is False
+        assert api.post("/api/v1/oidc-provider/activate", json={"version": 1}, headers=headers).status_code == 409
+        with auth_database.engine.begin() as connection:
+            connection.execute(text("UPDATE app.oidc_provider SET checked_version = 2 WHERE id = 1"))
+        assert api.get("/api/v1/auth/oidc/trial/start?version=2", follow_redirects=False).status_code == 307
+        assert api.get("/api/v1/auth/oidc/callback", follow_redirects=False).headers["location"] == "/administration?oidc_trial=success"
+        with auth_database.session_factory() as session:
+            session.add(User(
+                username="oidc-other", password_hash=hash_password("correct-password"),
+                display_name="Other admin", role_id=ADMIN_ID,
+            ))
+            session.commit()
+        with TestClient(create_app(configured, auth_database)) as other:
+            assert login(other, "oidc-other").status_code == 200
+            assert other.get("/api/v1/oidc-provider").json()["trial_succeeded"] is False
+        old_handshake = api.get("/api/v1/auth/oidc/login", follow_redirects=False)
+        assert old_handshake.status_code == 307
+        activation = api.post(
+            "/api/v1/oidc-provider/activate", json={"version": 2}, headers=headers
+        )
+        assert activation.status_code == 200, activation.text
+        assert activation.json()["mode"] == "managed"
+        without_key = configured.model_copy(update={"external_secret_key": None})
+        with TestClient(create_app(without_key, auth_database)) as degraded:
+            assert degraded.get("/api/v1/auth/methods").json()["oidc_enabled"] is False
+            assert login(degraded, "oidc-admin").status_code == 200
+            assert degraded.get("/api/v1/oidc-provider").json()["diagnostic"] == "oidc_key_unavailable"
+        stale_callback = api.get("/api/v1/auth/oidc/callback", follow_redirects=False)
+        assert stale_callback.headers["location"] == "/error"
+        assert api.get("/api/v1/auth/session").json()["user"] == before["user"]
+        assert (
+            api.post(
+                "/api/v1/oidc-provider/activate", json={"version": 2}, headers=headers
+            ).status_code
+            == 409
+        )
+        disabled = api.post("/api/v1/oidc-provider/disable", json={"version": 2}, headers=headers)
+        assert disabled.status_code == 200
+        assert api.get("/api/v1/auth/methods").json()["oidc_enabled"] is False
+    with TestClient(create_app(configured, auth_database)) as restarted:
+        assert restarted.get("/api/v1/auth/methods").json()["oidc_enabled"] is False
+
+
 def oidc_settings(auth_settings):
     return Settings(
         **{
@@ -1163,6 +1418,103 @@ def oidc_settings(auth_settings):
             "oidc_error_redirect_url": "/error",
         },
     )
+
+
+def test_managed_oidc_revalidates_saved_callback_after_public_origin_change(
+    auth_database, auth_settings, monkeypatch
+):
+    configured = oidc_settings(auth_settings).model_copy(update={
+        "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+        "public_origin": "https://events.example.test",
+    })
+    with auth_database.session_factory() as session:
+        session.add(User(
+            username="oidc-admin", password_hash=hash_password("correct-password"),
+            display_name="OIDC admin", role_id=ADMIN_ID,
+        ))
+        session.commit()
+    fake = FakeOidcClient({"iss": "https://identity.example.test", "sub": "subject"})
+    monkeypatch.setattr("app.api.v1.endpoints.auth.managed_client", lambda *_: fake)
+    monkeypatch.setattr("app.oidc_provider.client", lambda *_: fake)
+    with TestClient(create_app(configured, auth_database, fake)) as api:
+        assert login(api, "oidc-admin").status_code == 200
+        csrf = api.get("/api/v1/auth/session").json()["csrf_token"]
+        headers = {"X-CSRF-Token": csrf}
+        draft = {
+            "version": 0, "issuer_url": "https://identity.example.test", "client_id": "client",
+            "client_secret": "synthetic-secret",
+            "redirect_uri": "https://events.example.test/api/v1/auth/oidc/callback",
+            "scopes": ["openid"],
+        }
+        assert api.put("/api/v1/oidc-provider/draft", json=draft, headers=headers).status_code == 200
+        with auth_database.engine.begin() as connection:
+            connection.execute(text("UPDATE app.oidc_provider SET checked_version = 1 WHERE id = 1"))
+        assert api.get("/api/v1/auth/oidc/trial/start?version=1", follow_redirects=False).status_code == 307
+        changed = configured.model_copy(update={"public_origin": "https://new.example.test"})
+        api.app.dependency_overrides[get_settings] = lambda: changed
+        assert api.get("/api/v1/auth/oidc/callback", follow_redirects=False).headers["location"] == "/administration?oidc_trial=invalid"
+        state = api.get("/api/v1/oidc-provider").json()
+        assert state["diagnostic"] == "oidc_callback_origin_invalid"
+        assert state["checked"] is False
+        assert api.get("/api/v1/auth/oidc/trial/start?version=1", follow_redirects=False).status_code == 422
+        assert api.post("/api/v1/oidc-provider/draft/check", json={"version": 1}, headers=headers).status_code == 422
+        assert api.get("/api/v1/auth/methods").json()["local_enabled"] is True
+        assert api.put("/api/v1/oidc-provider/draft", json={
+            **draft, "version": 1,
+            "redirect_uri": "https://new.example.test/api/v1/auth/oidc/callback",
+        }, headers=headers).status_code == 200
+        with auth_database.engine.begin() as connection:
+            connection.execute(text("UPDATE app.oidc_provider SET checked_version = 2 WHERE id = 1"))
+        assert api.get("/api/v1/auth/oidc/trial/start?version=2", follow_redirects=False).status_code == 307
+        assert api.get("/api/v1/auth/oidc/callback", follow_redirects=False).headers["location"] == "/administration?oidc_trial=success"
+        api.app.dependency_overrides[get_settings] = lambda: configured
+        assert api.post("/api/v1/oidc-provider/activate", json={"version": 2}, headers=headers).status_code == 422
+        api.app.dependency_overrides[get_settings] = lambda: changed
+        assert api.post("/api/v1/oidc-provider/activate", json={"version": 2}, headers=headers).status_code == 200
+        assert api.get("/api/v1/auth/oidc/login", follow_redirects=False).headers["location"].startswith("https://idp.test/authorize?")
+        api.app.dependency_overrides[get_settings] = lambda: configured
+        assert api.get("/api/v1/auth/oidc/callback", follow_redirects=False).headers["location"] == "/error"
+        assert api.get("/api/v1/auth/methods").json()["oidc_enabled"] is False
+        assert api.get("/api/v1/oidc-provider").json()["diagnostic"] == "oidc_callback_origin_invalid"
+        assert api.get("/api/v1/auth/oidc/login", follow_redirects=False).status_code == 404
+
+
+def test_oidc_invalid_callback_and_public_origin_ports_are_controlled(
+    auth_database, auth_settings
+):
+    configured = oidc_settings(auth_settings).model_copy(update={
+        "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+        "public_origin": "https://events.example.test",
+    })
+    with auth_database.session_factory() as session:
+        session.add(User(
+            username="oidc-admin", password_hash=hash_password("correct-password"),
+            display_name="OIDC admin", role_id=ADMIN_ID,
+        ))
+        session.commit()
+    with TestClient(create_app(configured, auth_database)) as api:
+        assert login(api, "oidc-admin").status_code == 200
+        headers = {"X-CSRF-Token": api.get("/api/v1/auth/session").json()["csrf_token"]}
+        draft = {
+            "version": 0, "issuer_url": "https://identity.example.test", "client_id": "client",
+            "client_secret": "synthetic-secret", "scopes": ["openid"],
+        }
+        for port in ("bad", "99999"):
+            rejected = api.put("/api/v1/oidc-provider/draft", json={
+                **draft, "redirect_uri": f"https://events.example.test:{port}/api/v1/auth/oidc/callback",
+            }, headers=headers)
+            assert rejected.status_code == 422
+            assert rejected.json()["code"] == "oidc_url_invalid"
+            invalid_settings = configured.model_copy(update={
+                "public_origin": f"https://events.example.test:{port}",
+            })
+            api.app.dependency_overrides[get_settings] = lambda value=invalid_settings: value
+            rejected = api.put("/api/v1/oidc-provider/draft", json={
+                **draft, "redirect_uri": "https://events.example.test/api/v1/auth/oidc/callback",
+            }, headers=headers)
+            assert rejected.status_code == 503
+            assert rejected.json()["code"] == "oidc_public_origin_invalid"
+            api.app.dependency_overrides[get_settings] = lambda: configured
 
 
 def test_oidc_router_uses_adapter_and_clears_handshake(auth_database, auth_settings):
@@ -1691,11 +2043,12 @@ def test_guest_cannot_read_or_mutate_administration(client, auth_database):
         "/api/v1/users", f"/api/v1/users/{uuid4()}",
         "/api/v1/roles", f"/api/v1/roles/{GUEST_ID}",
         "/api/v1/oidc-role-mappings", f"/api/v1/oidc-role-mappings/{uuid4()}",
+        "/api/v1/oidc-provider",
     ):
         response = client.get(path)
         assert response.status_code == 403
         assert response.json()["code"] == "permission_denied"
-    assert client.get("/api/v1/app-settings").status_code == 200
+    assert client.get("/api/v1/app-settings").status_code == 403
     assert client.get("/api/v1/normalizers").status_code == 200
     csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
     headers = {"X-CSRF-Token": csrf}
@@ -1704,6 +2057,7 @@ def test_guest_cannot_read_or_mutate_administration(client, auth_database):
         ("patch", f"/api/v1/roles/{ADMIN_ID}", {"name": "Nope"}),
         ("post", "/api/v1/oidc-role-mappings", {"issuer": "https://idp.test", "claim_name": "g", "claim_value": "x", "role_id": str(GUEST_ID)}),
         ("put", "/api/v1/app-settings/missing", {"value": True, "version": 1}),
+        ("post", "/api/v1/oidc-provider/disable", {"version": 0}),
         ("post", "/api/v1/normalizers", {"name": "x", "rule": "opaque"}),
     )
     for method, path, body in requests:
@@ -1733,7 +2087,7 @@ def test_existing_guest_session_uses_current_role_permissions(client, auth_datab
             )
         assert client.get("/api/v1/users").status_code == 403
         assert "users.read" not in client.get("/api/v1/auth/session").json()["permissions"]
-        assert client.get("/api/v1/app-settings").status_code == 200
+        assert client.get("/api/v1/app-settings").status_code == 403
     finally:
         with auth_database.engine.begin() as connection:
             connection.execute(
@@ -3088,6 +3442,7 @@ def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_
             }
             if role_id == GUEST_ID:
                 expected.add("users.read")  # Rolling back 0013 restores the former permission.
+                expected.add("settings.read")  # Rolling back 0014 restores the former permission.
             assert downgraded[role_id][1] == expected
     finally:
         run_alembic(auth_database_url, "upgrade", "head")

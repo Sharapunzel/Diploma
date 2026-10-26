@@ -176,4 +176,13 @@ describe("ApiClient", () => {
     expect(new Set(descriptions).size).toBe(4);
     expect(descriptions.every((text) => text.includes("Kafka"))).toBe(true);
   });
+
+  it("explains invalid OIDC callback and public origin safely", () => {
+    expect(
+      errorText(new ApiError(422, "oidc_callback_origin_invalid")),
+    ).toContain("публичным адресом приложения");
+    expect(
+      errorText(new ApiError(503, "oidc_public_origin_invalid")),
+    ).toContain("PUBLIC_ORIGIN");
+  });
 });

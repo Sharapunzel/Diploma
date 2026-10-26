@@ -31,7 +31,6 @@ ADMIN_PERMISSIONS = [
     "agents.write",
 ]
 GUEST_PERMISSIONS = [
-    "settings.read",
     "connections.read",
     "sources.read",
     "normalizers.read",
@@ -145,7 +144,7 @@ def test_guest_read_revocation_migrates_existing_role_without_other_changes(db, 
         "SELECT name, permissions FROM app.roles WHERE id = %s", (GUEST_ID,)
     ).fetchone()
     assert role[0] == "Renamed guest"
-    assert role[1] == [permission for permission in permissions if permission != "users.read"]
+    assert role[1] == [permission for permission in permissions if permission not in {"users.read", "settings.read"}]
     assert "users.read" in db.execute(
         "SELECT permissions FROM app.roles WHERE id = %s", (ADMIN_ID,)
     ).fetchone()[0]
@@ -153,7 +152,7 @@ def test_guest_read_revocation_migrates_existing_role_without_other_changes(db, 
     run_alembic(sqlalchemy_url, "downgrade", "0012_agent_cluster_route")
     assert db.execute(
         "SELECT permissions FROM app.roles WHERE id = %s", (GUEST_ID,)
-    ).fetchone()[0] == [permission for permission in permissions if permission != "users.read"] + ["users.read"]
+    ).fetchone()[0] == [permission for permission in permissions if permission not in {"users.read", "settings.read"}] + ["settings.read", "users.read"]
     db.rollback()
     run_alembic(sqlalchemy_url, "upgrade", "head")
 
