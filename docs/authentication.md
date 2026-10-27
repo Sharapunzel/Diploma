@@ -41,6 +41,43 @@ scope `openid`; URL перенаправления берутся только �
 
 ### Управление OIDC через интерфейс
 
+#### Отдельный Docker Keycloak в локальной разработке
+
+1. Проверьте discovery Keycloak по
+   `http://localhost:8081/realms/master/.well-known/openid-configuration`:
+   значение `issuer` должно быть `http://localhost:8081/realms/master`.
+   В корневом dev `.env` задайте
+   `OIDC_DEV_HTTP_ISSUER=http://localhost:8081/realms/master` и
+   `PUBLIC_ORIGIN=http://localhost:8080`. API внутри dev обращается к IdP через
+   `host.docker.internal` на том же порту, но в интерфейсе issuer вводится
+   только как `http://localhost:8081/realms/master`.
+2. В том же realm создайте OIDC-клиент с Authorization Code Flow. В Keycloak
+   укажите **Valid redirect URIs**:
+   `http://localhost:8080/api/v1/auth/oidc/callback`, **Web origins**:
+   `http://localhost:8080`. Для этого клиента оставьте поле **PKCE method / Proof
+   Key for Code Exchange Code Challenge Method** пустым: текущая версия приложения
+   использует серверный Authorization Code Flow с client secret, но не отправляет
+   PKCE `code_challenge`. Обязательные `S256` и `plain` приводят к отказу входа.
+   Это ограничение не относится к другим клиентам IdP. Root URL и Home URL не
+   заменяют issuer и callback.
+   Client ID и Client secret возьмите из настроек этого клиента; секрет не
+   записывайте в документацию.
+3. В «Администрирование» → «Способы входа» укажите issuer realm, Client ID,
+   точный Callback URL, scopes с `openid` и Client secret. Сохраните черновик,
+   проверьте discovery, выполните пробный вход и активируйте подтверждённую
+   версию. Для повторного включения после отключения повторите эти шаги.
+   `OIDC_ENABLED=true` для управления через интерфейс не требуется.
+
+Текущий отдельный тестовый Keycloak опубликован на всех интерфейсах хоста
+(`0.0.0.0:8081`, возможно также `[::]:8081`). Используйте его только в
+доверенной локальной сети. Для ограничения доступа можно привязать порт к
+loopback хоста, **проверив после этого доступность из API по
+`host.docker.internal`**, либо перейти на TLS с доверенным CA. Изменение
+публикации порта требует отдельного изменения пользовательского контейнера.
+Если API отвечает `oidc_key_unavailable`, восстановите прежний постоянный
+`EXTERNAL_SECRET_KEY` в защищённом файле или корневом dev `.env`, затем
+обновите состояние. Не заменяйте ключ случайным новым значением.
+
 Администратор открывает «Администрирование» → «Способы входа». Локальный вход остаётся резервным.
 Отдельного маршрута `/settings` больше нет; API `app-settings` сохраняется для следующей задачи.
 Для одного OIDC-провайдера задаются issuer, client ID, точный callback URL и scopes. Client secret

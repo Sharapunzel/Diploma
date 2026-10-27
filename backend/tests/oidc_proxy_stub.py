@@ -13,7 +13,8 @@ from joserfc.jwk import RSAKey
 PORT = int(os.environ.get("OIDC_STUB_PORT", "19095"))
 SCHEME = "https" if os.environ.get("OIDC_STUB_CERT_FILE") else "http"
 ISSUER = f"{SCHEME}://{os.environ.get('OIDC_STUB_HOST', 'oidc-idp')}:{PORT}"
-BROWSER_HOST = os.environ.get("OIDC_STUB_BROWSER_HOST", "oidc-idp")
+REALM_PATH = os.environ.get("OIDC_STUB_REALM_PATH", "")
+ISSUER = os.environ.get("OIDC_STUB_PUBLIC_ISSUER") or ISSUER + REALM_PATH
 KEY = RSAKey.import_key(rsa.generate_private_key(65537, 2048))
 CODES = {}
 
@@ -30,20 +31,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def public_host_ok(self):
+        return not os.environ.get("OIDC_STUB_PUBLIC_ISSUER") or self.headers.get("Host") == urlparse(ISSUER).netloc
+
     def do_GET(self):
+        if not self.public_host_ok():
+            self.send_error(400)
+            return
         parsed = urlparse(self.path)
-        if parsed.path == "/.well-known/openid-configuration":
+        if parsed.path == REALM_PATH + "/.well-known/openid-configuration":
             self.send_json({
                 "issuer": ISSUER,
-                "authorization_endpoint": f"{SCHEME}://{BROWSER_HOST}:{PORT}/authorize",
+                "authorization_endpoint": f"{ISSUER}/authorize",
                 "token_endpoint": f"{ISSUER}/token",
                 "jwks_uri": f"{ISSUER}/jwks",
                 "response_types_supported": ["code"],
                 "id_token_signing_alg_values_supported": ["RS256"],
             })
-        elif parsed.path == "/jwks":
+        elif parsed.path == REALM_PATH + "/jwks":
             self.send_json({"keys": [KEY.as_dict(private=False, kid="smoke", use="sig", alg="RS256")]})
-        elif parsed.path == "/authorize":
+        elif parsed.path == REALM_PATH + "/authorize":
             params = parse_qs(parsed.query)
             if params.get("client_id") != ["smoke-client"] or not params.get("state") or not params.get("nonce"):
                 self.send_error(400)
@@ -59,7 +66,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if urlparse(self.path).path != "/token":
+        if not self.public_host_ok():
+            self.send_error(400)
+            return
+        if urlparse(self.path).path != REALM_PATH + "/token":
             self.send_error(404)
             return
         params = parse_qs(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode())

@@ -11,6 +11,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
+import httpx2
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.fernet import Fernet, InvalidToken
@@ -22,7 +23,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .core.errors import DomainError
 from .indexer import validate_ca
-from .oidc import AuthlibOidcClient
+from .oidc import AuthlibOidcClient, OidcDevBackchannelTransport
 
 
 class ProviderInput(BaseModel):
@@ -89,7 +90,9 @@ def _secret(config: dict, settings: Settings) -> str:
         raise _error("oidc_key_unavailable", 503) from None
 
 
-def _safe_url(value: str, settings: Settings, callback: bool = False) -> None:
+def _safe_url(
+    value: str, settings: Settings, callback: bool = False, discovery_endpoint: bool = False
+) -> None:
     field = "redirect_uri" if callback else "issuer_url"
     try:
         parsed = urlparse(value)
@@ -97,16 +100,35 @@ def _safe_url(value: str, settings: Settings, callback: bool = False) -> None:
     except ValueError:
         raise DomainError("oidc_url_invalid", "Invalid URL", 422, {"field": field}) from None
     if (
-        parsed.username
-        or parsed.password
+        parsed.username is not None
+        or parsed.password is not None
         or parsed.fragment
         or not parsed.hostname
         or parsed.scheme not in {"http", "https"}
     ):
         raise DomainError("oidc_url_invalid", "Invalid URL", 422, {"field": field})
+    dev_issuer = settings.oidc_dev_http_issuer
+    dev_origin = urlparse(dev_issuer) if dev_issuer else None
+    dev_http_allowed = bool(
+        not callback
+        and settings.environment == "development"
+        and dev_issuer
+        and (
+            value == dev_issuer
+            or discovery_endpoint
+            and dev_origin is not None
+            and parsed.scheme == dev_origin.scheme
+            and parsed.hostname == dev_origin.hostname
+            and (parsed_port or _default_port(parsed.scheme))
+            == (dev_origin.port or _default_port(dev_origin.scheme))
+        )
+    )
+    if parsed.scheme == "http" and not callback and dev_issuer and not dev_http_allowed:
+        raise DomainError("oidc_https_required", "HTTPS is required", 422, {"field": field})
     if parsed.scheme == "http" and not (
         settings.environment != "production"
         and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        or dev_http_allowed
     ):
         raise DomainError("oidc_https_required", "HTTPS is required", 422, {"field": field})
     if callback and (parsed.path != "/api/v1/auth/oidc/callback" or parsed.query):
@@ -180,6 +202,7 @@ def status(session: Session, settings: Settings, principal_id=None) -> dict:
     )
     if active is not None:
         try:
+            _safe_url(active["issuer_url"], settings)
             _safe_url(active["redirect_uri"], settings, callback=True)
             _secret(active, settings)
             _context(active)
@@ -333,7 +356,20 @@ def _context(config: dict):
     return context
 
 
+def _dev_transport(settings: Settings, issuer: str, config: dict, urls: set[str], *, authlib=False):
+    if settings.environment != "development" or issuer != settings.oidc_dev_http_issuer:
+        return None
+    parsed = urlparse(issuer)
+    if parsed.scheme != "http" or parsed.hostname != "localhost":
+        return None
+    transport = httpx2.AsyncHTTPTransport if authlib else httpx.AsyncHTTPTransport
+    return OidcDevBackchannelTransport(
+        issuer, transport(verify=_context(config), trust_env=False), urls
+    )
+
+
 def client(config: dict, settings: Settings, redirect_uri: str | None = None) -> AuthlibOidcClient:
+    _safe_url(config["issuer_url"], settings)
     _safe_url(config["redirect_uri"], settings, callback=True)
     configured = settings.model_copy(
         update={
@@ -345,7 +381,22 @@ def client(config: dict, settings: Settings, redirect_uri: str | None = None) ->
             "oidc_scopes": config["scopes"],
         }
     )
-    return AuthlibOidcClient(configured, metadata=config.get("metadata"), verify=_context(config))
+    transport = None
+    if settings.environment == "development" and config["issuer_url"] == settings.oidc_dev_http_issuer:
+        metadata = config.get("metadata") or {}
+        endpoints = (metadata.get("token_endpoint"), metadata.get("jwks_uri"))
+        for endpoint in endpoints:
+            if not isinstance(endpoint, str):
+                raise _error("oidc_metadata_invalid", 503)
+            _safe_url(endpoint, settings, discovery_endpoint=True)
+            if (urlparse(endpoint).scheme, urlparse(endpoint).netloc) != (
+                urlparse(config["issuer_url"]).scheme, urlparse(config["issuer_url"]).netloc
+            ):
+                raise _error("oidc_metadata_origin_invalid", 503)
+        transport = _dev_transport(settings, config["issuer_url"], config, set(endpoints), authlib=True)
+    return AuthlibOidcClient(
+        configured, transport=transport, metadata=config.get("metadata"), verify=_context(config)
+    )
 
 
 async def check(session: Session, settings: Settings, version: int) -> dict:
@@ -360,9 +411,11 @@ async def check(session: Session, settings: Settings, version: int) -> dict:
     issuer = config["issuer_url"].rstrip("/")
     _safe_url(issuer, settings)
     discovery = issuer + "/.well-known/openid-configuration"
+    transport = _dev_transport(settings, issuer, config, {discovery})
     try:
         async with httpx.AsyncClient(
-            verify=_context(config), trust_env=False, timeout=8, follow_redirects=False
+            verify=_context(config), trust_env=False, timeout=8, follow_redirects=False,
+            transport=transport,
         ) as http:
             response = await http.get(discovery)
             response.raise_for_status()
@@ -373,13 +426,16 @@ async def check(session: Session, settings: Settings, version: int) -> dict:
                 raise _error("oidc_metadata_invalid")
             if metadata.get("issuer") != issuer:
                 raise _error("oidc_metadata_invalid")
-            origin = urlparse(issuer).netloc
+            issuer_url = urlparse(issuer)
             for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
                 endpoint = metadata.get(key)
                 if not isinstance(endpoint, str):
                     raise _error("oidc_metadata_invalid")
-                _safe_url(endpoint, settings)
-                if urlparse(endpoint).netloc != origin:
+                _safe_url(endpoint, settings, discovery_endpoint=True)
+                endpoint_url = urlparse(endpoint)
+                if (endpoint_url.scheme, endpoint_url.netloc) != (
+                    issuer_url.scheme, issuer_url.netloc
+                ):
                     raise _error("oidc_metadata_origin_invalid")
             if "code" not in metadata.get("response_types_supported", []):
                 raise _error("oidc_metadata_invalid")
@@ -397,6 +453,8 @@ async def check(session: Session, settings: Settings, version: int) -> dict:
             )
             if "client_secret_basic" not in auth_methods:
                 raise _error("oidc_metadata_invalid")
+            if transport is not None:
+                transport.allowed_urls.add(metadata["jwks_uri"])
             jwks = await http.get(metadata["jwks_uri"])
             jwks.raise_for_status()
             keys = jwks.json()
@@ -448,6 +506,7 @@ def mark_trial(session: Session, settings: Settings, version: int, session_id) -
     row = _row(session, lock=True)
     if row["version"] != version or row["checked_version"] != version:
         raise _error("oidc_version_conflict", 409)
+    _safe_url(row["draft"]["issuer_url"], settings)
     _safe_url(row["draft"]["redirect_uri"], settings, callback=True)
     session.execute(
         text("""
@@ -468,6 +527,7 @@ def activate(session: Session, settings: Settings, version: int, session_id) -> 
     row = _row(session, lock=True)
     if row["version"] != version or row["checked_version"] != version or not row["draft"]:
         raise _error("oidc_version_conflict", 409)
+    _safe_url(row["draft"]["issuer_url"], settings)
     _safe_url(row["draft"]["redirect_uri"], settings, callback=True)
     if (
         row["trial_version"] != version

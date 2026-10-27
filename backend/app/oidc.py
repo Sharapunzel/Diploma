@@ -1,8 +1,45 @@
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
+import httpx2
 from authlib.integrations.starlette_client import OAuth
 
 from .config import Settings
+
+
+class OidcDevBackchannelTransport(httpx.AsyncBaseTransport, httpx2.AsyncBaseTransport):
+    """Route selected public OIDC URLs to the same port on the development host."""
+
+    def __init__(
+        self, issuer: str, inner: httpx.AsyncBaseTransport | httpx2.AsyncBaseTransport,
+        allowed_urls: set[str],
+    ):
+        self.issuer = urlparse(issuer)
+        self.inner = inner
+        self.allowed_urls = allowed_urls
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        source = request.url
+        issuer_port = self.issuer.port or (443 if self.issuer.scheme == "https" else 80)
+        if (source.scheme, source.host, source.port) != (
+            self.issuer.scheme, self.issuer.hostname, issuer_port
+        ):
+            raise httpx.ConnectError("OIDC request is outside the configured issuer", request=request)
+        public_url = str(source.copy_with(fragment=None))
+        if public_url not in self.allowed_urls:
+            raise httpx.ConnectError("OIDC request path is not allowed", request=request)
+        host = self.issuer.hostname
+        if self.issuer.port:
+            host += f":{self.issuer.port}"
+        request.headers["host"] = host
+        request.url = source.copy_with(
+            host="host.docker.internal",
+        )
+        return await self.inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
 
 
 class AuthlibOidcClient:
@@ -15,6 +52,7 @@ class AuthlibOidcClient:
         if verify is not None:
             client_kwargs["verify"] = verify
             client_kwargs["trust_env"] = False
+        client_kwargs["follow_redirects"] = False
         self.oauth.register(
             name="oidc",
             server_metadata_url=(

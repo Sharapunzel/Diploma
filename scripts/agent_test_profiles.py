@@ -247,26 +247,35 @@ def oidc_compose_overlay(run: Path, env: dict[str, str], project: str) -> Path:
         "CMD [\"python\", \"/app/oidc_proxy_stub.py\"]\n",
         encoding="utf-8",
     )
+    dev_http = env.get("OIDC_STUB_SCHEME") == "http"
     overlay = {
         "services": {
             "oidc-idp": {
                 "image": f"{project}-oidc-idp",
                 "build": {"context": str(context), "dockerfile": "Dockerfile"},
                 "environment": {
-                    "OIDC_STUB_PORT": "19095",
+                    "OIDC_STUB_PORT": env["OIDC_STUB_PORT"],
                     "OIDC_STUB_HOST": "oidc-idp",
                     "OIDC_STUB_BROWSER_HOST": "oidc-idp",
-                    "OIDC_STUB_CERT_FILE": "/run/oidc/cert.pem",
-                    "OIDC_STUB_KEY_FILE": "/run/oidc/key.pem",
+                    "OIDC_STUB_REALM_PATH": "/realms/master" if dev_http else "",
+                    **({"OIDC_STUB_PUBLIC_ISSUER": env["OIDC_DEV_HTTP_ISSUER"]} if dev_http else {}),
+                    **({} if dev_http else {
+                        "OIDC_STUB_CERT_FILE": "/run/oidc/cert.pem",
+                        "OIDC_STUB_KEY_FILE": "/run/oidc/key.pem",
+                    }),
                 },
-                "volumes": [
+                "volumes": [] if dev_http else [
                     f"{Path(env['OIDC_STUB_CERT_FILE']).resolve()}:/run/oidc/cert.pem:ro",
                     f"{Path(env['OIDC_STUB_KEY_FILE']).resolve()}:/run/oidc/key.pem:ro",
                 ],
-                "networks": ["oidc-private"],
+                **({"ports": [f"127.0.0.1:{env['OIDC_STUB_PUBLIC_PORT']}:{env['OIDC_STUB_PORT']}"]}
+                   if dev_http else {}),
+                "networks": ({"oidc-private": {"aliases": ["host.docker.internal"]},
+                              "oidc-browser": {}}
+                             if dev_http else ["oidc-private"]),
                 "healthcheck": {
                     "test": ["CMD", "python", "-c",
-                             "import socket; s=socket.create_connection(('127.0.0.1',19095),3); s.close()"],
+                             f"import socket; s=socket.create_connection(('127.0.0.1',{env['OIDC_STUB_PORT']}),3); s.close()"],
                     "interval": "1s", "timeout": "3s", "retries": 30,
                 },
                 "mem_limit": "256m", "cpus": 1.0,
@@ -283,7 +292,8 @@ def oidc_compose_overlay(run: Path, env: dict[str, str], project: str) -> Path:
                 },
             },
         },
-        "networks": {"oidc-private": {"driver": "bridge", "internal": True}},
+        "networks": {"oidc-private": {"driver": "bridge", "internal": True},
+                     **({"oidc-browser": {"driver": "bridge"}} if dev_http else {})},
     }
     path = run / "oidc-compose.json"
     path.write_text(json.dumps(overlay, indent=2) + "\n", encoding="utf-8")
@@ -337,9 +347,15 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
            }
     if profile in {"smoke-development", "smoke-production"}:
         env.update({"OIDC_STUB_PORT": "19095", "OIDC_STUB_HOST": "oidc-idp",
-                    "OIDC_STUB_BROWSER_HOST": "oidc-idp"})
+                    "OIDC_STUB_BROWSER_HOST": "oidc-idp",
+                    "OIDC_STUB_SCHEME": "https" if production else "http"})
     if profile == "smoke-development":
         env["EXTERNAL_SECRET_KEY"] = Fernet.generate_key().decode()
+        env["OIDC_STUB_PUBLIC_PORT"] = str(free_port())
+        env["OIDC_STUB_PORT"] = env["OIDC_STUB_PUBLIC_PORT"]
+        env["OIDC_DEV_HTTP_ISSUER"] = f"http://localhost:{env['OIDC_STUB_PUBLIC_PORT']}/realms/master"
+    else:
+        env["OIDC_DEV_HTTP_ISSUER"] = ""
     if production:
         env.update({
             "KAFKA_PUBLIC_HOST": "127.0.0.1",
@@ -384,8 +400,20 @@ def check_config(compose: list[str], project: str, env: dict[str, str], run: Pat
         if not private.get("internal"):
             raise RuntimeError("Synthetic OIDC network is not marked internal")
         idp = config["services"]["oidc-idp"]
-        if idp.get("ports") or idp.get("network_mode") or idp.get("networks") != {"oidc-private": None}:
-            raise RuntimeError("Synthetic OIDC provider is not isolated from host ports")
+        expected_networks = ({"oidc-private": {"aliases": ["host.docker.internal"]},
+                              "oidc-browser": {}}
+                             if env.get("OIDC_STUB_SCHEME") == "http" else {"oidc-private": None})
+        if idp.get("network_mode") or idp.get("networks") != expected_networks:
+            raise RuntimeError(
+                f"Synthetic OIDC provider networks differ from the profile: "
+                f"actual={idp.get('networks')!r}, expected={expected_networks!r}"
+            )
+        expected_ports = ([{"mode": "ingress", "target": int(env["OIDC_STUB_PORT"]),
+                            "published": env["OIDC_STUB_PUBLIC_PORT"],
+                            "protocol": "tcp", "host_ip": "127.0.0.1"}]
+                          if env.get("OIDC_STUB_SCHEME") == "http" else [])
+        if idp.get("ports", []) != expected_ports:
+            raise RuntimeError("Synthetic OIDC provider port binding differs from the profile")
         if "oidc-private" not in config["services"]["api"].get("networks", {}):
             raise RuntimeError("API cannot reach the isolated synthetic OIDC provider")
         if "oidc-private" not in config["services"]["proxy"].get("networks", {}):
@@ -567,8 +595,8 @@ def oidc_administration_smoke(compose: list[str], env: dict[str, str], productio
     port = (env["HTTPS_BIND"] if production else env["PROXY_BIND"]).split(":")[1]
     base = f"{'https' if production else 'http'}://localhost:{port}"
     context = ssl.create_default_context()
-    context.load_verify_locations(cafile=env["OIDC_STUB_CA_FILE"])
     if production:
+        context.load_verify_locations(cafile=env["OIDC_STUB_CA_FILE"])
         context.load_verify_locations(cafile=env["KAFKA_CA_FILE"])
     class FixtureHTTPSConnection(http.client.HTTPSConnection):
         def __init__(self, host, **kwargs):
@@ -626,7 +654,20 @@ def oidc_administration_smoke(compose: list[str], env: dict[str, str], productio
     status, current = call("/api/v1/oidc-provider")
     if status != 200 or current["mode"] != "env":
         raise RuntimeError("OIDC smoke initial configuration invalid")
-    issuer = f"https://oidc-idp:{env['OIDC_STUB_PORT']}"
+    if production:
+        status, refused = call("/api/v1/oidc-provider/draft", "PUT", {
+            "version": current["version"],
+            "issuer_url": "http://oidc-idp:19095/realms/master",
+            "client_id": "smoke-client",
+            "client_secret": "synthetic-smoke-secret",
+            "redirect_uri": base + "/api/v1/auth/oidc/callback",
+            "scopes": ["openid"],
+        }, csrf)
+        if status != 422 or refused["code"] != "oidc_https_required":
+            raise RuntimeError("Production accepted a development HTTP issuer")
+    dev_http = not production
+    issuer = (env["OIDC_DEV_HTTP_ISSUER"] if dev_http
+              else f"https://oidc-idp:{env['OIDC_STUB_PORT']}")
     status, saved = call("/api/v1/oidc-provider/draft", "PUT", {
         "version": current["version"], "issuer_url": issuer, "client_id": "smoke-client",
         "client_secret": "synthetic-smoke-secret",
@@ -636,7 +677,7 @@ def oidc_administration_smoke(compose: list[str], env: dict[str, str], productio
     if status != 200 or not saved["draft"]["has_secret"]:
         raise RuntimeError("OIDC smoke draft save failed")
     status, failure = call("/api/v1/oidc-provider/draft/check", "POST", {"version": saved["version"]}, csrf)
-    if status != 422 or failure["code"] not in {"oidc_tls_invalid", "oidc_hostname_mismatch"}:
+    if production and (status != 422 or failure["code"] not in {"oidc_tls_invalid", "oidc_hostname_mismatch"}):
         if isinstance(failure, dict) and failure.get("code") == "oidc_unreachable":
             diagnostic = (
                 "import socket; h='oidc-idp'; p=" + env["OIDC_STUB_PORT"] + "; "
@@ -647,28 +688,37 @@ def oidc_administration_smoke(compose: list[str], env: dict[str, str], productio
                                     env=env, text=True, capture_output=True, check=False)
             print(f"OIDC route diagnostic: exit={result.returncode}; stdout={result.stdout[-1200:]}; stderr={result.stderr[-1200:]}", flush=True)
         raise RuntimeError(f"OIDC smoke untrusted CA refusal: HTTP {status}, code {failure.get('code') if isinstance(failure, dict) else None}")
-    ca = Path(env["OIDC_STUB_CA_FILE"]).read_bytes()
-    status, saved = call(f"/api/v1/oidc-provider/draft/ca?version={saved['version']}",
-                         "PUT", ca, csrf, "application/x-pem-file")
-    if status != 200 or not saved["draft"]["has_ca"]:
-        raise RuntimeError("OIDC smoke CA upload failed")
+    if production:
+        ca = Path(env["OIDC_STUB_CA_FILE"]).read_bytes()
+        status, saved = call(f"/api/v1/oidc-provider/draft/ca?version={saved['version']}",
+                             "PUT", ca, csrf, "application/x-pem-file")
+        if status != 200 or not saved["draft"]["has_ca"]:
+            raise RuntimeError("OIDC smoke CA upload failed")
+    elif status != 200 or not failure.get("checked"):
+        raise RuntimeError(f"OIDC smoke dev discovery failed: HTTP {status}, response={failure!r}")
     idp_ip = command([*compose, "exec", "-T", "api", "python", "-c",
                       "import socket; print(socket.gethostbyname('oidc-idp'))"],
                      env=env, capture=True).strip()
     status, wrong_host = call("/api/v1/oidc-provider/draft", "PUT", {
         "version": saved["version"],
-        "issuer_url": f"https://{idp_ip}:{env['OIDC_STUB_PORT']}",
+        "issuer_url": f"{'http' if dev_http else 'https'}://{idp_ip}:{env['OIDC_STUB_PORT']}" + ("/realms/master" if dev_http else ""),
         "client_id": "smoke-client",
         "redirect_uri": base + "/api/v1/auth/oidc/callback",
         "scopes": ["openid", "profile", "email"],
     }, csrf)
-    if status != 200:
-        raise RuntimeError("OIDC smoke hostname setup failed")
-    status, failure = call("/api/v1/oidc-provider/draft/check", "POST", {"version": wrong_host["version"]}, csrf)
-    if status != 422 or failure["code"] != "oidc_hostname_mismatch":
-        raise RuntimeError(f"OIDC smoke wrong hostname refusal: HTTP {status}, code {failure.get('code') if isinstance(failure, dict) else None}")
+    if dev_http:
+        if status != 422 or wrong_host["code"] != "oidc_https_required":
+            raise RuntimeError("OIDC smoke foreign HTTP issuer was accepted")
+        restore_version = saved["version"]
+    else:
+        if status != 200:
+            raise RuntimeError("OIDC smoke hostname setup failed")
+        status, failure = call("/api/v1/oidc-provider/draft/check", "POST", {"version": wrong_host["version"]}, csrf)
+        if status != 422 or failure["code"] != "oidc_hostname_mismatch":
+            raise RuntimeError(f"OIDC smoke wrong hostname refusal: HTTP {status}, code {failure.get('code') if isinstance(failure, dict) else None}")
+        restore_version = wrong_host["version"]
     status, saved = call("/api/v1/oidc-provider/draft", "PUT", {
-        "version": wrong_host["version"], "issuer_url": issuer,
+        "version": restore_version, "issuer_url": issuer,
         "client_id": "smoke-client",
         "redirect_uri": base + "/api/v1/auth/oidc/callback",
         "scopes": ["openid", "profile", "email"],
@@ -715,8 +765,22 @@ def oidc_administration_smoke(compose: list[str], env: dict[str, str], productio
 
 def oidc_browser_trial(compose: list[str], env: dict[str, str], production: bool,
                        password: str) -> None:
-    """Verify the checked draft in Chromium with temporary, provider-scoped CA trust."""
+    """Verify trial and active login in Chromium; trust the test CA only in production."""
     run = Path(env["TEMP"])
+    if not production:
+        chrome = next((candidate for candidate in (
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ) if Path(candidate).is_file()), None)
+        if chrome is None:
+            raise RuntimeError("Development OIDC smoke requires local Chrome or Edge")
+        browser_env = {**env, "TASK27_ADMIN_PASSWORD": password,
+                       "PLAYWRIGHT_BASE_URL": f"http://localhost:{env['PROXY_BIND'].split(':')[1]}",
+                       "PLAYWRIGHT_CHROME_PATH": chrome}
+        command([NPM, "run", "test:browser", "--", "oidc.trial.spec.ts",
+                 "--output", str(run / "oidc-browser-results")],
+                env=browser_env, cwd=ROOT / "frontend", timeout=300)
+        return
     context = run / "oidc-browser-context"
     context.mkdir()
     source = ROOT / "frontend"
@@ -763,20 +827,20 @@ def oidc_browser_trial(compose: list[str], env: dict[str, str], production: bool
         "apt-get update >/dev/null",
         "apt-get install -y --no-install-recommends libnss3-tools socat >/dev/null",
         "npm ci --ignore-scripts --no-audit --no-fund",
-        "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb",
-        "cp /tmp/oidc-ca.pem /usr/local/share/ca-certificates/oidc-smoke.crt",
     ]
-    mounts = ["-v", f"{Path(env['OIDC_STUB_CA_FILE']).resolve()}:/tmp/oidc-ca.pem:ro"]
+    mounts = []
     if production:
-        mounts += ["-v", f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/proxy-ca.pem:ro"]
-        script.append("cp /tmp/proxy-ca.pem /usr/local/share/ca-certificates/proxy-smoke.crt")
-    script += [
-        "update-ca-certificates >/dev/null",
-        "certutil -d sql:/root/.pki/nssdb -N --empty-password",
-        "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n oidc-smoke -i /tmp/oidc-ca.pem",
-    ]
-    if production:
-        script.append("certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n proxy-smoke -i /tmp/proxy-ca.pem")
+        mounts += ["-v", f"{Path(env['OIDC_STUB_CA_FILE']).resolve()}:/tmp/oidc-ca.pem:ro",
+                   "-v", f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/proxy-ca.pem:ro"]
+        script += [
+            "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb",
+            "cp /tmp/oidc-ca.pem /usr/local/share/ca-certificates/oidc-smoke.crt",
+            "cp /tmp/proxy-ca.pem /usr/local/share/ca-certificates/proxy-smoke.crt",
+            "update-ca-certificates >/dev/null",
+            "certutil -d sql:/root/.pki/nssdb -N --empty-password",
+            "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n oidc-smoke -i /tmp/oidc-ca.pem",
+            "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n proxy-smoke -i /tmp/proxy-ca.pem",
+        ]
     public_port = (env["HTTPS_BIND"] if production else env["PROXY_BIND"]).split(":")[1]
     proxy_port = "443" if production else "8080"
     script.append(
@@ -1329,14 +1393,18 @@ def main() -> None:
             if args.profile in {"smoke-development", "smoke-production"}:
                 idp_container = command([*compose, "ps", "-q", "oidc-idp"], env=env, capture=True).strip()
                 inspection = json.loads(command(["docker", "inspect", idp_container], env=env, capture=True))[0]
-                bindings = inspection["NetworkSettings"]["Ports"]
-                if any(binding for values in bindings.values() if values for binding in values):
-                    raise RuntimeError("Synthetic OIDC provider has a published host port")
+                bindings = inspection["HostConfig"]["PortBindings"]
+                expected = ({f"{env['OIDC_STUB_PORT']}/tcp": [{"HostIp": "127.0.0.1",
+                    "HostPort": env["OIDC_STUB_PUBLIC_PORT"]}]} if not production else {})
+                if bindings != expected:
+                    raise RuntimeError(f"Synthetic OIDC port binding differs from the profile: {bindings!r}")
                 attached = inspection["NetworkSettings"]["Networks"]
                 network_name = f"{project}_oidc-private"
-                if set(attached) != {network_name}:
+                expected_network_names = ({network_name, f"{project}_oidc-browser"}
+                                          if not production else {network_name})
+                if set(attached) != expected_network_names:
                     raise RuntimeError(f"Synthetic OIDC provider escaped its private network: {sorted(attached)}")
-                print(f"Synthetic IdP isolation passed: {network_name}, no host port, service oidc-idp:19095", flush=True)
+                print(f"Synthetic IdP isolation passed: {network_name}, service oidc-idp:{env['OIDC_STUB_PORT']}", flush=True)
             verify_kafka_metadata(compose, env)
             verify_api_metadata(compose, env)
             if args.profile in {"end-to-end", "smoke-production"}:

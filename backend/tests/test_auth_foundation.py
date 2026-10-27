@@ -16,6 +16,7 @@ from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
+import httpx
 import httpx2
 import jsonschema
 import psycopg
@@ -70,9 +71,11 @@ from app.models import (
     User,
 )
 from app.normalization.schema import ValueSource
-from app.oidc import AuthlibOidcClient
+from app.oidc import AuthlibOidcClient, OidcDevBackchannelTransport
 from app.oidc_provider import ProviderInput
+from app.oidc_provider import _safe_url as safe_oidc_url
 from app.oidc_provider import check as check_oidc_provider
+from app.oidc_provider import client as managed_oidc_client
 from app.oidc_provider import save as save_oidc_provider
 from app.repositories.sqlalchemy import (
     SqlAlchemyOidcMappingRepository,
@@ -857,6 +860,136 @@ def test_oidc_check_rejects_cross_origin_metadata_without_changing_active(
         assert session.execute(text("SELECT mode FROM app.oidc_provider WHERE id = 1")).scalar_one() == "env"
 
 
+def test_oidc_dev_http_allowlist_is_exact_and_production_refuses_it(auth_settings):
+    issuer = "http://localhost:48943/realms/demo"
+    development = auth_settings.model_copy(update={
+        "environment": "development", "oidc_dev_http_issuer": issuer,
+    })
+    safe_oidc_url(issuer, development)
+    safe_oidc_url(issuer + "/protocol/openid-connect/token", development,
+                  discovery_endpoint=True)
+    for rejected in (
+        "http://localhost:48943/realms/other",
+        "http://localhost:48944/realms/demo",
+        "http://other.internal:48943/realms/demo",
+        "http://user@localhost:48943/realms/demo",
+        "http://@localhost:48943/realms/demo",
+    ):
+        with pytest.raises(DomainError):
+            safe_oidc_url(rejected, development)
+    with pytest.raises(DomainError):
+        safe_oidc_url("http://other.internal:48943/token", development,
+                      discovery_endpoint=True)
+    with pytest.raises(DomainError):
+        safe_oidc_url(issuer, auth_settings.model_copy(update={"environment": "production"}))
+    with pytest.raises(ValueError, match="OIDC_DEV_HTTP_ISSUER"):
+        Settings(environment="production", oidc_dev_http_issuer=issuer)
+    with pytest.raises(ValueError, match="OIDC_DEV_HTTP_ISSUER"):
+        Settings(environment="development", oidc_dev_http_issuer="http://user@localhost:48943/realms/demo")
+
+
+def test_oidc_dev_backchannel_keeps_public_host_and_restricts_urls():
+    issuer = "http://localhost:48943/realms/demo"
+    discovery = issuer + "/.well-known/openid-configuration?test=1"
+    seen = []
+
+    def respond(request):
+        seen.append((str(request.url), request.headers["host"]))
+        return httpx.Response(302, headers={"location": "http://other.test/steal"})
+
+    async def exercise():
+        transport = OidcDevBackchannelTransport(
+            issuer, httpx.MockTransport(respond), {discovery}
+        )
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+            response = await client.get(discovery)
+            assert response.status_code == 302
+            with pytest.raises(httpx.ConnectError):
+                await client.get(issuer + "/unexpected")
+            with pytest.raises(httpx.ConnectError):
+                await client.get("http://other.test/realms/demo/.well-known/openid-configuration?test=1")
+
+    asyncio.run(exercise())
+    assert seen == [
+        ("http://host.docker.internal:48943/realms/demo/.well-known/openid-configuration?test=1",
+         "localhost:48943")
+    ]
+
+
+def test_oidc_dev_discovery_and_jwks_use_public_issuer(auth_database, auth_settings, monkeypatch):
+    issuer = "http://localhost:48943/realms/demo"
+    configured = auth_settings.model_copy(update={
+        "environment": "development", "oidc_dev_http_issuer": issuer,
+        "public_origin": "http://localhost:8080",
+        "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+    })
+    seen = []
+
+    def provider(request):
+        seen.append((str(request.url), request.headers["host"]))
+        if request.url.path.endswith("/.well-known/openid-configuration"):
+            return httpx.Response(200, json={
+                "issuer": issuer,
+                "authorization_endpoint": issuer + "/authorize",
+                "token_endpoint": issuer + "/token",
+                "jwks_uri": issuer + "/jwks",
+                "response_types_supported": ["code"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })
+        return httpx.Response(200, json={"keys": [{"kty": "RSA"}]})
+
+    monkeypatch.setattr("app.oidc_provider.httpx.AsyncHTTPTransport",
+                        lambda **_: httpx.MockTransport(provider))
+    with auth_database.session_factory() as session:
+        saved = save_oidc_provider(session, configured, ProviderInput(
+            issuer_url=issuer, client_id="client", client_secret="synthetic-secret",
+            redirect_uri="http://localhost:8080/api/v1/auth/oidc/callback",
+        ), 0)
+        checked = asyncio.run(check_oidc_provider(session, configured, saved["version"]))
+        assert checked["checked"] is True
+    assert seen == [
+        ("http://host.docker.internal:48943/realms/demo/.well-known/openid-configuration",
+         "localhost:48943"),
+        ("http://host.docker.internal:48943/realms/demo/jwks", "localhost:48943"),
+    ]
+
+
+@pytest.mark.parametrize("tamper", ["issuer", "token_origin"])
+def test_oidc_dev_rejects_untrusted_metadata_before_fetching_jwks(
+    auth_database, auth_settings, monkeypatch, tamper
+):
+    issuer = "http://localhost:48943/realms/demo"
+    configured = auth_settings.model_copy(update={
+        "environment": "development", "oidc_dev_http_issuer": issuer,
+        "public_origin": "http://localhost:8080",
+        "external_secret_key": SecretStr(Fernet.generate_key().decode()),
+    })
+    seen = []
+
+    def provider(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={
+            "issuer": "http://other.test/realms/demo" if tamper == "issuer" else issuer,
+            "authorization_endpoint": issuer + "/authorize",
+            "token_endpoint": "http://other.test/token" if tamper == "token_origin" else issuer + "/token",
+            "jwks_uri": issuer + "/jwks",
+            "response_types_supported": ["code"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })
+
+    monkeypatch.setattr("app.oidc_provider.httpx.AsyncHTTPTransport",
+                        lambda **_: httpx.MockTransport(provider))
+    with auth_database.session_factory() as session:
+        saved = save_oidc_provider(session, configured, ProviderInput(
+            issuer_url=issuer, client_id="client", client_secret="synthetic-secret",
+            redirect_uri="http://localhost:8080/api/v1/auth/oidc/callback",
+        ), 0)
+        with pytest.raises(DomainError) as refusal:
+            asyncio.run(check_oidc_provider(session, configured, saved["version"]))
+        assert refusal.value.code in {"oidc_metadata_invalid", "oidc_https_required"}
+    assert seen == ["http://host.docker.internal:48943/realms/demo/.well-known/openid-configuration"]
+
+
 def test_0002_schema_permission_and_downgrade(auth_database_url):
     run_alembic(auth_database_url, "upgrade", "head")
     psycopg_url = make_url(auth_database_url).set(drivername="postgresql").render_as_string(
@@ -1613,6 +1746,72 @@ def test_authlib_oidc_flow_uses_local_discovery_jwks_and_signed_id_token(
             for value in session.scalars(select(AuthSession))
         )
         assert "provider-token-not-persisted" not in serialized_sessions
+
+
+def test_managed_dev_oidc_login_routes_token_and_jwks_with_public_issuer(
+    auth_database, auth_settings, monkeypatch
+):
+    issuer = "http://localhost:48943/realms/demo"
+    key = Fernet.generate_key().decode()
+    configured = oidc_settings(auth_settings).model_copy(update={
+        "environment": "development", "public_origin": "http://localhost:8080",
+        "oidc_issuer_url": issuer, "oidc_dev_http_issuer": issuer,
+        "external_secret_key": SecretStr(key),
+    })
+    private_key = RSAKey.import_key(rsa.generate_private_key(65537, 2048))
+    public_jwk = private_key.as_dict(private=False, kid="dev-key", use="sig", alg="RS256")
+    handshake = {"nonce": None}
+    seen = []
+
+    def provider(request):
+        seen.append((str(request.url), request.headers["host"]))
+        if request.url.path.endswith("/token"):
+            now = int(time.time())
+            token = jwt.encode(
+                {"alg": "RS256", "kid": "dev-key"},
+                {"iss": issuer, "sub": "dev-subject", "aud": "client", "iat": now,
+                 "exp": now + 300, "nonce": handshake["nonce"]},
+                private_key, algorithms=["RS256"],
+            )
+            return httpx2.Response(200, json={
+                "access_token": "synthetic-access", "token_type": "Bearer", "id_token": token,
+            })
+        if request.url.path.endswith("/jwks"):
+            return httpx2.Response(200, json={"keys": [public_jwk]})
+        return httpx2.Response(404)
+
+    monkeypatch.setattr("app.oidc_provider.httpx2.AsyncHTTPTransport",
+                        lambda **_: httpx2.MockTransport(provider))
+    config = {
+        "issuer_url": issuer, "client_id": "client",
+        "secret_ciphertext": Fernet(key.encode()).encrypt(b"synthetic-secret").decode(),
+        "redirect_uri": "http://localhost:8080/api/v1/auth/oidc/callback",
+        "scopes": ["openid", "profile", "email"],
+        "metadata": {
+            "issuer": issuer, "authorization_endpoint": issuer + "/authorize",
+            "token_endpoint": issuer + "/token", "jwks_uri": issuer + "/jwks",
+            "id_token_signing_alg_values_supported": ["RS256"],
+        },
+    }
+    adapter = managed_oidc_client(config, configured)
+    app_settings = oidc_settings(auth_settings).model_copy(update={
+        "oidc_issuer_url": issuer, "public_origin": "http://localhost:8080",
+    })
+    with TestClient(create_app(app_settings, auth_database, adapter)) as api:
+        start = api.get("/api/v1/auth/oidc/login", follow_redirects=False)
+        assert start.status_code == 302
+        assert start.headers["location"].startswith(issuer + "/authorize?")
+        query = parse_qs(urlparse(start.headers["location"]).query)
+        handshake["nonce"] = query["nonce"][0]
+        callback = api.get("/api/v1/auth/oidc/callback", params={
+            "code": "synthetic-code", "state": query["state"][0],
+        }, follow_redirects=False)
+        assert callback.status_code == 307, callback.text
+        assert api.get("/api/v1/auth/session").json()["authenticated"] is True
+    assert seen == [
+        ("http://host.docker.internal:48943/realms/demo/token", "localhost:48943"),
+        ("http://host.docker.internal:48943/realms/demo/jwks", "localhost:48943"),
+    ]
 
 
 def failing_oidc_provider(mode: str):

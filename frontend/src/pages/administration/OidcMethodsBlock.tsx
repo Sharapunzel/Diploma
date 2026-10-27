@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { InfoCircleOutlined } from "@ant-design/icons";
 import {
   Alert,
   Button,
   Form,
   Input,
+  Popover,
   Space,
   Spin,
   Typography,
@@ -43,6 +45,78 @@ type Values = {
   client_secret?: string;
 };
 
+const confirmedRejectionStatuses: Record<string, readonly number[]> = {
+  authentication_required: [401],
+  permission_denied: [403],
+  csrf_invalid: [403],
+  validation_error: [422],
+  oidc_key_unavailable: [503],
+  oidc_configuration_unavailable: [503],
+  oidc_public_origin_invalid: [503],
+  oidc_version_conflict: [409],
+  oidc_trial_required: [409],
+  oidc_secret_required: [400],
+  oidc_ca_invalid: [422],
+  oidc_url_invalid: [422],
+  oidc_https_required: [422],
+  oidc_callback_invalid: [422],
+  oidc_callback_origin_invalid: [422],
+  oidc_tls_invalid: [422],
+  oidc_hostname_mismatch: [422],
+  oidc_unreachable: [422],
+  oidc_metadata_invalid: [422],
+  oidc_metadata_origin_invalid: [422],
+  oidc_jwks_invalid: [422],
+};
+
+function isConfirmedRejection(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    confirmedRejectionStatuses[error.code]?.includes(error.status) === true
+  );
+}
+
+function isConfig(value: unknown): value is Config {
+  if (typeof value !== "object" || value === null) return false;
+  const config = value as Record<string, unknown>;
+  return (
+    typeof config.issuer_url === "string" &&
+    typeof config.client_id === "string" &&
+    typeof config.redirect_uri === "string" &&
+    Array.isArray(config.scopes) &&
+    config.scopes.every((scope) => typeof scope === "string") &&
+    typeof config.has_secret === "boolean" &&
+    typeof config.has_ca === "boolean"
+  );
+}
+
+function isStatus(value: unknown): value is Status {
+  if (typeof value !== "object" || value === null) return false;
+  const status = value as Record<string, unknown>;
+  return (
+    ["env", "managed", "disabled"].includes(String(status.mode)) &&
+    typeof status.env_enabled === "boolean" &&
+    Number.isInteger(status.version) &&
+    (status.active_version === null ||
+      Number.isInteger(status.active_version)) &&
+    (status.active === null || isConfig(status.active)) &&
+    (status.draft === null || isConfig(status.draft)) &&
+    typeof status.checked === "boolean" &&
+    typeof status.trial_succeeded === "boolean"
+  );
+}
+
+const HelpTip = ({ label, text }: { label: string; text: string }) => (
+  <Popover content={text} trigger="click">
+    <Button
+      type="text"
+      size="small"
+      icon={<InfoCircleOutlined />}
+      aria-label={`Справка: ${label}`}
+    />
+  </Popover>
+);
+
 export const OidcMethodsBlock = observer(() => {
   const { api, session } = useStores();
   const [form] = Form.useForm<Values>();
@@ -50,6 +124,7 @@ export const OidcMethodsBlock = observer(() => {
   const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState<string | null>(null);
   const mutationInFlight = useRef(false);
+  const caInput = useRef<HTMLInputElement>(null);
   const [confirm, setConfirm] = useState<"activate" | "disable" | null>(null);
   const [uncertain, setUncertain] = useState(false);
   const canWrite = session.has("settings.write");
@@ -58,7 +133,9 @@ export const OidcMethodsBlock = observer(() => {
     setPending("load");
     setError(null);
     try {
-      const next = await api.request<Status>("/oidc-provider");
+      const response = await api.request<unknown>("/oidc-provider");
+      if (!isStatus(response)) throw new ApiError(200, "invalid_response");
+      const next = response;
       setState(next);
       setUncertain(false);
       const config = next.draft ?? next.active;
@@ -103,6 +180,7 @@ export const OidcMethodsBlock = observer(() => {
     setError(null);
     try {
       const next = await action();
+      if (!isStatus(next)) throw new ApiError(200, "invalid_response");
       setState(next);
       form.setFieldValue("client_secret", "");
       message.success(success);
@@ -126,12 +204,7 @@ export const OidcMethodsBlock = observer(() => {
         if (field)
           form.setFields([{ name: field, errors: [errorText(cause)] }]);
       }
-      if (
-        !(cause instanceof ApiError) ||
-        cause.status === 0 ||
-        cause.status >= 500
-      )
-        setUncertain(true);
+      setUncertain(!isConfirmedRejection(cause));
     } finally {
       mutationInFlight.current = false;
       setPending(null);
@@ -163,7 +236,10 @@ export const OidcMethodsBlock = observer(() => {
           message={
             uncertain
               ? `${errorText(error)} Исход изменения неизвестен. Обновите состояние перед следующим действием.`
-              : undefined
+              : error instanceof ApiError &&
+                  error.code === "oidc_key_unavailable"
+                ? `${errorText(error)} Задайте постоянный EXTERNAL_SECRET_KEY в защищённом файле или корневом dev .env и обновите состояние.`
+                : undefined
           }
           onRetry={() => void load()}
           actionLabel="Обновить"
@@ -186,6 +262,27 @@ export const OidcMethodsBlock = observer(() => {
                 : "OIDC отключён"}
             . Активная версия: {state.active_version ?? "—"}.
           </Typography.Paragraph>
+          {state.mode === "disabled" && (
+            <Typography.Paragraph>
+              Для повторного включения подготовьте черновик, проверьте
+              настройки, выполните пробный вход текущей версии и активируйте
+              OIDC.
+            </Typography.Paragraph>
+          )}
+          <ol aria-label="Этапы настройки OIDC">
+            <li>Черновик: {state.draft ? "сохранён" : "не создан"}</li>
+            <li>
+              Discovery и TLS: {state.checked ? "проверены" : "не проверены"}
+            </li>
+            <li>
+              Пробный вход:{" "}
+              {state.trial_succeeded ? "подтверждён" : "не подтверждён"}
+            </li>
+            <li>
+              Активация:{" "}
+              {state.trial_succeeded ? "доступна" : "после пробного входа"}
+            </li>
+          </ol>
           {state.mode === "env" && (
             <Typography.Paragraph>
               OIDC из настроек хоста:{" "}
@@ -226,36 +323,89 @@ export const OidcMethodsBlock = observer(() => {
           >
             <Form.Item
               name="issuer_url"
-              label="Issuer URL"
+              label={
+                <>
+                  Issuer URL{" "}
+                  <HelpTip
+                    label="Issuer URL"
+                    text="Адрес конкретного realm в IdP, например http://localhost:8081/realms/master; корень Keycloak не подходит."
+                  />
+                </>
+              }
               rules={[{ required: true }]}
             >
-              <Input disabled={!canWrite || !!pending || uncertain} />
+              <Input
+                aria-label="Issuer URL"
+                disabled={!canWrite || !!pending || uncertain}
+              />
             </Form.Item>
             <Form.Item
               name="client_id"
-              label="Client ID"
+              label={
+                <>
+                  Client ID{" "}
+                  <HelpTip
+                    label="Client ID"
+                    text="Идентификатор клиента, созданного в настройках того же realm IdP."
+                  />
+                </>
+              }
               rules={[{ required: true }]}
             >
-              <Input disabled={!canWrite || !!pending || uncertain} />
+              <Input
+                aria-label="Client ID"
+                disabled={!canWrite || !!pending || uncertain}
+              />
             </Form.Item>
             <Form.Item
               name="redirect_uri"
-              label="Callback URL"
+              label={
+                <>
+                  Callback URL{" "}
+                  <HelpTip
+                    label="Callback URL"
+                    text="Точный публичный адрес приложения; зарегистрируйте его в Valid redirect URIs клиента IdP, например http://localhost:8080/api/v1/auth/oidc/callback."
+                  />
+                </>
+              }
               rules={[{ required: true }]}
             >
-              <Input disabled={!canWrite || !!pending || uncertain} />
+              <Input
+                aria-label="Callback URL"
+                disabled={!canWrite || !!pending || uncertain}
+              />
             </Form.Item>
             <Form.Item
               name="scopes"
-              label="Scopes через пробел"
+              label={
+                <>
+                  Scopes через пробел{" "}
+                  <HelpTip
+                    label="Scopes"
+                    text="Разрешённые клиенту IdP области доступа через пробел; openid обязателен, например openid profile email."
+                  />
+                </>
+              }
               initialValue="openid profile email"
               rules={[{ required: true }]}
             >
-              <Input disabled={!canWrite || !!pending || uncertain} />
+              <Input
+                aria-label="Scopes через пробел"
+                disabled={!canWrite || !!pending || uncertain}
+              />
             </Form.Item>
             <Form.Item
               name="client_secret"
-              label={`Client secret (${state.draft?.has_secret ? "сохранён" : "отсутствует"})`}
+              label={
+                <>
+                  Client secret (
+                  {state.draft?.has_secret ? "сохранён" : "отсутствует"}){" "}
+                  <HelpTip
+                    label="Client secret"
+                    text="Секрет берётся из настроек того же клиента в IdP. Он не отображается после сохранения."
+                  />
+                </>
+              }
               extra="Оставьте пустым, чтобы сохранить действующий секрет."
             >
               <Input.Password
@@ -287,36 +437,45 @@ export const OidcMethodsBlock = observer(() => {
           </Typography.Paragraph>
           {canWrite && (
             <Space wrap>
-              <label className={styles.upload}>
+              <Button
+                disabled={!state.draft || !!pending || uncertain}
+                loading={pending === "ca"}
+                onClick={() => caInput.current?.click()}
+              >
                 Загрузить CA PEM
-                <input
-                  type="file"
-                  accept=".pem,application/x-pem-file"
-                  disabled={!state.draft || !!pending || uncertain}
-                  onChange={(event) => {
-                    const file = event.target.files?.[0];
-                    event.target.value = "";
-                    if (file && file.size <= 65536)
-                      void run(
-                        "ca",
-                        () =>
-                          api.request<Status>(
-                            `/oidc-provider/draft/ca?version=${state.version}`,
-                            {
-                              method: "PUT",
-                              headers: {
-                                "Content-Type": "application/x-pem-file",
-                              },
-                              body: file,
+              </Button>
+              <HelpTip
+                label="CA PEM"
+                text="Нужен только для доверия частному удостоверяющему центру HTTPS-провайдера. Загружайте сертификат CA в PEM, не сертификат сервера и не приватный ключ."
+              />
+              <input
+                ref={caInput}
+                type="file"
+                accept=".pem,application/x-pem-file"
+                disabled={!state.draft || !!pending || uncertain}
+                className={styles.hiddenInput}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file && file.size <= 65536)
+                    void run(
+                      "ca",
+                      () =>
+                        api.request<Status>(
+                          `/oidc-provider/draft/ca?version=${state.version}`,
+                          {
+                            method: "PUT",
+                            headers: {
+                              "Content-Type": "application/x-pem-file",
                             },
-                          ),
-                        "CA загружен",
-                      );
-                    else if (file)
-                      setError(new ApiError(422, "oidc_ca_invalid"));
-                  }}
-                />
-              </label>
+                            body: file,
+                          },
+                        ),
+                      "CA загружен",
+                    );
+                  else if (file) setError(new ApiError(422, "oidc_ca_invalid"));
+                }}
+              />
               <Button
                 disabled={!state.draft?.has_ca || !!pending || uncertain}
                 loading={pending === "remove-ca"}
@@ -385,12 +544,40 @@ export const OidcMethodsBlock = observer(() => {
               </Button>
               <Button
                 danger
-                disabled={state.mode === "disabled" || !!pending || uncertain}
+                disabled={
+                  state.mode === "disabled" ||
+                  (state.mode === "env" && !state.env_enabled) ||
+                  !!pending ||
+                  uncertain
+                }
                 onClick={() => setConfirm("disable")}
               >
                 Отключить OIDC
               </Button>
             </Space>
+          )}
+          {canWrite && (
+            <Typography.Paragraph>
+              {!state.draft &&
+                "Сначала сохраните черновик: тогда станут доступны CA и проверка. "}
+              {state.draft &&
+                !state.draft.has_ca &&
+                "Удалить CA можно после его загрузки. "}
+              {state.draft &&
+                !state.draft.has_secret &&
+                "Удалить секрет можно после его сохранения. "}
+              {state.draft &&
+                !state.checked &&
+                "Проверьте настройки, чтобы открыть пробный вход. "}
+              {state.checked &&
+                !state.trial_succeeded &&
+                "Выполните пробный вход текущей версии, чтобы открыть активацию. "}
+              {(state.mode === "disabled" ||
+                (state.mode === "env" && !state.env_enabled)) &&
+                "OIDC уже отключён: действие «Отключить OIDC» недоступно."}
+              {pending && "Дождитесь завершения текущей операции. "}
+              {uncertain && "Сначала обновите состояние после сетевой ошибки."}
+            </Typography.Paragraph>
           )}
           {state.checked && !state.trial_succeeded && (
             <Typography.Paragraph>

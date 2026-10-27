@@ -13,28 +13,8 @@
   overflow-wrap: anywhere;
 }
 
-.upload {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  min-height: 32px;
-  padding: 4px 12px;
-  border: 1px solid var(--color-border, #7775);
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.upload:focus-within {
-  outline: 2px solid #64f86a;
-  outline-offset: 2px;
-}
-
-.upload input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  opacity: 0;
-  cursor: pointer;
+.hiddenInput {
+  display: none;
 }
 
 @media (max-width: 480px) {

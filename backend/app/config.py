@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     local_auth_enabled: bool = True
     oidc_enabled: bool = False
     oidc_issuer_url: str | None = None
+    oidc_dev_http_issuer: str | None = None
     oidc_client_id: str | None = None
     oidc_client_secret: SecretStr | None = None
     oidc_redirect_uri: str | None = None
@@ -90,6 +91,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security(self):
+        if self.oidc_dev_http_issuer:
+            try:
+                dev_issuer = urlparse(self.oidc_dev_http_issuer)
+                dev_port = dev_issuer.port
+            except ValueError:
+                raise ValueError("OIDC_DEV_HTTP_ISSUER is invalid") from None
+            if (
+                self.environment != "development"
+                or dev_issuer.scheme != "http"
+                or dev_issuer.hostname != "localhost"
+                or dev_issuer.netloc != f"localhost{f':{dev_port}' if dev_port else ''}"
+                or not dev_issuer.path.startswith("/")
+                or dev_issuer.path == "/"
+                or dev_issuer.query
+                or dev_issuer.fragment
+            ):
+                raise ValueError("OIDC_DEV_HTTP_ISSUER must be a development localhost realm URL")
         if self.cors_origins and "*" in self.cors_origins:
             raise ValueError("cors_origins cannot contain wildcard")
         if self.session_idle_ttl_seconds > self.session_absolute_ttl_seconds:
