@@ -1,7 +1,15 @@
 .page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
   min-width: 0;
+}
+.page :global(.ant-card) {
+  min-width: 0;
+}
+.page :global(.ant-card-head-wrapper) {
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .selector {
   display: flex;

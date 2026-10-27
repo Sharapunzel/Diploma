@@ -100,8 +100,13 @@ describe("EventsStore", () => {
       timestamp_to: first.timestamp_to,
       cursor: "next",
     });
-    store.applySearch(first.timestamp_from, first.timestamp_to, "asc", []);
-    expect(store.cursors).toEqual([undefined]);
+    await store.applySearch(
+      first.timestamp_from,
+      first.timestamp_to,
+      "asc",
+      [],
+    );
+    expect(store.cursors).toEqual([undefined, "next"]);
     expect(store.page).toBe(0);
   });
 

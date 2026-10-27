@@ -636,9 +636,7 @@ export const AgentsPage = observer(() => {
     <main className={styles.page}>
       <div className={styles.heading}>
         <div>
-          <Typography.Title level={2}>
-            {id ? "Карточка агента" : "Агенты"}
-          </Typography.Title>
+          {id && <Typography.Title level={2}>Карточка агента</Typography.Title>}
           <Typography.Text type="secondary">
             Готовность доступа не означает, что Fluent Bit сейчас работает или
             отправляет записи.
@@ -687,6 +685,7 @@ export const AgentsPage = observer(() => {
         <>
           <Table
             rowKey="id"
+            scroll={{ x: 820 }}
             dataSource={store.page}
             loading={store.loading}
             pagination={false}
@@ -798,6 +797,7 @@ export const AgentsPage = observer(() => {
           />
           <Table
             rowKey="id"
+            scroll={{ x: 720 }}
             pagination={false}
             dataSource={agent.topics}
             columns={[

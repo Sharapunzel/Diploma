@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Alert, Button, Drawer, Input, Select, Spin, Table, Tag } from "antd";
+import { Alert, Button, Input, Modal, Select, Spin, Table, Tag } from "antd";
 import { observer } from "mobx-react-lite";
-import { ApiError } from "../../app/api/client";
+import { ApiError, errorText } from "../../app/api/client";
 import {
   EventsApi,
   type DeleteScope,
@@ -183,6 +183,41 @@ type PendingDelete = {
   row?: EventRow;
 };
 
+function ExpandableText({
+  value,
+  formatted = false,
+}: {
+  value: string;
+  formatted?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const long = value.length > (formatted ? 240 : 90) || value.includes("\n");
+  return (
+    <div className={formatted ? styles.textBlock : styles.cell}>
+      {formatted ? (
+        <pre
+          className={`${styles.pre} ${!expanded && long ? styles.collapsed : ""}`}
+        >
+          {value}
+        </pre>
+      ) : (
+        <span
+          className={
+            !expanded && long ? styles.collapsedCell : styles.expandedCell
+          }
+        >
+          {value}
+        </span>
+      )}
+      {long && (
+        <Button type="link" size="small" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "Свернуть" : "Развернуть"}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 export const EventsPage = observer(() => {
   const { api, session } = useStores();
   const [store] = useState(() => new EventsStore(new EventsApi(api)));
@@ -190,6 +225,7 @@ export const EventsPage = observer(() => {
   const [draftFrom, setDraftFrom] = useState("");
   const [draftTo, setDraftTo] = useState("");
   const [draftSort, setDraftSort] = useState<"asc" | "desc">("desc");
+  const [draftColumns, setDraftColumns] = useState<string[]>([]);
   const [draftFilters, setDraftFilters] = useState<
     { field: string; operator: string; value: string }[]
   >([]);
@@ -205,24 +241,22 @@ export const EventsPage = observer(() => {
   const [deleteError, setDeleteError] = useState<unknown>(null);
   const [notice, setNotice] = useState("");
   const [unknownResult, setUnknownResult] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const canDelete =
     session.has("events.delete") && store.source?.source_type === "kafka";
-  const backendFilterIndex =
-    store.error instanceof ApiError &&
-    store.error.code === "event_filter_invalid" &&
-    store.error.details &&
-    typeof store.error.details === "object" &&
-    "index" in store.error.details &&
-    typeof store.error.details.index === "number"
-      ? store.error.details.index
-      : null;
   useEffect(() => {
     void store.loadSources();
     return () => store.dispose();
   }, [store]);
 
   function selectSource(id: string | null) {
+    setFiltersOpen(false);
+    setDeleteOpen(false);
     setDraftFilters([]);
+    setDraftColumns([]);
+    setFilterError("");
+    setFilterErrorIndex(null);
     setDeleteError(null);
     setPendingDelete(null);
     setUnknownResult(false);
@@ -241,7 +275,9 @@ export const EventsPage = observer(() => {
     if (!store.error) setUnknownResult(false);
   }
 
-  function apply() {
+  async function apply() {
+    if (store.loading) return;
+    const sourceId = store.source?.id;
     setFilterError("");
     setFilterErrorIndex(null);
     const lower = new Date(draftFrom);
@@ -295,11 +331,41 @@ export const EventsPage = observer(() => {
         return;
       }
     }
-    store.applySearch(
+    const applied = await store.applySearch(
       lower.toISOString(),
       upper.toISOString(),
       draftSort,
       filters,
+      draftColumns,
+    );
+    if (store.source?.id !== sourceId) return;
+    if (applied) {
+      setFiltersOpen(false);
+      return;
+    }
+    const error = store.error;
+    if (
+      error instanceof ApiError &&
+      error.code === "event_filter_invalid" &&
+      error.details &&
+      typeof error.details === "object" &&
+      "index" in error.details &&
+      typeof error.details.index === "number" &&
+      Number.isInteger(error.details.index) &&
+      error.details.index >= 0 &&
+      error.details.index < draftFilters.length
+    ) {
+      setFilterErrorIndex(error.details.index);
+      setFilterError(
+        "Источник отклонил это условие. Проверьте поле, оператор и значение.",
+      );
+      return;
+    }
+    setFilterErrorIndex(null);
+    setFilterError(
+      error instanceof ApiError && error.status === 0
+        ? "Не удалось связаться с сервером. Поиск не применён; проверьте соединение и повторите попытку."
+        : `Не удалось применить поиск. ${errorText(error)}`,
     );
   }
 
@@ -352,6 +418,7 @@ export const EventsPage = observer(() => {
       return;
     }
     setDeletePeriodError("");
+    setDeleteOpen(false);
     const scope: DeleteScope = {
       timestamp_from: from.toISOString(),
       timestamp_to: to.toISOString(),
@@ -367,7 +434,6 @@ export const EventsPage = observer(() => {
 
   return (
     <main className={styles.page}>
-      <h1>События</h1>
       {notice && (
         <Alert
           type="success"
@@ -438,209 +504,49 @@ export const EventsPage = observer(() => {
               onRetry={() => void store.loadCatalog()}
             />
           )}
-          <div className={styles.toolbar}>
-            <label className={styles.field}>
-              От (время события, {zone})
-              <Input
-                type="datetime-local"
-                value={
-                  draftFrom && !Number.isNaN(new Date(draftFrom).getTime())
-                    ? new Date(draftFrom)
-                        .toLocaleString("sv-SE")
-                        .replace(" ", "T")
-                        .slice(0, 16)
-                    : ""
-                }
-                onChange={(event) =>
-                  setDraftFrom(
-                    event.target.value
-                      ? new Date(event.target.value).toISOString()
-                      : "",
-                  )
-                }
-              />
-            </label>
-            <label className={styles.field}>
-              До (исключительно, {zone})
-              <Input
-                type="datetime-local"
-                value={
-                  draftTo && !Number.isNaN(new Date(draftTo).getTime())
-                    ? new Date(draftTo)
-                        .toLocaleString("sv-SE")
-                        .replace(" ", "T")
-                        .slice(0, 16)
-                    : ""
-                }
-                onChange={(event) =>
-                  setDraftTo(
-                    event.target.value
-                      ? new Date(event.target.value).toISOString()
-                      : "",
-                  )
-                }
-              />
-            </label>
-            <label className={styles.field}>
-              Порядок
-              <Select
-                value={draftSort}
-                onChange={setDraftSort}
-                options={[
-                  { value: "desc", label: "Новые сначала" },
-                  { value: "asc", label: "Старые сначала" },
-                ]}
-              />
-            </label>
-          </div>
-          <label className={styles.field}>
-            Колонки
-            <Select
-              mode="multiple"
-              disabled={!store.catalogReady}
-              showSearch
-              value={store.columns}
-              onChange={(values) => {
-                store.columns = values;
-              }}
-              options={store.fields.map((field) => ({
-                value: field.name,
-                label: field.name,
-              }))}
-              placeholder="Выберите поля"
-            />
-          </label>
-          <section className={styles.filters} aria-label="Фильтры по полям">
-            {draftFilters.map((filter, index) => {
-              const field = store.fields.find(
-                (item) => item.name === filter.field,
-              );
-              return (
-                <div className={styles.filter} key={index}>
-                  <Select
-                    className={styles.filterField}
-                    showSearch
-                    optionFilterProp="label"
-                    placeholder="Поле"
-                    value={filter.field || undefined}
-                    onChange={(value) =>
-                      setDraftFilters(
-                        draftFilters.map((item, at) =>
-                          at === index
-                            ? { field: value, operator: "", value: "" }
-                            : item,
-                        ),
-                      )
-                    }
-                    options={store.fields.map((item) => ({
-                      value: item.name,
-                      label: item.name,
-                    }))}
-                  />
-                  <Select
-                    placeholder="Оператор"
-                    value={filter.operator || undefined}
-                    onChange={(value) =>
-                      setDraftFilters(
-                        draftFilters.map((item, at) =>
-                          at === index ? { ...item, operator: value } : item,
-                        ),
-                      )
-                    }
-                    options={(field?.operators ?? []).map((operator) => ({
-                      value: operator,
-                      label: operators[operator] || operator,
-                    }))}
-                  />
-                  {!noValue.has(filter.operator) &&
-                    (field?.type === "boolean" && filter.operator !== "in" ? (
-                      <Select
-                        className={styles.filterValue}
-                        value={filter.value || undefined}
-                        onChange={(value) =>
-                          setDraftFilters(
-                            draftFilters.map((item, at) =>
-                              at === index ? { ...item, value } : item,
-                            ),
-                          )
-                        }
-                        options={[
-                          { value: "true", label: "Истина" },
-                          { value: "false", label: "Ложь" },
-                        ]}
-                      />
-                    ) : (
-                      <Input
-                        className={styles.filterValue}
-                        type={
-                          field?.type === "date" && filter.operator !== "in"
-                            ? "datetime-local"
-                            : filter.operator !== "in" &&
-                                ["integer", "long", "float", "double"].includes(
-                                  field?.type ?? "",
-                                )
-                              ? "number"
-                              : "text"
-                        }
-                        value={filter.value}
-                        onChange={(event) =>
-                          setDraftFilters(
-                            draftFilters.map((item, at) =>
-                              at === index
-                                ? { ...item, value: event.target.value }
-                                : item,
-                            ),
-                          )
-                        }
-                        placeholder={
-                          filter.operator === "in"
-                            ? "Значения через запятую"
-                            : "Значение"
-                        }
-                      />
-                    ))}
-                  <Button
-                    onClick={() =>
-                      setDraftFilters(
-                        draftFilters.filter((_, at) => at !== index),
-                      )
-                    }
-                  >
-                    Убрать
-                  </Button>
-                  {(backendFilterIndex === index ||
-                    filterErrorIndex === index) && (
-                    <Alert
-                      type="error"
-                      message={
-                        filterErrorIndex === index
-                          ? filterError
-                          : "Проверьте это условие фильтра."
-                      }
-                    />
-                  )}
-                </div>
-              );
-            })}
+          <div className={styles.searchBar}>
+            <div className={styles.applied}>
+              <span>
+                Период: {displayTime(store.from)} — {displayTime(store.to)}
+              </span>
+              <span>
+                Порядок:{" "}
+                {store.sort === "desc" ? "Новые сначала" : "Старые сначала"}
+              </span>
+              {store.filters.length === 0 ? (
+                <span>Условий: 0</span>
+              ) : (
+                <span
+                  className={styles.conditions}
+                  title={store.filters
+                    .map(
+                      (filter) =>
+                        `${filter.field} ${operators[filter.operator] ?? filter.operator}${"value" in filter ? ` ${showValue(filter.value)}` : ""}`,
+                    )
+                    .join("; ")}
+                >
+                  Условия:{" "}
+                  {store.filters
+                    .slice(0, 2)
+                    .map(
+                      (filter) =>
+                        `${filter.field} ${operators[filter.operator] ?? filter.operator}${"value" in filter ? ` ${showValue(filter.value)}` : ""}`,
+                    )
+                    .join("; ")}
+                  {store.filters.length > 2
+                    ? `; ещё ${store.filters.length - 2}`
+                    : ""}
+                </span>
+              )}
+            </div>
             <div className={styles.actions}>
               <Button
-                disabled={!store.catalogReady || draftFilters.length >= 20}
-                onClick={() =>
-                  setDraftFilters([
-                    ...draftFilters,
-                    { field: "", operator: "", value: "" },
-                  ])
-                }
+                onClick={() => {
+                  setDraftColumns(store.columns);
+                  setFiltersOpen(true);
+                }}
               >
-                Добавить условие
-              </Button>
-              <Button
-                type="primary"
-                onClick={apply}
-                loading={store.loading}
-                disabled={!store.catalogReady}
-              >
-                Искать
+                Фильтры и поля
               </Button>
               <Button
                 onClick={() => void refresh()}
@@ -648,84 +554,319 @@ export const EventsPage = observer(() => {
               >
                 Обновить
               </Button>
+              {canDelete && (
+                <Button danger onClick={() => setDeleteOpen(true)}>
+                  Удаление событий
+                </Button>
+              )}
             </div>
-            {filterError && filterErrorIndex === null && (
-              <Alert type="error" message={filterError} />
-            )}
-          </section>
-          {canDelete && (
-            <section aria-label="Область удаления">
-              <h2>Область удаления</h2>
-              <p>
-                Удаление использует время события. Другие фильтры таблицы не
-                учитываются.
-              </p>
+          </div>
+          <Modal
+            title="Фильтры и поля"
+            open={filtersOpen}
+            onCancel={() => {
+              if (!store.loading) setFiltersOpen(false);
+            }}
+            footer={null}
+            width={760}
+            destroyOnHidden
+          >
+            <div className={styles.panelContent}>
               <div className={styles.toolbar}>
                 <label className={styles.field}>
-                  От ({zone}, включительно)
+                  От (время события, {zone})
                   <Input
-                    aria-label="Начало периода удаления"
                     type="datetime-local"
-                    step="0.001"
-                    value={deleteFrom}
-                    onChange={(event) => setDeleteFrom(event.target.value)}
+                    value={
+                      draftFrom && !Number.isNaN(new Date(draftFrom).getTime())
+                        ? new Date(draftFrom)
+                            .toLocaleString("sv-SE")
+                            .replace(" ", "T")
+                            .slice(0, 16)
+                        : ""
+                    }
+                    onChange={(event) =>
+                      setDraftFrom(
+                        event.target.value
+                          ? new Date(event.target.value).toISOString()
+                          : "",
+                      )
+                    }
                   />
                 </label>
                 <label className={styles.field}>
-                  До ({zone}, исключительно)
+                  До (исключительно, {zone})
                   <Input
-                    aria-label="Конец периода удаления"
                     type="datetime-local"
-                    step="0.001"
-                    value={deleteTo}
-                    onChange={(event) => setDeleteTo(event.target.value)}
+                    value={
+                      draftTo && !Number.isNaN(new Date(draftTo).getTime())
+                        ? new Date(draftTo)
+                            .toLocaleString("sv-SE")
+                            .replace(" ", "T")
+                            .slice(0, 16)
+                        : ""
+                    }
+                    onChange={(event) =>
+                      setDraftTo(
+                        event.target.value
+                          ? new Date(event.target.value).toISOString()
+                          : "",
+                      )
+                    }
                   />
                 </label>
-                <Button
-                  onClick={() => {
-                    setDeleteFrom(localDateTime(store.from));
-                    setDeleteTo(localDateTime(store.to));
-                  }}
-                >
-                  Взять период применённого поиска
-                </Button>
+                <label className={styles.field}>
+                  Порядок
+                  <Select
+                    value={draftSort}
+                    onChange={setDraftSort}
+                    options={[
+                      { value: "desc", label: "Новые сначала" },
+                      { value: "asc", label: "Старые сначала" },
+                    ]}
+                  />
+                </label>
               </div>
-              {deletePeriodError && (
-                <Alert type="error" message={deletePeriodError} />
-              )}
-              <div className={styles.actions}>
-                <Button
-                  danger
-                  disabled={unknownResult}
-                  onClick={() =>
-                    setPendingDelete({
-                      title: "Удалить источник целиком",
-                      sourceId: store.source!.id,
-                      scope: { source_id: store.source!.id },
-                      message: `Необратимо удалить все локальные события источника «${store.source!.name}» независимо от времени и фильтров таблицы.`,
-                    })
-                  }
-                >
-                  Удалить события источника
-                </Button>
-                <Button
-                  danger
-                  disabled={unknownResult}
-                  onClick={() => deletePeriod(false)}
-                >
-                  Удалить источник за период
-                </Button>
-                <Button
-                  danger
-                  disabled={unknownResult}
-                  onClick={() => deletePeriod(true)}
-                >
-                  Удалить все локальные за период
-                </Button>
-              </div>
-            </section>
+              <label className={styles.field}>
+                Колонки
+                <Select
+                  mode="multiple"
+                  disabled={!store.catalogReady}
+                  showSearch
+                  value={draftColumns}
+                  onChange={setDraftColumns}
+                  options={store.fields.map((field) => ({
+                    value: field.name,
+                    label: field.name,
+                  }))}
+                  placeholder="Выберите поля"
+                />
+              </label>
+              <section className={styles.filters} aria-label="Фильтры по полям">
+                {draftFilters.map((filter, index) => {
+                  const field = store.fields.find(
+                    (item) => item.name === filter.field,
+                  );
+                  return (
+                    <div className={styles.filter} key={index}>
+                      <Select
+                        className={styles.filterField}
+                        aria-label="Поле условия"
+                        showSearch
+                        optionFilterProp="label"
+                        placeholder="Поле"
+                        value={filter.field || undefined}
+                        onChange={(value) =>
+                          setDraftFilters(
+                            draftFilters.map((item, at) =>
+                              at === index
+                                ? { field: value, operator: "", value: "" }
+                                : item,
+                            ),
+                          )
+                        }
+                        options={store.fields.map((item) => ({
+                          value: item.name,
+                          label: item.name,
+                        }))}
+                      />
+                      <Select
+                        aria-label="Оператор условия"
+                        placeholder="Оператор"
+                        value={filter.operator || undefined}
+                        onChange={(value) =>
+                          setDraftFilters(
+                            draftFilters.map((item, at) =>
+                              at === index
+                                ? { ...item, operator: value }
+                                : item,
+                            ),
+                          )
+                        }
+                        options={(field?.operators ?? []).map((operator) => ({
+                          value: operator,
+                          label: operators[operator] || operator,
+                        }))}
+                      />
+                      {!noValue.has(filter.operator) &&
+                        (field?.type === "boolean" &&
+                        filter.operator !== "in" ? (
+                          <Select
+                            className={styles.filterValue}
+                            value={filter.value || undefined}
+                            onChange={(value) =>
+                              setDraftFilters(
+                                draftFilters.map((item, at) =>
+                                  at === index ? { ...item, value } : item,
+                                ),
+                              )
+                            }
+                            options={[
+                              { value: "true", label: "Истина" },
+                              { value: "false", label: "Ложь" },
+                            ]}
+                          />
+                        ) : (
+                          <Input
+                            className={styles.filterValue}
+                            type={
+                              field?.type === "date" && filter.operator !== "in"
+                                ? "datetime-local"
+                                : filter.operator !== "in" &&
+                                    [
+                                      "integer",
+                                      "long",
+                                      "float",
+                                      "double",
+                                    ].includes(field?.type ?? "")
+                                  ? "number"
+                                  : "text"
+                            }
+                            value={filter.value}
+                            onChange={(event) =>
+                              setDraftFilters(
+                                draftFilters.map((item, at) =>
+                                  at === index
+                                    ? { ...item, value: event.target.value }
+                                    : item,
+                                ),
+                              )
+                            }
+                            placeholder={
+                              filter.operator === "in"
+                                ? "Значения через запятую"
+                                : "Значение"
+                            }
+                          />
+                        ))}
+                      <Button
+                        onClick={() =>
+                          setDraftFilters(
+                            draftFilters.filter((_, at) => at !== index),
+                          )
+                        }
+                      >
+                        Убрать
+                      </Button>
+                      {filterErrorIndex === index && (
+                        <Alert type="error" message={filterError} />
+                      )}
+                    </div>
+                  );
+                })}
+                <div className={styles.actions}>
+                  <Button
+                    disabled={!store.catalogReady || draftFilters.length >= 20}
+                    onClick={() =>
+                      setDraftFilters([
+                        ...draftFilters,
+                        { field: "", operator: "", value: "" },
+                      ])
+                    }
+                  >
+                    Добавить условие
+                  </Button>
+                  <Button
+                    type="primary"
+                    onClick={() => void apply()}
+                    loading={store.loading}
+                    disabled={!store.catalogReady || store.loading}
+                  >
+                    Искать
+                  </Button>
+                </div>
+                {filterError && filterErrorIndex === null && (
+                  <Alert type="error" message={filterError} />
+                )}
+              </section>
+            </div>
+          </Modal>
+          {canDelete && (
+            <Modal
+              title="Удаление событий"
+              open={deleteOpen}
+              onCancel={() => setDeleteOpen(false)}
+              footer={null}
+              width={720}
+              destroyOnHidden
+            >
+              <section
+                className={styles.panelContent}
+                aria-label="Область удаления"
+              >
+                <h2>Область удаления</h2>
+                <p>
+                  Удаление использует время события. Другие фильтры таблицы не
+                  учитываются.
+                </p>
+                <div className={styles.toolbar}>
+                  <label className={styles.field}>
+                    От ({zone}, включительно)
+                    <Input
+                      aria-label="Начало периода удаления"
+                      type="datetime-local"
+                      step="0.001"
+                      value={deleteFrom}
+                      onChange={(event) => setDeleteFrom(event.target.value)}
+                    />
+                  </label>
+                  <label className={styles.field}>
+                    До ({zone}, исключительно)
+                    <Input
+                      aria-label="Конец периода удаления"
+                      type="datetime-local"
+                      step="0.001"
+                      value={deleteTo}
+                      onChange={(event) => setDeleteTo(event.target.value)}
+                    />
+                  </label>
+                  <Button
+                    onClick={() => {
+                      setDeleteFrom(localDateTime(store.from));
+                      setDeleteTo(localDateTime(store.to));
+                    }}
+                  >
+                    Взять период применённого поиска
+                  </Button>
+                </div>
+                {deletePeriodError && (
+                  <Alert type="error" message={deletePeriodError} />
+                )}
+                <div className={styles.actions}>
+                  <Button
+                    danger
+                    disabled={unknownResult}
+                    onClick={() => {
+                      setDeleteOpen(false);
+                      setPendingDelete({
+                        title: "Удалить источник целиком",
+                        sourceId: store.source!.id,
+                        scope: { source_id: store.source!.id },
+                        message: `Необратимо удалить все локальные события источника «${store.source!.name}» независимо от времени и фильтров таблицы.`,
+                      });
+                    }}
+                  >
+                    Удалить события источника
+                  </Button>
+                  <Button
+                    danger
+                    disabled={unknownResult}
+                    onClick={() => deletePeriod(false)}
+                  >
+                    Удалить источник за период
+                  </Button>
+                  <Button
+                    danger
+                    disabled={unknownResult}
+                    onClick={() => deletePeriod(true)}
+                  >
+                    Удалить все локальные за период
+                  </Button>
+                </div>
+              </section>
+            </Modal>
           )}
-          {!!store.error && (
+          {!!store.error && !filtersOpen && (
             <AppRequestError
               error={store.error}
               onRetry={() => void store.search()}
@@ -755,12 +896,9 @@ export const EventsPage = observer(() => {
                   title: name,
                   key: name,
                   render: (_: unknown, row: EventRow) => (
-                    <span
-                      className={styles.cell}
-                      title={showValue(fieldValue(row.fields, name))}
-                    >
-                      {showValue(fieldValue(row.fields, name))}
-                    </span>
+                    <ExpandableText
+                      value={showValue(fieldValue(row.fields, name))}
+                    />
                   ),
                 })),
                 ...(store.source.source_type === "kafka"
@@ -824,11 +962,14 @@ export const EventsPage = observer(() => {
           </div>
         </>
       )}
-      <Drawer
+      <Modal
         title="Событие"
         open={!!store.card || store.cardLoading || !!store.cardError}
-        onClose={() => store.closeCard()}
-        width="min(720px, 100%)"
+        onCancel={() => store.closeCard()}
+        footer={null}
+        width={720}
+        destroyOnHidden
+        className={styles.cardModal}
       >
         {store.cardLoading && <Spin aria-label="Загрузка события" />}
         {!!store.cardError && <AppRequestError error={store.cardError} />}
@@ -844,9 +985,10 @@ export const EventsPage = observer(() => {
               "raw" in store.card.details && (
                 <>
                   <h3>Исходная запись</h3>
-                  <pre className={styles.pre}>
-                    {String(store.card.details.raw)}
-                  </pre>
+                  <ExpandableText
+                    formatted
+                    value={String(store.card.details.raw)}
+                  />
                   {localDiagnostics(store.card)?.status === "partial" && (
                     <Alert
                       type="warning"
@@ -864,18 +1006,23 @@ export const EventsPage = observer(() => {
                     />
                   )}
                   <h3>Метаданные</h3>
-                  <pre className={styles.pre}>
-                    {JSON.stringify(store.card.details.metadata, null, 2)}
-                  </pre>
+                  <ExpandableText
+                    formatted
+                    value={
+                      JSON.stringify(store.card.details.metadata, null, 2) ??
+                      "—"
+                    }
+                  />
                 </>
               )}
             <h3>Поля события</h3>
-            <pre className={styles.pre}>
-              {JSON.stringify(store.card.fields, null, 2)}
-            </pre>
+            <ExpandableText
+              formatted
+              value={JSON.stringify(store.card.fields, null, 2) ?? "—"}
+            />
           </div>
         )}
-      </Drawer>
+      </Modal>
       <ConfirmationDialog
         open={!!pendingDelete}
         pending={deleting}

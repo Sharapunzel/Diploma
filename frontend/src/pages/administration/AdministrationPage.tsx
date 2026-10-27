@@ -570,7 +570,6 @@ export const AdministrationPage = observer(() => {
   if (!canReadUsers) {
     return (
       <main className={styles.page}>
-        <Typography.Title level={2}>Администрирование</Typography.Title>
         {session.has("settings.read") && <OidcMethodsBlock />}
       </main>
     );
@@ -578,7 +577,6 @@ export const AdministrationPage = observer(() => {
 
   return (
     <main className={styles.page}>
-      <Typography.Title level={2}>Администрирование</Typography.Title>
       <section className={styles.block} aria-labelledby="users-heading">
         <div className={styles.heading}>
           <Typography.Title level={3} id="users-heading">

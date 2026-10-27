@@ -249,22 +249,69 @@ export class EventsStore {
     }
   }
 
-  applySearch(
+  async applySearch(
     from: string,
     to: string,
     sort: "asc" | "desc",
     filters: EventFilter[],
-  ) {
-    this.defaultWindow = false;
-    this.from = from;
-    this.to = to;
-    this.sort = sort;
-    this.filters = filters;
-    this.cursors = [undefined];
-    this.pages = [];
-    this.page = 0;
-    this.results = null;
-    void this.search();
+    columns = this.columns,
+  ): Promise<boolean> {
+    if (!this.source || this.disposed || this.loading) return false;
+    const generation = ++this.generation;
+    this.controller?.abort();
+    this.controller = new AbortController();
+    const sourceId = this.source.id;
+    const request: EventSearch = {
+      timestamp_from: from,
+      timestamp_to: to,
+      sort,
+      filters,
+      limit: 50,
+    };
+    this.loading = true;
+    this.error = null;
+    try {
+      const result = await this.api.search(
+        sourceId,
+        request,
+        this.controller.signal,
+      );
+      if (
+        this.disposed ||
+        generation !== this.generation ||
+        this.source?.id !== sourceId
+      )
+        return false;
+      runInAction(() => {
+        this.defaultWindow = false;
+        this.from = from;
+        this.to = to;
+        this.sort = sort;
+        this.filters = filters;
+        this.columns = columns;
+        this.cursors = [undefined];
+        this.pages = [result];
+        this.page = 0;
+        this.results = result;
+        if (result.next_cursor) this.cursors[1] = result.next_cursor;
+      });
+      return true;
+    } catch (error) {
+      if (
+        generation === this.generation &&
+        !(error instanceof DOMException && error.name === "AbortError")
+      ) {
+        runInAction(() => {
+          this.error = error;
+        });
+      }
+      return false;
+    } finally {
+      if (generation === this.generation)
+        runInAction(() => {
+          this.loading = false;
+        });
+    }
   }
 
   refresh() {

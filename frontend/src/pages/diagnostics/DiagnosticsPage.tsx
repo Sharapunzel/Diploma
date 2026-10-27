@@ -365,7 +365,6 @@ export const DiagnosticsPage = observer(() => {
   return (
     <main className={styles.page}>
       <header>
-        <Typography.Title level={2}>Диагностика конвейера</Typography.Title>
         <Typography.Paragraph>
           Здесь показан собственный путь событий: сбор агентом, передача через
           Kafka, обработка источником, нормализация и сохранение. Текущий снимок

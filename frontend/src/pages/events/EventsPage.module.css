@@ -1,6 +1,37 @@
 .page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
+  min-width: 0;
+}
+.searchBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.applied {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.applied > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.conditions {
+  max-width: min(100%, 480px);
+  overflow-wrap: anywhere;
+}
+.panelContent {
+  display: grid;
+  gap: 16px;
+  max-height: min(70vh, 760px);
+  overflow: auto;
+  padding: 4px;
 }
 .toolbar {
   display: flex;
@@ -15,18 +46,42 @@
   flex: 1 1 180px;
 }
 .source {
-  min-width: min(100%, 320px);
+  min-width: 0;
+  max-width: 100%;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 0 1 420px;
+}
+.source :global(.ant-select) {
+  width: 100%;
+  min-width: 0;
 }
 .table {
   overflow-x: auto;
+  min-width: 0;
 }
 .cell {
-  display: inline-block;
+  display: grid;
+  justify-items: start;
   max-width: 260px;
+  min-width: 120px;
+  overflow-wrap: anywhere;
+}
+.collapsedCell {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: middle;
+}
+.expandedCell {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.textBlock {
+  min-width: 0;
+}
+.collapsed {
+  max-height: 6em !important;
+  overflow: hidden !important;
 }
 .filters {
   display: grid;
@@ -53,12 +108,18 @@
 .pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 320px;
+  max-height: 50vh;
   overflow-y: auto;
 }
 .card {
   display: grid;
   gap: 12px;
+  min-width: 0;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.cardModal {
+  max-width: calc(100vw - 24px);
 }
 @media (max-width: 600px) {
   .toolbar > * {
