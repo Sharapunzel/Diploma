@@ -6,7 +6,7 @@
 python scripts/agent_test_profiles.py external-end-to-end
 ```
 
-Профиль поднимает production-состав приложения и настоящий `wazuh/wazuh-indexer:5.0.0-beta5`, закреплённый по digest в `scripts/agent_test_profiles.py`. Он создаёт синтетические секреты, CA и данные в `.harness/runs/<run-id>`, проверяет живой backend и UI через HTTPS proxy, затем удаляет созданные ресурсы. Для проверки Compose без запуска используйте `--check-only`. Требования к Docker и очистке описаны в [профилях](../../../docs/agent-test-profiles.md).
+Профиль поднимает production-состав приложения и настоящий `wazuh/wazuh-indexer:5.0.0-beta5`, закреплённый по digest в `scripts/agent_test_profiles.py`. Он создаёт синтетические секреты, CA и данные в `.test_runs/runs/<run-id>`, проверяет живой backend и UI через HTTPS proxy, затем удаляет созданные ресурсы. Для проверки Compose без запуска используйте `--check-only`. Требования к Docker и очистке описаны в [профилях](../../../docs/agent-test-profiles.md).
 
 Скрипты этого каталога используются профилем: `generate_certs.py` выпускает тестовый CA и сертификат индексера, `bootstrap_readonly.py` создаёт роль чтения, `seed_synthetic.py` загружает данные, `smoke_indexer.py` проверяет HTTPS, mappings, PIT и запрет записи. Переменные `WAZUH_TEST_RUNTIME` и `WAZUH_TEST_BASE_URL` указывают на изолированный каталог и опубликованный адрес текущего прогона. Контейнер API обращается к индексеру по внутреннему имени `https://indexer:9200`; адрес хоста ему не подходит.
 

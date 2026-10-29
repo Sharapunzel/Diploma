@@ -47,4 +47,4 @@ def test_profile_rejects_unsafe_resolved_compose(monkeypatch, change):
         config["networks"]["internal"]["name"] = "diploma_internal"
     monkeypatch.setattr(profiles, "command", lambda *args, **kwargs: json.dumps(config))
     with pytest.raises(RuntimeError):
-        profiles.check_config([], "diploma_t21_test", {}, ROOT / ".harness" / "runs" / "test")
+        profiles.check_config([], "diploma_t21_test", {}, ROOT / ".test_runs" / "runs" / "test")

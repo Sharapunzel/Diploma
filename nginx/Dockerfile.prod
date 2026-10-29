@@ -6,7 +6,7 @@ COPY frontend/index.html frontend/vite.config.ts frontend/tsconfig.json ./
 COPY frontend/src/ ./src/
 COPY frontend/public/ ./public/
 RUN test ! -d .ruff_cache \
-    && test ! -d .harness \
+    && test ! -d .test_runs \
     && test ! -d .pytest_cache \
     && test ! -e tsconfig.tsbuildinfo \
     && test ! -d dist \

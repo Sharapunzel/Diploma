@@ -66,4 +66,4 @@ def test_external_preparation_removes_only_new_image(tmp_path: Path, monkeypatch
 
     assert removed == ["sha256:new-wazuh"]
     assert present == {foreign}
-    assert list((tmp_path / ".harness" / "runs").iterdir()) == []
+    assert list((tmp_path / ".test_runs" / "runs").iterdir()) == []

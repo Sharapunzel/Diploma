@@ -10,8 +10,8 @@ frontend/dist/
 frontend/dist/**
 frontend/.ruff_cache/
 frontend/.ruff_cache/**
-frontend/.harness/
-frontend/.harness/**
+frontend/.test_runs/
+frontend/.test_runs/**
 frontend/.pytest_cache/
 frontend/.pytest_cache/**
 frontend/test-results/

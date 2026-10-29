@@ -16,8 +16,8 @@ SPEC.loader.exec_module(PROFILE)
 @pytest.mark.parametrize(
     "run",
     [
-        PureWindowsPath(r"C:\Users\Lenovo\Projects\Diploma\.harness\runs\run with spaces"),
-        PurePosixPath("/workspace/project/.harness/runs/run with spaces"),
+        PureWindowsPath(r"C:\Users\Lenovo\Projects\Diploma\.test_runs\runs\run with spaces"),
+        PurePosixPath("/workspace/project/.test_runs/runs/run with spaces"),
     ],
 )
 def test_pytest_basetemp_keeps_absolute_run_path(run):

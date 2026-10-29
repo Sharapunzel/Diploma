@@ -1573,7 +1573,7 @@ def main() -> None:
     parser.add_argument("--pytest", nargs="*", help="Specific backend test nodes for a focused retry")
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
     args = parser.parse_args()
-    run = ROOT / ".harness" / "runs" / f"task21-{uuid4().hex}"
+    run = ROOT / ".test_runs" / "runs" / f"task21-{uuid4().hex}"
     run.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "TEMP": str(run), "TMP": str(run), "TMPDIR": str(run),
            "npm_config_cache": str(run / "npm-cache"), "PYTHONDONTWRITEBYTECODE": "1",
@@ -1771,7 +1771,7 @@ def main() -> None:
                 compare_inventory(before, after, project or "unassigned project")
             except Exception as exc:
                 cleanup_error = exc
-        run_root = (ROOT / ".harness" / "runs").resolve()
+        run_root = (ROOT / ".test_runs" / "runs").resolve()
         target = run.resolve()
         if target == run_root or not target.is_relative_to(run_root):
             raise RuntimeError(f"Unexpected run cleanup path: {target}")
