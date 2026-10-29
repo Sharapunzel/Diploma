@@ -155,7 +155,8 @@ def inventory(env: dict[str, str]) -> dict:
     }
 
 
-def remove_new_images(before: dict, env: dict[str, str], project: str) -> None:
+def remove_new_images(before: dict, env: dict[str, str], project: str,
+                      profile: str) -> None:
     prior = set(before["images"])
     prior_ids = {entry.split(" ", 1)[0] for entry in prior}
     allowed = (f"{project}-", "fluent/fluent-bit:4.2.3", "moby/buildkit:buildx-stable-1",
@@ -163,6 +164,8 @@ def remove_new_images(before: dict, env: dict[str, str], project: str) -> None:
                "mcr.microsoft.com/playwright:v1.63.0-noble",
                "python:3.12-slim", "node:20.19.5-alpine", "nginx:1.30.5-alpine",
                "postgres:18", "apache/kafka:4.2.0")
+    if profile == "external-end-to-end":
+        allowed += ("wazuh/wazuh-indexer:",)
     for entry in inventory(env)["images"]:
         if entry in prior:
             continue
@@ -300,6 +303,61 @@ def oidc_compose_overlay(run: Path, env: dict[str, str], project: str) -> Path:
     return path
 
 
+def wazuh_compose_overlay(run: Path, env: dict[str, str]) -> Path:
+    """Attach the pinned Wazuh Indexer to the same isolated Compose project."""
+    source = ROOT / "backend" / "tests" / "opensearch-wazuh5"
+    image = "wazuh/wazuh-indexer@sha256:70d7c42518e4e295a73947ef916fc26e67f81658dd0c892d7032018b296607ce"
+    config = run / "wazuh-opensearch.yml"
+    config.write_bytes((source / "opensearch.yml").read_bytes())
+    password_file = Path(env["WAZUH_TEST_ADMIN_PASSWORD_FILE"])
+    password_hash = command([
+        "docker", "run", "--rm", "--entrypoint", "sh",
+        "-v", f"{password_file.resolve()}:/tmp/admin-password:ro", image,
+        "-c", "OPENSEARCH_JAVA_HOME=/usr/share/wazuh-indexer/jdk "
+              "/usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh "
+              "-p \"$(cat /tmp/admin-password)\"",
+    ], env=env, capture=True, timeout=60).strip()
+    if not password_hash.startswith(("$2a$", "$2y$")):
+        raise RuntimeError("Wazuh did not return a bcrypt admin hash")
+    users = run / "wazuh-internal-users.yml"
+    users.write_text(
+        "_meta:\n  type: internalusers\n  config_version: 2\n"
+        f"admin:\n  hash: '{password_hash}'\n  reserved: true\n"
+        "  backend_roles:\n    - admin\n",
+        encoding="utf-8",
+    )
+    overlay = {
+        "services": {
+            "postgres": {"ports": [env["POSTGRES_BIND"]]},
+            "indexer": {
+                "image": image,
+                "environment": {
+                    "OPENSEARCH_JAVA_OPTS": "-Xms1g -Xmx1g",
+                },
+                "ports": [f"127.0.0.1:{env['WAZUH_TEST_PORT']}:9200"],
+                "volumes": [
+                    f"{config.resolve()}:/usr/share/wazuh-indexer/config/opensearch.yml:ro",
+                    f"{(Path(env['WAZUH_TEST_RUNTIME']) / 'certs').resolve()}:/usr/share/wazuh-indexer/config/certs:ro",
+                    f"{users.resolve()}:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro",
+                    "indexer_data:/var/lib/wazuh-indexer",
+                ],
+                "ulimits": {"memlock": {"soft": -1, "hard": -1}},
+                "healthcheck": {
+                    "test": ["CMD-SHELL", "test \"$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /usr/share/wazuh-indexer/config/certs/root-ca.pem https://localhost:9200/)\" = 401"],
+                    "interval": "10s", "timeout": "5s", "retries": 18,
+                    "start_period": "90s",
+                },
+                "mem_limit": "2g", "cpus": 2.0, "restart": "no",
+                "networks": ["internal"],
+            },
+        },
+        "volumes": {"indexer_data": {}},
+    }
+    path = run / "wazuh-compose.json"
+    path.write_text(json.dumps(overlay, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
     suffix = uuid4().hex[:10]
     project = f"diploma_t21_{suffix}"
@@ -312,7 +370,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
         "KAFKA_READER_PASSWORD_FILE": secret_file(run, "kafka_reader_password", secrets.token_urlsafe(32)),
         "AGENT_CREDENTIALS_KEY_FILE": secret_file(run, "agent_credentials_key", Fernet.generate_key().decode()),
     }
-    production = profile == "smoke-production"
+    production = profile in {"smoke-production", "external-end-to-end"}
     if profile in {"smoke-development", "smoke-production"}:
         files.update(oidc_certificates(run))
     if production:
@@ -345,6 +403,18 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
            "KAFKA_TEST_ADMIN_PASSWORD_FILE": str(files["KAFKA_ADMIN_PASSWORD_FILE"]),
            "KAFKA_TEST_DEV_ALLOWED_BOOTSTRAP_SERVERS": f"127.0.0.1:{kafka_port},kafka:9092",
            }
+    if profile == "external-end-to-end":
+        indexer_port = free_port()
+        runtime = run / "wazuh-runtime"
+        env.update({"WAZUH_TEST_RUNTIME": str(runtime),
+                    "WAZUH_TEST_PORT": str(indexer_port),
+                    "WAZUH_TEST_BASE_URL": f"https://localhost:{indexer_port}",
+                    "WAZUH_TEST_ADMIN_PASSWORD_FILE": str(secret_file(
+                        run, "wazuh_initial_admin_password", "Aa1!" + secrets.token_urlsafe(28))),
+                    "WAZUH_SMOKE_URL": f"https://localhost:{indexer_port}",
+                    "WAZUH_SMOKE_CA": str(runtime / "certs" / "root-ca.pem")})
+        command([sys.executable, str(ROOT / "backend" / "tests" / "opensearch-wazuh5" / "generate_certs.py")],
+                env=env)
     if profile in {"smoke-development", "smoke-production"}:
         env.update({"OIDC_STUB_PORT": "19095", "OIDC_STUB_HOST": "oidc-idp",
                     "OIDC_STUB_BROWSER_HOST": "oidc-idp",
@@ -1093,29 +1163,12 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
     del unknown, producer, admin
     print("Kafka denied an unknown agent and cross-topic write", flush=True)
 
-    base = profile_env["PLAYWRIGHT_BASE_URL"] + "/api/v1"
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-    def request(path: str, method: str, body: dict | None = None, csrf: str | None = None):
-        headers = {"Content-Type": "application/json"}
-        if csrf:
-            headers["X-CSRF-Token"] = csrf
-        data = json.dumps(body).encode() if body is not None else None
-        with opener.open(urllib.request.Request(base + path, data=data, headers=headers,
-                                                method=method), timeout=15) as response:
-            return json.load(response)
-    session = request("/auth/local/login", "POST", {"username": "task21admin", "password": password})
-    csrf = session["csrf_token"]
-    rule = {"format_version": 1, "variants": [{"key": "plain", "priority": 1,
-            "when": {"kind": "contains", "value": " "}, "blocks": [{"key": "message",
-            "kind": "map_ecs", "target": "message", "source": {"ref": "log"},
-            "required": True}]}]}
-    normalizer = request("/normalizers", "POST", {"name": "Task 21 normalizer", "rule": rule}, csrf)
+    profile_env["TASK21_PHASE"] = "configure"
+    command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "configure-playwright")],
+            env=profile_env, cwd=ROOT / "frontend")
     agent_artifact = json.loads((run / "agent.json").read_text(encoding="utf-8"))
-    agent_artifact["normalizerId"] = normalizer["id"]
-    (run / "agent.json").write_text(json.dumps(agent_artifact), encoding="utf-8")
     source = agent["sourceId"]
-    request(f"/sources/{source}/normalizer", "PUT", {"normalizer_id": normalizer["id"]}, csrf)
-    request(f"/sources/{source}/enable", "POST", csrf=csrf)
+    normalizer_id = agent_artifact["normalizerId"]
     from sqlalchemy import create_engine
     from sqlalchemy import text as sql_text
     engine = create_engine(env["TEST_DATABASE_URL"])
@@ -1123,14 +1176,29 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             with engine.connect() as connection:
-                value = connection.execute(sql_text(
-                    "SELECT ecs_data->>'message' FROM logs.parsed_logs WHERE source_id=:id "
-                    "ORDER BY backend_processed_at DESC LIMIT 1"), {"id": source}).scalar_one_or_none()
-            if value == "task21 smoke event":
+                record = connection.execute(sql_text(
+                    "SELECT raw, ecs_data->>'message' AS message, kafka_topic, "
+                    "kafka_partition, kafka_offset, source_id, connection_id, "
+                    "normalizer_id, processed_record_id FROM logs.parsed_logs "
+                    "WHERE source_id=:id ORDER BY backend_processed_at DESC LIMIT 1"
+                ), {"id": source}).mappings().one_or_none()
+            if record and record["message"] == "task21 smoke event":
                 break
             time.sleep(1)
         else:
             raise RuntimeError("The source did not persist the normalized event in PostgreSQL")
+        if (record["raw"] != "task21 smoke event" or record["kafka_topic"] != topic
+                or record["kafka_partition"] < 0 or record["kafka_offset"] < 0
+                or str(record["source_id"]) != source or not record["connection_id"]
+                or str(record["normalizer_id"]) != normalizer_id
+                or not record["processed_record_id"]):
+            raise RuntimeError("The stored ECS event lost its raw log or Kafka provenance")
+        with engine.connect() as connection:
+            saved_count = connection.execute(sql_text(
+                "SELECT count(*) FROM logs.parsed_logs WHERE source_id=:id AND raw=:raw"
+            ), {"id": source, "raw": "task21 smoke event"}).scalar_one()
+        if saved_count != 1:
+            raise RuntimeError("The synthetic Kafka record was duplicated before restart")
         diagnostic_delivery = []
         diagnostic_producer = Producer({**agent_options, "message.timeout.ms": 10000})
         diagnostic_producer.produce(topic, b"task23-invalid-envelope", callback=lambda error, _: diagnostic_delivery.append(error))
@@ -1164,6 +1232,20 @@ def end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path)
                 raise RuntimeError("The synthetic Kafka history event was not saved")
     finally:
         engine.dispose()
+    command([*compose, "restart", "api"], env=env)
+    command([*compose, "up", "-d", "--wait", "api"], env=env)
+    time.sleep(3)
+    engine = create_engine(env["TEST_DATABASE_URL"])
+    try:
+        with engine.connect() as connection:
+            after_restart = connection.execute(sql_text(
+                "SELECT count(*) FROM logs.parsed_logs WHERE source_id=:id AND raw=:raw"
+            ), {"id": source, "raw": "task21 smoke event"}).scalar_one()
+        if after_restart != saved_count:
+            raise RuntimeError("Backend restart duplicated the saved Kafka record")
+    finally:
+        engine.dispose()
+    print("Backend restart recovered the source without duplicating the stored event", flush=True)
     profile_env["TASK21_PHASE"] = "verify"
     profile_env["TASK23_DIAGNOSTIC_FIXTURES"] = "1"
     command([NPM, "run", "test:browser", "--", "agents.live.spec.ts", "--output", str(run / "playwright")],
@@ -1294,9 +1376,200 @@ def tls_agent_smoke(compose: list[str], project: str, env: dict[str, str], run: 
         command(["docker", "rm", "-f", container], env=env)
 
 
+def external_end_to_end(compose: list[str], project: str, env: dict[str, str], run: Path) -> None:
+    """Check Wazuh-shaped ECS data through the real HTTPS API and indexer."""
+    scripts = ROOT / "backend" / "tests" / "opensearch-wazuh5"
+    for name in ("bootstrap_readonly.py", "seed_synthetic.py", "smoke_indexer.py"):
+        command([sys.executable, str(scripts / name)], env=env, timeout=240)
+    reader_password = (Path(env["WAZUH_TEST_RUNTIME"]) / "reader-password.txt").read_text(encoding="utf-8").strip()
+    test_env = {**env, "WAZUH_SMOKE_USERNAME": "diploma_task12_reader",
+                "WAZUH_SMOKE_PASSWORD": reader_password}
+    for name in ("DATABASE_URL_FILE", "OIDC_STATE_SECRET_FILE", "OIDC_CLIENT_SECRET_FILE",
+                 "EXTERNAL_SECRET_KEY_FILE"):
+        test_env.pop(name, None)
+    test_env["ENVIRONMENT"] = "test"
+    command([sys.executable, "scripts/run_tests.py", "--temporary", "--pytest",
+             "tests/test_auth_foundation.py::test_external_live_wazuh_smoke"],
+            env=test_env, cwd=ROOT / "backend", timeout=600)
+
+    kafka_options = {
+        "bootstrap.servers": env["KAFKA_TEST_BOOTSTRAP_SERVERS"],
+        "security.protocol": env["KAFKA_TEST_SECURITY_PROTOCOL"],
+        "sasl.mechanisms": "SCRAM-SHA-512", "sasl.username": "diploma-kafka-admin",
+        "sasl.password": Path(env["KAFKA_TEST_ADMIN_PASSWORD_FILE"]).read_text(encoding="utf-8").strip(),
+        "ssl.ca.location": env["KAFKA_TEST_CA_FILE"],
+    }
+    topics_before = set(AdminClient(kafka_options).list_topics(timeout=15).topics)
+
+    password = secrets.token_urlsafe(24)
+    create = (
+        "import os,app.cli as cli; "
+        "cli.getpass.getpass=lambda prompt: os.environ['TASK29_ADMIN_PASSWORD']; "
+        "raise SystemExit(cli.create_admin('task29admin','Task 29 admin'))"
+    )
+    command([*compose, "exec", "-T", "-e", f"TASK29_ADMIN_PASSWORD={password}",
+             "api", "python", "-c", create], env=env)
+    base = f"https://localhost:{env['HTTPS_BIND'].split(':')[1]}/api/v1"
+    context = ssl.create_default_context(cafile=env["KAFKA_CA_FILE"])
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+    )
+
+    def request(path: str, method: str = "GET", body: dict | bytes | None = None,
+                csrf: str | None = None, content_type: str = "application/json"):
+        payload = json.dumps(body).encode() if isinstance(body, dict) else body
+        headers = {"Content-Type": content_type}
+        if csrf:
+            headers["X-CSRF-Token"] = csrf
+        with opener.open(urllib.request.Request(base + path, data=payload,
+                                                headers=headers, method=method),
+                         timeout=30) as response:
+            content = response.read(5_242_881)
+            if len(content) > 5_242_880:
+                raise RuntimeError("External acceptance response exceeded the size limit")
+            return json.loads(content) if content else None
+
+    login = request("/auth/local/login", "POST", {"username": "task29admin", "password": password})
+    csrf = login["csrf_token"]
+    from sqlalchemy import create_engine
+    from sqlalchemy import text as sql_text
+    engine = create_engine(env["TEST_DATABASE_URL"])
+    try:
+        with engine.connect() as connection:
+            before = connection.execute(sql_text("SELECT count(*) FROM logs.parsed_logs")).scalar_one()
+        created = request("/external-connections", "POST", {
+            "name": "Task 29 Wazuh indexer", "base_url": "https://indexer:9200",
+            "username": "diploma_task12_reader", "password": reader_password,
+        }, csrf)
+        connection_id = created["id"]
+        request(f"/external-connections/{connection_id}/ca", "PUT",
+                Path(env["WAZUH_SMOKE_CA"]).read_bytes(), csrf,
+                "application/x-pem-file")
+        checked = request(f"/external-connections/{connection_id}/test", "POST", csrf=csrf)
+        if checked["status"] != "ok":
+            raise RuntimeError("API did not confirm the external indexer")
+        streams = request(f"/external-connections/{connection_id}/data-streams?limit=100")
+        if "wazuh-findings-v5-security" not in streams["items"]:
+            raise RuntimeError("API did not discover the Wazuh-shaped data stream")
+        source = request("/external-sources", "POST", {
+            "name": "Task 29 Wazuh findings", "external_connection_id": connection_id,
+            "target_type": "data_stream", "data_stream_name": "wazuh-findings-v5-security",
+        }, csrf)
+        enabled = request(f"/external-sources/{source['id']}/enable", "POST", csrf=csrf)
+        if not enabled["is_enabled"]:
+            raise RuntimeError("External source was not enabled")
+        search = request(f"/events/sources/{source['id']}/search", "POST", {
+            "timestamp_from": "2026-06-15T12:00:00Z",
+            "timestamp_to": "2026-06-15T12:04:00Z", "sort": "asc", "limit": 10,
+            "filters": [{"field": "wazuh.agent.name", "operator": "eq", "value": "agent-0"}],
+        }, csrf)
+        if not search["items"]:
+            raise RuntimeError("Production API did not return filtered Wazuh-shaped documents")
+        with engine.connect() as connection:
+            after = connection.execute(sql_text("SELECT count(*) FROM logs.parsed_logs")).scalar_one()
+        if after != before:
+            raise RuntimeError("External documents were copied into parsed_logs")
+    finally:
+        engine.dispose()
+    # A small local fixture in the same production UI verifies source switching.
+    # The full Fluent Bit -> Kafka -> PostgreSQL route is exercised by end-to-end.
+    engine = create_engine(env["TEST_DATABASE_URL"])
+    try:
+        with engine.begin() as connection:
+            local_connection = connection.execute(sql_text(
+                "INSERT INTO app.kafka_connections (name, bootstrap_servers) "
+                "VALUES ('Task 29 local fixture', ARRAY['kafka:9092']) RETURNING id"
+            )).scalar_one()
+            local_normalizer = connection.execute(sql_text(
+                "INSERT INTO app.normalizers (name, rule) "
+                "VALUES ('Task 29 fixture normalizer', '{}'::jsonb) RETURNING id"
+            )).scalar_one()
+            local_source = connection.execute(sql_text(
+                "INSERT INTO app.sources (name, connection_id, normalizer_id, topic_name) "
+                "VALUES ('Task 29 local event', :connection_id, :normalizer_id, 'task29-local-fixture') "
+                "RETURNING id"
+            ), {"connection_id": local_connection, "normalizer_id": local_normalizer}).scalar_one()
+            timestamp = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+            connection.execute(sql_text(
+                "INSERT INTO logs.parsed_logs "
+                "(source_id, connection_id, normalizer_id, normalizer_version, normalizer_name, "
+                "source_name, connection_name, kafka_topic, kafka_partition, kafka_offset, "
+                "deduplication_key, fluent_bit_collected_at, backend_received_at, "
+                "backend_processed_at, raw, ecs_data) VALUES "
+                "(:source_id, :connection_id, :normalizer_id, 1, "
+                "'Task 29 fixture normalizer', 'Task 29 local event', 'Task 29 local fixture', "
+                "'task29-local-fixture', 0, 0, :dedup, :timestamp, :timestamp, :timestamp, "
+                "'task29 local smoke event', CAST(:ecs AS jsonb))"
+            ), {"source_id": local_source, "connection_id": local_connection,
+                "normalizer_id": local_normalizer, "dedup": str(uuid4()),
+                "timestamp": timestamp,
+                "ecs": json.dumps({"@timestamp": timestamp.isoformat(),
+                                   "message": "task29 local smoke event",
+                                   "event": {"kind": "event"}})})
+    finally:
+        engine.dispose()
+    local_search = request(f"/events/sources/{local_source}/search", "POST", {
+        "timestamp_from": "2026-06-15T11:59:00Z",
+        "timestamp_to": "2026-06-15T12:05:00Z",
+        "sort": "desc", "limit": 10,
+        "filters": [{"field": "message", "operator": "contains", "value": "local smoke"}],
+    }, csrf)
+    if not local_search["items"]:
+        raise RuntimeError("Local fixture was not searchable through production API")
+    proxy_container = command([*compose, "ps", "-q", "proxy"], env=env, capture=True).strip()
+    if not proxy_container:
+        raise RuntimeError("Production proxy is unavailable for the external UI smoke")
+    browser_context = run / "external-browser"
+    browser_context.mkdir()
+    for name in ("package.json", "package-lock.json", "playwright.config.ts"):
+        (browser_context / name).write_bytes((ROOT / "frontend" / name).read_bytes())
+    browser_dir = browser_context / "browser"
+    browser_dir.mkdir()
+    (browser_dir / "external.live.spec.ts").write_bytes(
+        (ROOT / "frontend" / "browser" / "external.live.spec.ts").read_bytes())
+    results = run / "external-browser-results"
+    results.mkdir()
+    browser_container = f"{project}-external-browser"
+    browser_command = [
+        "docker", "run", "--rm", "--name", browser_container,
+        "--user", "0:0", "--memory", "2g", "--cpus", "2",
+        "--network", f"container:{proxy_container}",
+        "--label", f"task29.project={project}",
+        "-v", f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/test-ca.pem:ro",
+        "-v", f"{Path(env['WAZUH_SMOKE_CA']).resolve()}:/tmp/indexer-ca.pem:ro",
+        "-v", f"{results.resolve()}:/results",
+        "-v", f"{browser_context.resolve()}:/test",
+        "-w", "/test", "-e", f"TASK29_ADMIN_PASSWORD={password}",
+        "-e", f"TASK29_READER_PASSWORD={reader_password}",
+        "-e", "PLAYWRIGHT_BASE_URL=https://localhost",
+        "mcr.microsoft.com/playwright:v1.63.0-noble", "sh", "-c",
+        (
+            "set -e; apt-get update >/dev/null; "
+            "apt-get install -y --no-install-recommends libnss3-tools >/dev/null; "
+            "npm ci --ignore-scripts --no-audit --no-fund; "
+            "mkdir -p /usr/local/share/ca-certificates /root/.pki/nssdb; "
+            "cp /tmp/test-ca.pem /usr/local/share/ca-certificates/task29-smoke.crt; "
+            "update-ca-certificates >/dev/null; "
+            "certutil -d sql:/root/.pki/nssdb -N --empty-password; "
+            "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n task29-smoke -i /tmp/test-ca.pem; "
+            "npx playwright test browser/external.live.spec.ts --output /results"
+        ),
+    ]
+    try:
+        command(browser_command, env=env, timeout=600)
+    finally:
+        subprocess.run(["docker", "rm", "-f", browser_container], env=env,
+                       cwd=ROOT, check=False, capture_output=True, timeout=30)
+    topics_after = set(AdminClient(kafka_options).list_topics(timeout=15).topics)
+    if topics_after != topics_before:
+        raise RuntimeError("External path changed Kafka topics")
+    print("Production HTTPS API read filtered Wazuh-shaped documents without PostgreSQL copies", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("profile", choices=["frontend", "backend-db", "kafka-integration", "end-to-end", "smoke-development", "smoke-production"])
+    parser.add_argument("profile", choices=["frontend", "backend-db", "kafka-integration", "end-to-end", "smoke-development", "smoke-production", "external-end-to-end"])
     parser.add_argument("--pytest", nargs="*", help="Specific backend test nodes for a focused retry")
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
     args = parser.parse_args()
@@ -1337,6 +1610,9 @@ def main() -> None:
                         env=env,
                         cwd=ROOT / "frontend",
                     )
+                elif check == "test":
+                    command([NPM, "run", "test", "--", "--maxWorkers=1"],
+                            env=env, cwd=ROOT / "frontend")
                 else:
                     command([NPM, "run", check], env=env, cwd=ROOT / "frontend")
             artifacts_after = frontend_artifact_snapshot()
@@ -1354,6 +1630,8 @@ def main() -> None:
         before = inventory(env)
         (run / "docker-before.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
         env, compose, project = prepare(run, args.profile)
+        if args.profile == "external-end-to-end":
+            compose += ["-f", str(wazuh_compose_overlay(run, env))]
         print(f"Profile={args.profile}; project={project}; run={run}", flush=True)
         print(f"Addresses: PostgreSQL={env['POSTGRES_BIND']}, Kafka={env['KAFKA_TEST_BOOTSTRAP_SERVERS']}, proxy={env.get('HTTPS_BIND', env['PROXY_BIND'])}", flush=True)
         print("Secret variables: POSTGRES_PASSWORD_FILE, KAFKA_ADMIN_PASSWORD_FILE, KAFKA_READER_PASSWORD_FILE, AGENT_CREDENTIALS_KEY_FILE", flush=True)
@@ -1362,7 +1640,7 @@ def main() -> None:
             print("Resolved Compose config passed isolated-resource checks", flush=True)
             successful = True
             return
-        if args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end"}:
+        if args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             builder = project + "_builder"
             command(["docker", "buildx", "create", "--name", builder, "--driver", "docker-container",
                      "--driver-opt", "network=host", "--bootstrap"], env=env)
@@ -1382,9 +1660,11 @@ def main() -> None:
                 command([sys.executable, "-m", "pytest", "-q", *args.pytest], env=env, cwd=ROOT / "backend")
             else:
                 command([sys.executable, "scripts/run_tests.py", "--temporary"], env=env, cwd=ROOT / "backend")
-        elif args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
-            production = args.profile == "smoke-production"
+        elif args.profile in {"smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
+            production = args.profile in {"smoke-production", "external-end-to-end"}
             services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "proxy"]
+            if args.profile == "external-end-to-end":
+                services.append("indexer")
             if args.profile in {"smoke-development", "smoke-production"}:
                 services.append("oidc-idp")
             if not production:
@@ -1454,42 +1734,60 @@ def main() -> None:
                 smoke_http(env, True)
             if args.profile == "end-to-end":
                 end_to_end(compose, project, env, run)
+            if args.profile == "external-end-to-end":
+                external_end_to_end(compose, project, env, run)
             if args.profile == "smoke-production":
                 tls_agent_smoke(compose, project, env, run)
         successful = True
     finally:
-        if compose and project and not args.check_only:
-            if not successful and args.profile in {"backend-db", "kafka-integration", "smoke-development", "smoke-production", "end-to-end"}:
-                logs = subprocess.run([*compose, "logs", "--no-color", "--tail=100", "postgres", "kafka", "api", "proxy"], cwd=ROOT, env=env, check=False, text=True, capture_output=True)
-                selected = [line for line in logs.stdout.splitlines() if any(
-                    token in line for token in ("ERROR", "Exception", "Caused by", "SSL", "TLS", "certificate", "unhealthy")
-                )]
-                print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
-            command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
-            for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
-                image = f"{project}-{service}"
-                matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
-                if image in matches:
-                    command(["docker", "image", "rm", image], env=env)
-            if builder:
-                command(["docker", "buildx", "rm", "--force", builder], env=env)
-                env.pop("BUILDX_BUILDER", None)
-            remove_new_images(before, env, project)
-            after = inventory(env)
-            (run / "docker-after.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
-            residual = command(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.ID}}"], env=env, capture=True).strip()
-            volumes = command(["docker", "volume", "ls", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Name}}"], env=env, capture=True).strip()
-            networks = command(["docker", "network", "ls", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Name}}"], env=env, capture=True).strip()
-            if residual or volumes or networks:
-                raise RuntimeError(f"Temporary Docker resources remain for {project}; run directory: {run}")
-            compare_inventory(before, after, project)
+        cleanup_error = None
+        if before is not None:
+            try:
+                if compose and project and not args.check_only:
+                    if not successful and args.profile in {"backend-db", "kafka-integration", "smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
+                        logs = subprocess.run([*compose, "logs", "--no-color", "--tail=100", "postgres", "kafka", "api", "proxy"], cwd=ROOT, env=env, check=False, text=True, capture_output=True)
+                        selected = [line for line in logs.stdout.splitlines() if any(
+                            token in line for token in ("ERROR", "Exception", "Caused by", "SSL", "TLS", "certificate", "unhealthy")
+                        )]
+                        print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
+                    command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
+                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
+                        image = f"{project}-{service}"
+                        matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
+                        if image in matches:
+                            command(["docker", "image", "rm", image], env=env)
+                if builder:
+                    command(["docker", "buildx", "rm", "--force", builder], env=env)
+                    env.pop("BUILDX_BUILDER", None)
+                remove_new_images(before, env, project or "", args.profile)
+                after = inventory(env)
+                (run / "docker-after.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
+                if project:
+                    residual = command(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.ID}}"], env=env, capture=True).strip()
+                    volumes = command(["docker", "volume", "ls", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Name}}"], env=env, capture=True).strip()
+                    networks = command(["docker", "network", "ls", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Name}}"], env=env, capture=True).strip()
+                    if residual or volumes or networks:
+                        raise RuntimeError(f"Temporary Docker resources remain for {project}: containers={residual!r}, volumes={volumes!r}, networks={networks!r}")
+                compare_inventory(before, after, project or "unassigned project")
+            except Exception as exc:
+                cleanup_error = exc
         run_root = (ROOT / ".harness" / "runs").resolve()
         target = run.resolve()
-        if target != run_root and target.is_relative_to(run_root):
-            import shutil
-            shutil.rmtree(target)
-        else:
+        if target == run_root or not target.is_relative_to(run_root):
             raise RuntimeError(f"Unexpected run cleanup path: {target}")
+        if cleanup_error is not None:
+            try:
+                current = inventory(env)
+                remaining = {kind: sorted(set(current[kind]) - set(before[kind]))
+                             for kind in before if set(current[kind]) - set(before[kind])}
+            except Exception as exc:
+                remaining = {"inventory_error": str(exc)}
+            raise RuntimeError(
+                f"Docker cleanup failed for {project or 'unassigned project'}: "
+                f"{cleanup_error}; remaining={remaining}; run directory={run}"
+            ) from cleanup_error
+        import shutil
+        shutil.rmtree(target)
 
 
 if __name__ == "__main__":

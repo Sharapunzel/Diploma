@@ -1,14 +1,16 @@
 import base64
 import getpass
 import json
+import os
 import ssl
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
-CERTS = ROOT / "runtime" / "certs"
-BASE_URL = "https://localhost:19200"
+RUNTIME = Path(os.environ.get("WAZUH_TEST_RUNTIME", ROOT / "runtime"))
+CERTS = RUNTIME / "certs"
+BASE_URL = os.environ.get("WAZUH_TEST_BASE_URL", "https://localhost:19200")
 
 
 def call(method, path, username, password, payload=None, content_type="application/json"):
@@ -130,7 +132,9 @@ def seed_stream(stream, count, group, username, password):
 
 
 def main():
-    admin_password = getpass.getpass("Wazuh Indexer admin password: ")
+    password_file = os.environ.get("WAZUH_TEST_ADMIN_PASSWORD_FILE")
+    admin_password = (Path(password_file).read_text(encoding="utf-8").strip()
+                      if password_file else getpass.getpass("Wazuh Indexer admin password: "))
     common_mapping = {
         "properties": {
             "@timestamp": {"type": "date"},

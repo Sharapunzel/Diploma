@@ -1,14 +1,8 @@
-## FastAPI и аутентификация
+# FastAPI и аутентификация
 
-Скопируйте `.env.example` в `.env` и задайте значения окружения без добавления `.env`
-в Git. Миграции запускаются вручную и не выполняются при старте API:
+Эта инструкция нужна администратору при первом входе, настройке OIDC и проверке сессии и CSRF.
 
-```powershell
-python -m pip install -e ".[test]"
-$env:DATABASE_URL = "postgresql+psycopg://diploma_user:diploma_password@localhost:5432/diploma_db"
-python -m alembic upgrade head
-python -m uvicorn app.main:app --reload
-```
+При запуске через Compose используйте [development или production маршрут](deployment.md): сервис `migrate` выполняет миграции перед API. При прямом запуске backend из `backend/` нужны установленные зависимости, отдельный `DATABASE_URL` целевой БД и ручной `python -m alembic upgrade head`; миграции не выполняются при старте API. Не копируйте примерный пароль в реальную установку и не запускайте тесты на `diploma_db`.
 
 Проверки доступны по `/api/v1/health/live` и `/api/v1/health/ready`. Фабрика
 приложения создаёт engine из `DATABASE_URL` конкретного экземпляра; миграции при
@@ -19,19 +13,7 @@ python -m uvicorn app.main:app --reload
 python -m app.cli create-admin --username admin --display-name "Administrator"
 ```
 
-Локальный и OIDC-вход можно включать одновременно:
-
-```dotenv
-LOCAL_AUTH_ENABLED=true
-OIDC_ENABLED=true
-OIDC_ISSUER_URL=https://identity.example.test
-OIDC_CLIENT_ID=diploma
-OIDC_CLIENT_SECRET=replace-me
-OIDC_REDIRECT_URI=https://events.example.org/api/v1/auth/oidc/callback
-OIDC_SCOPES=openid,profile,email
-OIDC_SUCCESS_REDIRECT_URL=/
-OIDC_ERROR_REDIRECT_URL=/login?error=oidc
-```
+Локальный и OIDC-вход можно включать одновременно. Для env-конфигурации задайте `LOCAL_AUTH_ENABLED=true`, `OIDC_ENABLED=true`, `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI` и `OIDC_SCOPES` с обязательным `openid`. Допустимые относительные перенаправления: `OIDC_SUCCESS_REDIRECT_URL=/` и `OIDC_ERROR_REDIRECT_URL=/login?error=oidc`. Возьмите адреса, ID и секрет из своего IdP; секрет храните в защищённом файле и зарегистрируйте точный callback у провайдера.
 
 `OIDC_REDIRECT_URI` нужно без изменений зарегистрировать у провайдера идентификации. В production
 используйте публичный HTTPS-адрес; URL успешного и ошибочного перенаправления остаются на нём. OIDC
@@ -68,8 +50,8 @@ scope `openid`; URL перенаправления берутся только �
    версию. Для повторного включения после отключения повторите эти шаги.
    `OIDC_ENABLED=true` для управления через интерфейс не требуется.
 
-Текущий отдельный тестовый Keycloak опубликован на всех интерфейсах хоста
-(`0.0.0.0:8081`, возможно также `[::]:8081`). Используйте его только в
+Если отдельный тестовый Keycloak опубликован на всех интерфейсах хоста
+(`0.0.0.0:8081`, возможно также `[::]:8081`), используйте его только в
 доверенной локальной сети. Для ограничения доступа можно привязать порт к
 loopback хоста, **проверив после этого доступность из API по
 `host.docker.internal`**, либо перейти на TLS с доверенным CA. Изменение
@@ -79,7 +61,7 @@ loopback хоста, **проверив после этого доступнос
 обновите состояние. Не заменяйте ключ случайным новым значением.
 
 Администратор открывает «Администрирование» → «Способы входа». Локальный вход остаётся резервным.
-Отдельного маршрута `/settings` больше нет; API `app-settings` сохраняется для следующей задачи.
+Отдельного маршрута `/settings` нет; административные настройки входа находятся в этом разделе.
 Для одного OIDC-провайдера задаются issuer, client ID, точный callback URL и scopes. Client secret
 вводится только при установке или замене; после сохранения показывается лишь признак его наличия.
 Пустое поле оставляет сохранённый секрет. Публичный корпоративный CA можно загрузить в PEM для

@@ -60,6 +60,7 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--shared", action="store_true", help="reset and reuse diploma_test")
     mode.add_argument("--temporary", action="store_true", help="create a unique disposable DB")
+    parser.add_argument("--pytest", nargs="+", help="Pytest nodes for a focused isolated run")
     args = parser.parse_args()
 
     base_url, admin_url = database_urls()
@@ -75,7 +76,7 @@ def main() -> int:
     exit_code = 1
     restore_ok = True
     try:
-        exit_code = command(["pytest", "-q"], environment)
+        exit_code = command(["pytest", "-q", *(args.pytest or [])], environment)
     finally:
         with psycopg.connect(admin_url, autocommit=True) as connection:
             if args.temporary:

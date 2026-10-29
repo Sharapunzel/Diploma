@@ -1,13 +1,15 @@
 import base64
 import json
+import os
 import ssl
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
-CERTS = ROOT / "runtime" / "certs"
-BASE_URL = "https://127.0.0.1:19200"
+RUNTIME = Path(os.environ.get("WAZUH_TEST_RUNTIME", ROOT / "runtime"))
+CERTS = RUNTIME / "certs"
+BASE_URL = os.environ.get("WAZUH_TEST_BASE_URL", "https://127.0.0.1:19200")
 USERNAME = "diploma_task12_reader"
 
 
@@ -30,7 +32,7 @@ def call(method, path, password, payload=None):
 
 
 def main():
-    password = (ROOT / "runtime" / "reader-password.txt").read_text(encoding="utf-8")
+    password = (RUNTIME / "reader-password.txt").read_text(encoding="utf-8")
     version = call("GET", "/", password)
     assert version[0] == 200
     indices = call("GET", "/_cat/indices?format=json&h=index&expand_wildcards=open", password)

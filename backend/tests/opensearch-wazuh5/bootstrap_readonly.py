@@ -1,17 +1,19 @@
 import base64
 import getpass
 import json
+import os
 import secrets
 import ssl
 import time
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
-CERTS = ROOT / "runtime" / "certs"
-PASSWORD_FILE = ROOT / "runtime" / "reader-password.txt"
-BASE_URL = "https://localhost:19200"
+RUNTIME = Path(os.environ.get("WAZUH_TEST_RUNTIME", ROOT / "runtime"))
+CERTS = RUNTIME / "certs"
+PASSWORD_FILE = RUNTIME / "reader-password.txt"
+BASE_URL = os.environ.get("WAZUH_TEST_BASE_URL", "https://localhost:19200")
 USERNAME = "diploma_task12_reader"
 ROLE = "diploma_task12_readonly"
 
@@ -34,12 +36,16 @@ def call(method, path, username, password, payload=None):
 
 
 def main():
-    admin_password = getpass.getpass("Wazuh Indexer admin password: ")
+    password_file = os.environ.get("WAZUH_TEST_ADMIN_PASSWORD_FILE")
+    admin_password = (Path(password_file).read_text(encoding="utf-8").strip()
+                      if password_file else getpass.getpass("Wazuh Indexer admin password: "))
     deadline = time.monotonic() + 180
     while True:
         try:
             call("GET", "/", "admin", admin_password)
             break
+        except HTTPError as exc:
+            raise SystemExit(f"Indexer authentication failed: HTTP {exc.code}") from exc
         except (URLError, TimeoutError):
             if time.monotonic() >= deadline:
                 raise SystemExit("Indexer did not become ready within 180 seconds")

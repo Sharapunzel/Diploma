@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
+import os
 from pathlib import Path
 
 from cryptography import x509
@@ -8,8 +9,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / "runtime" / "certs"
-AUTHORITY = ROOT / "runtime" / "authority"
+RUNTIME = Path(os.environ.get("WAZUH_TEST_RUNTIME", ROOT / "runtime"))
+OUTPUT = RUNTIME / "certs"
+AUTHORITY = RUNTIME / "authority"
 SUBJECT_TAIL = [
     x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Wazuh"),
     x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Wazuh"),
@@ -79,7 +81,8 @@ def main():
     issue_leaf(
         ca_cert, ca_key, "node-1", "indexer",
         [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
-        [x509.DNSName("localhost"), x509.IPAddress(ip_address("127.0.0.1"))],
+        [x509.DNSName("localhost"), x509.DNSName("indexer"),
+         x509.IPAddress(ip_address("127.0.0.1"))],
     )
     for stale_file in OUTPUT.glob("admin*"):
         stale_file.unlink()

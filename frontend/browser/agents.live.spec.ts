@@ -8,8 +8,10 @@ const password = process.env.TASK21_ADMIN_PASSWORD;
 const topic = process.env.TASK21_TOPIC;
 test.skip(!run || !password || !topic, "requires the isolated TASK-21 profile");
 test.setTimeout(120_000);
-const setupTest = process.env.TASK21_PHASE === "verify" ? test.skip : test;
+const setupTest = process.env.TASK21_PHASE === "setup" ? test : test.skip;
 const verifyTest = process.env.TASK21_PHASE === "verify" ? test : test.skip;
+const configureTest =
+  process.env.TASK21_PHASE === "configure" ? test : test.skip;
 
 setupTest(
   "registers an agent and explicitly claims its one-time configuration",
@@ -21,32 +23,45 @@ setupTest(
       data: { username: "task21admin", password },
     });
     expect(login.ok()).toBeTruthy();
-    const csrf = (await login.json()).csrf_token as string;
-    const connection = await page.request.post("/api/v1/kafka-connections", {
-      headers: { "X-CSRF-Token": csrf },
-      data: {
-        name: "Task 21 Kafka",
-        bootstrap_servers: ["kafka:9092"],
-      },
+    await page.goto("/connections");
+    await page.getByRole("button", { name: "Добавить подключение" }).click();
+    const connectionForm = page.getByRole("dialog", {
+      name: "Новое подключение",
     });
-    expect(connection.status()).toBe(201);
-    const connectionId = (await connection.json()).id as string;
+    await connectionForm.getByLabel("Имя").fill("Task 21 Kafka");
+    await connectionForm
+      .getByLabel("Адреса брокеров, по одному на строку")
+      .fill("kafka:9092");
+    await connectionForm.getByRole("button", { name: "Сохранить" }).click();
+    await expect(connectionForm).toBeHidden();
+    const connectionRow = page.getByRole("row").filter({
+      hasText: "Task 21 Kafka",
+    });
+    await expect(connectionRow).toBeVisible();
+    await connectionRow.getByRole("button", { name: "Проверить" }).click();
+    await expect(page.getByText(/проверка успешна/)).toBeVisible();
+    const connections = await page.request.get("/api/v1/kafka-connections");
+    expect(connections.ok()).toBeTruthy();
+    const connectionId = (await connections.json()).items.find(
+      (item: { name: string }) => item.name === "Task 21 Kafka",
+    ).id as string;
     await page.goto("/agents");
     await page.getByRole("button", { name: "Зарегистрировать агента" }).click();
     const form = page.getByRole("dialog");
     await form.getByLabel("Название").fill("Task 21 agent");
-    await form.getByLabel("Подключение Kafka").click();
-    await page
-      .locator(".ant-select-dropdown:visible .ant-select-item-option-content")
-      .getByText("Task 21 Kafka", { exact: true })
-      .click();
+    const chooseConnection = async (index: number) => {
+      const select = form.getByLabel("Подключение Kafka").nth(index);
+      await select
+        .locator("xpath=ancestor::div[contains(@class,'ant-select-selector')]")
+        .click();
+      await select.press("ArrowDown");
+      await select.press("Enter");
+      await expect(form.getByTitle("Task 21 Kafka").nth(index)).toBeVisible();
+    };
+    await chooseConnection(0);
     await form.getByLabel("Имя нового топика").fill(topic!);
     await form.getByRole("button", { name: "Ещё топик" }).click();
-    await form.getByLabel("Подключение Kafka").nth(1).click();
-    await page
-      .locator(".ant-select-dropdown:visible .ant-select-item-option-content")
-      .getByText("Task 21 Kafka", { exact: true })
-      .click();
+    await chooseConnection(1);
     await form.getByLabel("Имя нового топика").nth(1).fill(`${topic}-other`);
     await form.getByRole("button", { name: "Отправить" }).click();
     try {
@@ -159,6 +174,70 @@ setupTest(
   },
 );
 
+configureTest(
+  "previews a normalizer and enables the agent source through the UI",
+  async ({ page }) => {
+    const agent = JSON.parse(readFileSync(join(run!, "agent.json"), "utf8"));
+    const login = await page.request.post("/api/v1/auth/local/login", {
+      data: { username: "task21admin", password },
+    });
+    expect(login.ok()).toBeTruthy();
+    const rule = {
+      format_version: 1,
+      variants: [
+        {
+          key: "plain",
+          priority: 1,
+          when: { kind: "contains", value: "task21" },
+          blocks: [
+            {
+              key: "message",
+              kind: "map_ecs",
+              target: "message",
+              source: { ref: "log" },
+              required: true,
+            },
+          ],
+        },
+      ],
+    };
+    await page.goto("/normalizers/new");
+    await page.getByRole("textbox", { name: "Имя" }).fill("Task 21 normalizer");
+    await page.getByRole("button", { name: "JSON", exact: true }).click();
+    await page
+      .getByRole("textbox", { name: "Полный JSON RuleV1" })
+      .fill(JSON.stringify(rule));
+    await page
+      .getByRole("textbox", { name: "log — одна сырая строка" })
+      .fill("task21 smoke event");
+    await page.getByRole("button", { name: "Проверить черновик" }).click();
+    await expect(page.getByText("task21 smoke event").last()).toBeVisible();
+    await page.getByRole("button", { name: "Создать", exact: true }).click();
+    await expect(page).toHaveURL(/\/normalizers\/[0-9a-f-]+\/edit$/);
+    agent.normalizerId = new URL(page.url()).pathname.split("/").at(-2);
+    writeFileSync(join(run!, "agent.json"), JSON.stringify(agent), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+
+    await page.goto("/sources");
+    const row = page.locator(`tr[data-row-key="${agent.sourceId}"]`);
+    await expect(row).toContainText("Выключен");
+    await row.getByRole("button", { name: "Нормализатор" }).click();
+    const dialog = page.getByRole("dialog", { name: "Назначить нормализатор" });
+    await dialog.locator(".ant-select-selector").click();
+    await page
+      .locator(".ant-select-dropdown:visible")
+      .getByText(/Task 21 normalizer/)
+      .click();
+    await dialog.getByRole("button", { name: "Назначить" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(row).toContainText("Нормализатор: Task 21 normalizer");
+    await row.getByRole("button", { name: "Включить" }).click();
+    await expect(row).toContainText("Включён");
+  },
+);
+
 verifyTest("shows the stored event in the Events page", async ({ page }) => {
   const { sourceId } = JSON.parse(
     readFileSync(join(run!, "agent.json"), "utf8"),
@@ -201,12 +280,9 @@ verifyTest(
     expect((await topology.json()).agent_id).toBe(agentId);
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`/diagnostics?source=${sourceId}`);
-    await expect(
-      page.getByRole("heading", { name: "Диагностика конвейера" }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("list", { name: "Путь событий" }),
-    ).toContainText(topic);
+    const eventPath = page.getByRole("list", { name: /Путь событий/ });
+    await expect(eventPath).toBeVisible();
+    await expect(eventPath).toContainText(topic);
     const originalTheme = await page.locator("html").getAttribute("data-theme");
     for (const theme of ["light", "dark"] as const) {
       await page.locator("html").evaluate((element, value) => {

@@ -1,10 +1,18 @@
-# Жизненный цикл Fluent Bit-агентов (TASK-20)
+# Жизненный цикл Fluent Bit-агентов
+
+Эта инструкция нужна администратору при регистрации, выдаче конфигурации, перевыпуске и отзыве агента.
 
 В development и production управление агентами выполняется через существующий FastAPI. Kafka admin credentials доступны только отдельному закрытому Compose-сервису `provisioner`; у него нет опубликованных портов. API и consumers используют runtime reader без прав изменения топиков, SCRAM credentials и ACL. В production provisioner соединяется с Kafka по `SASL_SSL`, проверяя CA и имя узла.
 
 ## Секреты и запуск
 
-В development Compose использует `AGENT_CREDENTIALS_KEY_FILE`, по умолчанию `.dev/agent_credentials_key`. Создайте постоянный Fernet key командой `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` и сохраните его в этот файл с правами только для владельца. Не меняйте ключ, пока в БД есть невыданные credentials. Файл исключён из Git. В production задайте `AGENT_CREDENTIALS_KEY_FILE` на защищённый файл хоста, смонтированный как Docker secret только в API и provisioner.
+В development Compose использует `AGENT_CREDENTIALS_KEY_FILE`, по умолчанию `.dev/agent_credentials_key`. После установки Python-зависимостей backend выполните из корня репозитория в PowerShell или Linux shell:
+
+```shell
+python -c "from pathlib import Path; from cryptography.fernet import Fernet; import os; p=Path('.dev/agent_credentials_key'); p.parent.mkdir(exist_ok=True); fd=os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600); os.write(fd, Fernet.generate_key()); os.close(fd)"
+```
+
+Команда создаёт ключ один раз и не выводит его в терминал; если файл уже есть, она завершается ошибкой без замены. Проверьте, что файл доступен только владельцу. Не меняйте ключ, пока в БД есть невыданные credentials. Файл исключён из Git. В production задайте `AGENT_CREDENTIALS_KEY_FILE` на защищённый файл хоста, смонтированный как Docker secret только в API и provisioner.
 
 Provisioner получает `KAFKA_ADMIN_USERNAME`, `KAFKA_ADMIN_PASSWORD_FILE`, runtime reader и ключ шифрования. Перед запуском проверьте права на файлы секретов и доступность Kafka. У API не должно быть `KAFKA_ADMIN_PASSWORD_FILE` или секрета `kafka_admin_password`.
 
