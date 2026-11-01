@@ -12,7 +12,7 @@
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:browser": "playwright test",
+    "test:browser": "node scripts/run-browser-tests.mjs",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"browser/**/*.ts\" \"*.{ts,js,json,html}\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"browser/**/*.ts\" \"*.{ts,js,json,html}\""
   },
