@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
 from app.db import Database
@@ -179,14 +179,42 @@ def _payload(log: str = "ok accepted", timestamp: str | None = None) -> bytes:
     }, separators=(",", ":")).encode("utf-8")
 
 
-def _service(session, *, engine=None, repository=None, uow=None, clock=None):
+def _service(session, *, engine=None, repository=None, uow=None, clock=None, capture_guard=None):
     catalog = PackagedEcsCatalog.load()
     return DurableProcessingServiceImpl(
         repository or SqlAlchemyProcessingRepository(session),
         uow or SqlAlchemyUnitOfWork(session),
         engine or NormalizationEngine(catalog),
         clock=clock or (lambda: RECEIVED_AT - timedelta(seconds=1)),
+        capture_guard=capture_guard or _CaptureReady(),
     )
+
+
+class _CaptureReady:
+    def status(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(ready=True)
+
+
+class _CaptureLost:
+    def status(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(ready=False, reason="slot_or_progress_missing")
+
+
+def test_capture_loss_rolls_back_event_and_kafka_identity(processing_database, clean_processing_data):
+    connection_id, source_id, _ = _context(processing_database)
+    with processing_database.session_factory() as session, pytest.raises(
+        ProcessingStorageError, match="availability_capture_slot_or_progress_missing"
+    ):
+        _service(session, capture_guard=_CaptureLost()).process(
+            source_id, _coordinates(connection_id, 0, 998), _payload(), RECEIVED_AT,
+        )
+    with processing_database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(ParsedLog).where(
+            ParsedLog.source_id == source_id)) == 0
+        assert session.scalar(select(func.count()).select_from(ProcessedKafkaRecord).where(
+            ProcessedKafkaRecord.source_id == source_id)) == 0
 
 
 def _coordinates(connection_id, partition=0, offset=0, topic="events"):

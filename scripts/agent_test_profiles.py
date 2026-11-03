@@ -156,7 +156,7 @@ def inventory(env: dict[str, str]) -> dict:
 
 
 def remove_new_images(before: dict, env: dict[str, str], project: str,
-                      profile: str) -> None:
+                      profile: str, builder_images: set[str] | None = None) -> None:
     prior = set(before["images"])
     prior_ids = {entry.split(" ", 1)[0] for entry in prior}
     allowed = (f"{project}-", "fluent/fluent-bit:4.2.3", "moby/buildkit:buildx-stable-1",
@@ -172,13 +172,28 @@ def remove_new_images(before: dict, env: dict[str, str], project: str,
         image_id, tag = entry.split(" ", 1)
         if image_id in prior_ids:
             continue
-        if not tag.startswith(allowed):
+        if not tag.startswith(allowed) and image_id not in (builder_images or set()):
             raise RuntimeError(f"New image has unclear ownership: {tag}")
         attached = command(["docker", "ps", "-a", "--filter", f"ancestor={image_id}",
                             "--format", "{{.ID}}"], env=env, capture=True).strip()
         if attached:
             raise RuntimeError(f"New image is still attached to a container: {tag}")
         command(["docker", "image", "rm", image_id], env=env)
+
+
+def builder_image_ids(builder: str, env: dict[str, str]) -> set[str]:
+    """Identify the exact image used by this run's BuildKit container before removal."""
+    name = f"buildx_buildkit_{builder}0"
+    rows = command(["docker", "ps", "-a", "--filter", f"name=^/{name}$",
+                    "--format", "{{.ID}} {{.Names}}"], env=env, capture=True).splitlines()
+    result = set()
+    for row in rows:
+        container_id, actual_name = row.split(" ", 1)
+        if actual_name != name:
+            raise RuntimeError(f"Unexpected builder container: {actual_name}")
+        result.add(command(["docker", "inspect", "--type", "container", "--format", "{{.Image}}",
+                            container_id], env=env, capture=True).strip())
+    return result
 
 
 def compare_inventory(before: dict, after: dict, project: str) -> None:
@@ -364,11 +379,13 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
     db_port, kafka_port, proxy_port, https_port = (free_port() for _ in range(4))
     subnet = f"172.31.{100 + int(suffix[:2], 16) % 100}.0/24"
     db_password = secrets.token_urlsafe(24)
+    wal_password = secrets.token_urlsafe(24)
     files = {
         "POSTGRES_PASSWORD_FILE": secret_file(run, "postgres_password", db_password),
         "KAFKA_ADMIN_PASSWORD_FILE": secret_file(run, "kafka_admin_password", secrets.token_urlsafe(32)),
         "KAFKA_READER_PASSWORD_FILE": secret_file(run, "kafka_reader_password", secrets.token_urlsafe(32)),
         "AGENT_CREDENTIALS_KEY_FILE": secret_file(run, "agent_credentials_key", Fernet.generate_key().decode()),
+        "WAL_READER_PASSWORD_FILE": secret_file(run, "wal_reader_password", wal_password),
     }
     production = profile in {"smoke-production", "external-end-to-end"}
     if profile in {"smoke-development", "smoke-production"}:
@@ -380,12 +397,17 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
                 run, "database_url",
                 f"postgresql+psycopg://diploma_user:{db_password}@postgres:5432/diploma_test",
             ),
+            "WAL_DATABASE_URL_FILE": secret_file(
+                run, "wal_database_url",
+                f"postgresql+psycopg://diploma_wal_reader:{wal_password}@postgres:5432/diploma_test",
+            ),
             "OIDC_STATE_SECRET_FILE": secret_file(run, "oidc_state_secret", secrets.token_urlsafe(40)),
             "OIDC_CLIENT_SECRET_FILE": secret_file(run, "oidc_client_secret", secrets.token_urlsafe(40)),
             "EXTERNAL_SECRET_KEY_FILE": secret_file(run, "external_secret_key", Fernet.generate_key().decode()),
         })
     env = {**os.environ, **{name: str(path) for name, path in files.items()},
            "COMPOSE_PROJECT_NAME": project, "POSTGRES_PASSWORD": db_password,
+           "WAL_READER_PASSWORD": wal_password,
            "POSTGRES_DB": "diploma_test", "POSTGRES_BIND": f"127.0.0.1:{db_port}:5432",
            "KAFKA_BIND_ADDRESS": "127.0.0.1", "KAFKA_PUBLIC_HOST": "127.0.0.1",
            "KAFKA_HOST_PORT": str(kafka_port), "KAFKA_EXTERNAL_PORT": str(kafka_port),
@@ -445,6 +467,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
         for service, memory in {
             "postgres": "768m", "kafka": "2g", "kafka-acls": "512m",
             "migrate": "512m", "api": "1g", "provisioner": "768m",
+            "wal-bootstrap": "512m", "wal-decoder": "512m",
             "proxy": "256m", "frontend": "2g",
         }.items() if not production or service != "frontend"
     ), encoding="utf-8")
@@ -1751,15 +1774,16 @@ def main() -> None:
                         )]
                         print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
                     command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
-                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
+                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
                         image = f"{project}-{service}"
                         matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
                         if image in matches:
                             command(["docker", "image", "rm", image], env=env)
+                owned_builder_images = builder_image_ids(builder, env) if builder else set()
                 if builder:
                     command(["docker", "buildx", "rm", "--force", builder], env=env)
                     env.pop("BUILDX_BUILDER", None)
-                remove_new_images(before, env, project or "", args.profile)
+                remove_new_images(before, env, project or "", args.profile, owned_builder_images)
                 after = inventory(env)
                 (run / "docker-after.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
                 if project:

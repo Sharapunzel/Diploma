@@ -1,1 +1,2 @@
 frontend/scripts/start-dev.sh text eol=lf
+backend/app/resources/ecs/ecs_flat_v9.4.0.yml text eol=lf

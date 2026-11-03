@@ -5,11 +5,12 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from threading import Event, RLock, Thread
 from time import monotonic
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from ...adapters.replication_slot import PostgreSQLReplicationSlotAdapter
 from ...kafka import (
     KafkaAssignment,
     KafkaConnectionConfig,
@@ -25,18 +26,21 @@ from ...kafka import (
 from ...repositories.protocols.consumers import ConsumerSourceConfig
 from ...repositories.protocols.processing import KafkaCoordinates
 from ...repositories.sqlalchemy import SqlAlchemyUnitOfWork
+from ...repositories.sqlalchemy.capture import SqlAlchemyCaptureStateRepository
 from ...repositories.sqlalchemy.consumers import (
     RetentionGapConflict,
     SqlAlchemyConsumerStateRepository,
 )
 from ...repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from ..protocols.processing import DurableProcessingService
+from .consumer_evidence import ConsumerEvidenceService
 from .processing import (
     DurableProcessingServiceImpl,
     ProcessingConfigurationError,
     ProcessingStorageError,
     ProcessingSystemError,
 )
+from .wal_guard import CaptureGuard
 
 LOGGER = logging.getLogger("app.kafka_consumers")
 
@@ -99,6 +103,50 @@ class _SourceWorker:
         self.gap_retry_due: dict[int, float] = {}
         self.sparse_seek_pending: dict[int, int] = {}
         self.stopped_partitions: dict[int, str] = {}
+        self._next_checkpoint = 0.0
+        self._worker_instance = uuid4()
+
+    def _record_checkpoint(self) -> None:
+        """Persist actual broker positions for registered input probes, never caller claims."""
+        if (self.consumer is None or self.blocked or self.buffered or self.stopped_partitions
+                or self.gap_paused or not self.expected_offsets):
+            self._worker_instance = uuid4()
+            return
+        try:
+            if not self._repository(
+                lambda repository, session: ConsumerEvidenceService(
+                    repository, SqlAlchemyUnitOfWork(session),
+                ).has_active_probe(self.config.source_id)
+            ):
+                self._worker_instance = uuid4()
+                return
+            config = KafkaConnectionConfig(self.config.bootstrap_servers, self.config.security_protocol)
+            targeted = getattr(self.metadata_client, "metadata_for_topic", None)
+            metadata = (targeted(config, self.config.topic_name, self.metadata_timeout)
+                        if callable(targeted) else self.metadata_client.metadata(config, self.metadata_timeout))
+            topic = next((item for item in metadata.topics if item.name == self.config.topic_name), None)
+            if (topic is None or topic.identity != self.config.kafka_topic_identity
+                    or set(self.expected_offsets) != set(range(topic.partition_count))):
+                self._worker_instance = uuid4()
+                return
+            requested = tuple(KafkaPartition(self.config.topic_name, part, self.expected_offsets[part])
+                              for part in sorted(self.expected_offsets))
+            committed = self.consumer.committed(requested, self.metadata_timeout)
+            snapshots = {}
+            for item, position in zip(requested, committed, strict=True):
+                low, high = self.consumer.watermarks(item.topic, item.partition, self.metadata_timeout)
+                if position is None or position != item.offset or low < 0 or high < low:
+                    self._worker_instance = uuid4()
+                    return
+                snapshots[str(item.partition)] = {"low": low, "high": high, "committed": position}
+            with self.session_factory() as session:
+                ConsumerEvidenceService(SqlAlchemyConsumerStateRepository(session),
+                                        SqlAlchemyUnitOfWork(session)).record_checkpoint(
+                    self.config.source_id, self.config.kafka_topic_identity, snapshots, self._worker_instance,
+                )
+        except (KafkaConsumerError, KafkaMetadataError, SQLAlchemyError):
+            self._worker_instance = uuid4()
+            LOGGER.warning("source_checkpoint_unavailable", extra={"source_id": str(self.config.source_id)})
 
     @property
     def state(self) -> ConsumerWorkerState:
@@ -120,6 +168,22 @@ class _SourceWorker:
         with self._state_lock:
             self.expected_offsets[partition] = offset
 
+    def _record_processing_stop(self) -> None:
+        try:
+            with self.session_factory() as session:
+                ConsumerEvidenceService(SqlAlchemyConsumerStateRepository(session),
+                                        SqlAlchemyUnitOfWork(session)).mark_stopped(self.config.source_id)
+        except SQLAlchemyError:
+            LOGGER.warning("processing_stop_not_persisted", extra={"source_id": str(self.config.source_id)})
+
+    def _end_processing_stop(self) -> None:
+        try:
+            with self.session_factory() as session:
+                ConsumerEvidenceService(SqlAlchemyConsumerStateRepository(session),
+                                        SqlAlchemyUnitOfWork(session)).mark_resumed(self.config.source_id)
+        except SQLAlchemyError:
+            LOGGER.warning("processing_resume_not_persisted", extra={"source_id": str(self.config.source_id)})
+
     def _replace_expected_offsets(self, offsets: dict[int, int]) -> None:
         with self._state_lock:
             self.expected_offsets = offsets
@@ -129,6 +193,8 @@ class _SourceWorker:
             self.expected_offsets.clear()
 
     def _set_state(self, status: str, reason: str | None = None) -> None:
+        if status in {"retrying", "stopped"}:
+            self._worker_instance = uuid4()
         with self._state_lock:
             self._state = ConsumerWorkerState(status, reason)
         LOGGER.info(
@@ -388,6 +454,8 @@ class _SourceWorker:
                     self._set_state("stopped", "all_partitions_stopped")
                     self.stop_requested.set()
                 else:
+                    if not self.stopped_partitions:
+                        self._end_processing_stop()
                     self._set_state("waiting", "some_partitions_stopped" if self.stopped_partitions else None)
             return not retry_assignment
         except KafkaConsumerError as error:
@@ -395,8 +463,10 @@ class _SourceWorker:
             return False
 
     def _stop_partition(self, partition: int, reason: str) -> None:
+        self._worker_instance = uuid4()
         with self._state_lock:
             self.stopped_partitions[partition] = reason
+        self._record_processing_stop()
         LOGGER.error(
             "kafka_partition_stopped",
             extra={"source_id": str(self.config.source_id), "partition": partition, "reason": reason},
@@ -404,6 +474,7 @@ class _SourceWorker:
 
     def _block(self, message: KafkaMessage, action: str) -> None:
         assert self.consumer is not None
+        self._worker_instance = uuid4()
         partition = KafkaPartition(message.topic, message.partition, message.offset)
         self.blocked[message.partition] = (
             message,
@@ -580,6 +651,8 @@ class _SourceWorker:
                     SqlAlchemyProcessingRepository(session),
                     SqlAlchemyUnitOfWork(session),
                     self.engine,
+                    capture_guard=CaptureGuard(SqlAlchemyCaptureStateRepository(session),
+                                               PostgreSQLReplicationSlotAdapter(session)),
                 )
                 result = service.process(
                     self.config.source_id,
@@ -604,8 +677,11 @@ class _SourceWorker:
             self._set_state("stopped", "processing_configuration_invalid")
             self.stop_requested.set()
             return
-        except (ProcessingStorageError, ProcessingSystemError):
-            self._set_state("retrying", "processing_not_durable")
+        except (ProcessingStorageError, ProcessingSystemError) as error:
+            reason = str(error)
+            if not reason.startswith("availability_capture_"):
+                reason = "processing_not_durable"
+            self._set_state("retrying", reason)
             self._block(message, "process")
             return
         if not self._topic_is_safe():
@@ -681,11 +757,15 @@ class _SourceWorker:
                     self.stop_requested.wait(self.retry_delay)
                     continue
                 if event is None:
+                    if monotonic() >= self._next_checkpoint:
+                        self._next_checkpoint = monotonic() + 5
+                        self._record_checkpoint()
                     continue
                 if isinstance(event, KafkaAssignment):
                     pending_assignment = event
                     assignment_retry_at = monotonic()
                 elif isinstance(event, KafkaRevocation):
+                    self._worker_instance = uuid4()
                     self.blocked.clear()
                     self.buffered.clear()
                     self._clear_expected_offsets()
@@ -705,12 +785,14 @@ class _SourceWorker:
                     else:
                         self.buffered[event.partition][event.offset] = event
         except Exception:
+            self._record_processing_stop()
             LOGGER.exception(
                 "kafka_consumer_unexpected_failure",
                 extra={"source_id": str(self.config.source_id)},
             )
             self._set_state("stopped", "consumer_runtime_failure")
         finally:
+            self._record_processing_stop()
             if self.consumer is not None:
                 try:
                     self.consumer.close()

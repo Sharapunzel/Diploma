@@ -3,6 +3,7 @@ name: diploma
 services:
   postgres:
     image: postgres:18
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_slot_wal_keep_size=1GB"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-diploma_user}
@@ -94,7 +95,43 @@ services:
         condition: service_healthy
       kafka-acls:
         condition: service_completed_successfully
+      wal-decoder:
+        condition: service_healthy
     secrets: [kafka_reader_password, agent_credentials_key]
+    networks: [internal]
+
+  wal-bootstrap:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.wal_bootstrap"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-diploma_user}:${POSTGRES_PASSWORD:-diploma_password}@postgres:5432/${POSTGRES_DB:-diploma_db}
+      WAL_READER_PASSWORD_FILE: /run/secrets/wal_reader_password
+    secrets: [wal_reader_password]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  wal-decoder:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.wal_decoder"]
+    restart: unless-stopped
+    environment:
+      WAL_DATABASE_URL: postgresql+psycopg://diploma_wal_reader:${WAL_READER_PASSWORD:-diploma_wal_dev_password_2026}@postgres:5432/${POSTGRES_DB:-diploma_db}
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.wal_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    depends_on:
+      wal-bootstrap:
+        condition: service_completed_successfully
     networks: [internal]
 
   provisioner:
@@ -152,3 +189,5 @@ secrets:
     file: ${KAFKA_READER_PASSWORD_FILE:-./.dev/kafka_reader_password}
   agent_credentials_key:
     file: ${AGENT_CREDENTIALS_KEY_FILE:-./.dev/agent_credentials_key}
+  wal_reader_password:
+    file: ${WAL_READER_PASSWORD_FILE:-./.dev/wal_reader_password}

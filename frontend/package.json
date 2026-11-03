@@ -13,7 +13,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:browser": "node scripts/run-browser-tests.mjs",
-    "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"browser/**/*.ts\" \"*.{ts,js,json,html}\"",
+    "format:check": "prettier --check --end-of-line auto \"src/**/*.{ts,tsx,css}\" \"browser/**/*.ts\" \"*.{ts,js,json,html}\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"browser/**/*.ts\" \"*.{ts,js,json,html}\""
   },
   "dependencies": {

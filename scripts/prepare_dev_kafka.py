@@ -1,4 +1,4 @@
-"""Create disposable, local-only Kafka credentials for Docker development."""
+"""Create local-only Kafka and WAL reader credentials for Docker development."""
 
 import os
 import secrets
@@ -16,7 +16,15 @@ def main() -> None:
             continue
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             output.write(secrets.token_urlsafe(48) + "\n")
-    print("Local Kafka test credentials are ready in .dev")
+    wal_password = root / "wal_reader_password"
+    try:
+        descriptor = os.open(wal_password, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write("diploma_wal_dev_password_2026\n")
+    print("Local Kafka and WAL reader credentials are ready in .dev")
 
 
 if __name__ == "__main__":

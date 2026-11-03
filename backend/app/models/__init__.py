@@ -1,4 +1,5 @@
 from .app import (
+    AggregateSchedule,
     AppSetting,
     ExternalConnection,
     FluentBitAgent,
@@ -10,17 +11,34 @@ from .app import (
     Role,
     Source,
     User,
+    WorkingWindowPoint,
 )
 from .auth import AuthSession
-from .logs import KafkaOperationalEvent, ParsedLog, ProcessedKafkaRecord, ProcessingError
+from .logs import (
+    AvailabilityMarker,
+    InputAttestation,
+    InputProbe,
+    KafkaCheckpoint,
+    KafkaOperationalEvent,
+    ParsedLog,
+    ProcessedKafkaRecord,
+    ProcessingError,
+    ReplicationProgress,
+    SourceInterruption,
+)
 from .oidc_provider import OidcProvider
 
 __all__ = [
+    "AggregateSchedule",
     "AppSetting",
     "AuthSession",
+    "AvailabilityMarker",
     "ExternalConnection",
     "FluentBitAgent",
     "FluentBitAgentTopic",
+    "InputAttestation",
+    "InputProbe",
+    "KafkaCheckpoint",
     "KafkaConnection",
     "KafkaOperationalEvent",
     "KafkaProvisioningOperation",
@@ -30,7 +48,10 @@ __all__ = [
     "ParsedLog",
     "ProcessedKafkaRecord",
     "ProcessingError",
+    "ReplicationProgress",
     "Role",
     "Source",
+    "SourceInterruption",
     "User",
+    "WorkingWindowPoint",
 ]

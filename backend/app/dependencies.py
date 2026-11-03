@@ -1,6 +1,7 @@
 from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
+from .adapters.replication_slot import PostgreSQLReplicationSlotAdapter
 from .config import Settings, settings
 from .db import get_session
 from .ecs import EcsCatalog
@@ -22,6 +23,7 @@ from .repositories.sqlalchemy.administration import (
     SqlAlchemyNormalizerRepository,
     SqlAlchemySettingRepository,
 )
+from .repositories.sqlalchemy.capture import SqlAlchemyCaptureStateRepository
 from .repositories.sqlalchemy.connections import (
     SqlAlchemyKafkaConnectionRepository,
     SqlAlchemySourceRepository,
@@ -48,6 +50,7 @@ from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.opensearch_events import OpenSearchEventQueryProvider
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
 from .services.implementations.processing import DurableProcessingServiceImpl
+from .services.implementations.wal_guard import CaptureGuard
 from .services.protocols import AuthenticationService
 from .services.protocols.administration import (
     MappingAdministrationService,
@@ -239,7 +242,9 @@ def build_durable_processing_service(
     session: Session, engine: NormalizationEngine
 ) -> DurableProcessingService:
     return DurableProcessingServiceImpl(
-        SqlAlchemyProcessingRepository(session), SqlAlchemyUnitOfWork(session), engine
+        SqlAlchemyProcessingRepository(session), SqlAlchemyUnitOfWork(session), engine,
+        capture_guard=CaptureGuard(SqlAlchemyCaptureStateRepository(session),
+                                   PostgreSQLReplicationSlotAdapter(session)),
     )
 
 

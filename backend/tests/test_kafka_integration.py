@@ -19,6 +19,17 @@ from app.kafka import ConfluentKafkaMetadataClient, KafkaConnectionConfig, Kafka
 from app.kafka_security import KafkaSecurityProfile
 from app.main import create_app
 from app.models import KafkaOperationalEvent, ParsedLog, ProcessedKafkaRecord, Source
+from app.services.implementations.wal_guard import CaptureGuard, CaptureStatus
+
+
+@pytest.fixture(autouse=True)
+def stage1_kafka_capture_dependency(monkeypatch):
+    """Stage-1 broker tests isolate Kafka; TASK-30 checks WAL in its own gate."""
+    from datetime import UTC, datetime
+
+    monkeypatch.setattr(CaptureGuard, "status", lambda self: CaptureStatus(
+        True, "ready", 0, 1024 * 1024 * 1024, "0/0", datetime.now(UTC),
+    ))
 
 
 def kafka_test_profile() -> KafkaSecurityProfile | None:

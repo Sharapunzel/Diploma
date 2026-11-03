@@ -19,6 +19,7 @@ from ...repositories.protocols.processing import (
     ProcessingRepository,
 )
 from ..protocols.processing import ProcessMessageResult
+from .wal_guard import CaptureGuard, CaptureUnavailable
 
 LOGGER = logging.getLogger("app.durable_processing")
 
@@ -114,11 +115,13 @@ class DurableProcessingServiceImpl:
         unit_of_work: UnitOfWork,
         engine: NormalizationEngine,
         clock: ProcessingClock | None = None,
+        capture_guard: CaptureGuard | None = None,
     ) -> None:
         self.repository = repository
         self.unit_of_work = unit_of_work
         self.engine = engine
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.capture_guard = capture_guard
 
     def process(
         self,
@@ -236,6 +239,11 @@ class DurableProcessingServiceImpl:
                     normalization_diagnostics=_safe_diagnostics(normalized.diagnostics),
                 )
                 operation = "storage"
+                if self.capture_guard is None:
+                    raise CaptureUnavailable("guard_unconfigured")
+                capture = self.capture_guard.status()
+                if not capture.ready:
+                    raise CaptureUnavailable(capture.reason)
                 inserted = self.repository.store_event(record, event)
 
             self.unit_of_work.commit()
@@ -247,6 +255,9 @@ class DurableProcessingServiceImpl:
                 "failed": "stored_failed",
             }[status]
             return ProcessMessageResult(outcome, record_id)
+        except CaptureUnavailable as error:
+            self.unit_of_work.rollback()
+            raise ProcessingStorageError(f"availability_capture_{error}") from None
         except ProcessingConfigurationError:
             self.unit_of_work.rollback()
             raise

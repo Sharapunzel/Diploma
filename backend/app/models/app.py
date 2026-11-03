@@ -3,6 +3,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -371,3 +372,45 @@ class KafkaProvisioningOperation(TimestampMixin, Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     safe_error: Mapped[str | None] = mapped_column(Text)
     owner_token: Mapped[UUID | None] = mapped_column()
+
+
+class AggregateSchedule(Base):
+    __tablename__ = "aggregate_schedules"
+    __table_args__ = (
+        CheckConstraint("duration_seconds BETWEEN 1 AND 604800", name="duration_valid"),
+        CheckConstraint("next_index >= 0", name="next_index_nonnegative"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    # An immutable source identity survives source deletion; no cascade of history.
+    source_identity: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    anchor_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_index: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+
+class WorkingWindowPoint(Base):
+    __tablename__ = "working_window_points"
+    __table_args__ = (
+        CheckConstraint("window_index >= 0", name="index_nonnegative"),
+        CheckConstraint("end_utc > start_utc AND scheduled_at = end_utc", name="bounds_valid"),
+        CheckConstraint("actual_started_at >= scheduled_at", name="start_not_early"),
+        CheckConstraint("actual_completed_at >= actual_started_at", name="completion_valid"),
+        CheckConstraint("event_count >= 0", name="count_nonnegative"),
+        CheckConstraint("completeness IN ('complete', 'unknown', 'interrupted')", name="completeness_valid"),
+        Index("uq_working_window_schedule_index", "schedule_id", "window_index", unique=True),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    schedule_id: Mapped[UUID] = mapped_column(ForeignKey("logs.aggregate_schedules.id", ondelete="RESTRICT"), nullable=False)
+    window_index: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    start_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actual_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actual_completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_time_min: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    event_time_max: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completeness: Mapped[str] = mapped_column(Text, nullable=False)
+    completeness_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_refs: Mapped[dict] = mapped_column(JSONB, nullable=False)

@@ -59,6 +59,16 @@ const kindText: Record<string, string> = {
   topic_recreated: "Топик пересоздан",
 };
 const knownReasons: Record<string, string> = {
+  availability_capture_slot_or_progress_missing:
+    "Не найден слот фиксации времени доступности или его сохранённая позиция.",
+  availability_capture_wal_unavailable:
+    "Журнал WAL для определения времени доступности недоступен.",
+  availability_capture_slot_ahead_of_materialization:
+    "Позиция слота опережает сохранённые данные; требуется проверка оператора.",
+  availability_capture_decoder_unavailable:
+    "Декодер времени доступности недоступен.",
+  availability_capture_wal_budget_exhaustion_approaching:
+    "Журнал WAL приближается к установленному пределу; требуется вмешательство оператора.",
   invalid_utf8: "Невозможно прочитать кодировку сообщения.",
   invalid_json: "Сообщение не является корректным JSON.",
   null_payload: "Сообщение не содержит данных.",

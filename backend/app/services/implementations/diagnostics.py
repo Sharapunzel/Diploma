@@ -19,6 +19,11 @@ from ...schemas.diagnostics import (
 PAYLOAD_LIMIT = 700 * 1024
 SAFE_WORKER_STATES = {"waiting", "processing"}
 REASON_DESCRIPTIONS = {
+    'availability_capture_slot_or_progress_missing': 'The availability capture slot or its saved position is missing.',
+    'availability_capture_wal_unavailable': 'The WAL required for availability capture is unavailable.',
+    'availability_capture_slot_ahead_of_materialization': 'The capture slot is ahead of the durable position.',
+    'availability_capture_decoder_unavailable': 'The availability decoder is not responding.',
+    'availability_capture_wal_budget_exhaustion_approaching': 'The retained WAL is approaching its configured budget.',
     'all_partitions_stopped': 'All partitions for this source are stopped.',
     'cluster_identity_conflict': 'The Kafka cluster identity does not match the saved configuration.',
     'cluster_identity_unavailable': 'Kafka did not provide a cluster identity.',

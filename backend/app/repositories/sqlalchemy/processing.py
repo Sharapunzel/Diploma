@@ -1,10 +1,11 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from ...models import (
+    AvailabilityMarker,
     KafkaConnection,
     Normalizer,
     ParsedLog,
@@ -109,6 +110,10 @@ class SqlAlchemyProcessingRepository:
             return False
         event.processed_record_id = record.id
         self.session.add(event)
+        self.session.flush()
+        self.session.add(AvailabilityMarker(
+            id=uuid4(), source_identity=event.source_id, kind="event", event_id=event.id,
+        ))
         self.session.flush()
         return True
 

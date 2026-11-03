@@ -67,3 +67,37 @@ def test_external_preparation_removes_only_new_image(tmp_path: Path, monkeypatch
     assert removed == ["sha256:new-wazuh"]
     assert present == {foreign}
     assert list((tmp_path / ".test_runs" / "runs").iterdir()) == []
+
+
+def test_failed_builder_removes_only_its_new_untagged_image(monkeypatch):
+    before = {kind: [] for kind in (
+        "containers", "networks", "volumes", "images", "builders", "default_cache"
+    )}
+    before["images"] = ["sha256:old <none>:<none>"]
+    present = set(before["images"]) | {"sha256:buildkit <none>:<none>"}
+    removed = []
+
+    def inventory(_env):
+        return {**before, "images": sorted(present)}
+
+    def command(args, **_kwargs):
+        if args[:3] == ["docker", "ps", "-a"] and "--filter" in args:
+            return "abc buildx_buildkit_diploma_t21_test_builder0"
+        if args[:2] == ["docker", "inspect"]:
+            return "sha256:buildkit"
+        if args[:3] == ["docker", "image", "rm"]:
+            removed.append(args[3])
+            present.remove("sha256:buildkit <none>:<none>")
+        return ""
+
+    monkeypatch.setattr(profiles, "inventory", inventory)
+    monkeypatch.setattr(profiles, "command", command)
+    images = profiles.builder_image_ids("diploma_t21_test_builder", {})
+    # The builder container is gone before image deletion.
+    monkeypatch.setattr(profiles, "command", lambda args, **kwargs: (
+        "" if args[:3] == ["docker", "ps", "-a"] else command(args, **kwargs)
+    ))
+    profiles.remove_new_images(before, {}, "diploma_t21_test", "kafka-integration", images)
+    profiles.compare_inventory(before, inventory({}), "diploma_t21_test")
+    assert removed == ["sha256:buildkit"]
+    assert present == set(before["images"])

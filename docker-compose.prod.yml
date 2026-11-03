@@ -23,6 +23,16 @@ services:
       DATABASE_URL: ""
       DATABASE_URL_FILE: /run/secrets/database_url
     secrets: [database_url]
+  wal-bootstrap:
+    environment:
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets: [database_url, wal_reader_password]
+  wal-decoder:
+    environment:
+      WAL_DATABASE_URL: ""
+      WAL_DATABASE_URL_FILE: /run/secrets/wal_database_url
+    secrets: [wal_database_url]
   api:
     environment:
       ENVIRONMENT: production
@@ -91,6 +101,10 @@ secrets:
     file: ${POSTGRES_PASSWORD_FILE:?Set path to protected PostgreSQL password file}
   database_url:
     file: ${DATABASE_URL_FILE:?Set path to protected SQLAlchemy database URL file}
+  wal_reader_password:
+    file: ${WAL_READER_PASSWORD_FILE:?Set path to WAL reader password file}
+  wal_database_url:
+    file: ${WAL_DATABASE_URL_FILE:?Set path to dedicated WAL reader database URL file}
   oidc_state_secret:
     file: ${OIDC_STATE_SECRET_FILE:?Set path to protected unique OIDC state secret}
   oidc_client_secret:

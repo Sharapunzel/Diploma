@@ -4,12 +4,14 @@ from uuid import UUID
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     Text,
     text,
 )
@@ -260,3 +262,110 @@ class ProcessingError(Base):
     backend_processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class AvailabilityMarker(Base):
+    __tablename__ = "availability_markers"
+    __table_args__ = (
+        CheckConstraint("kind IN ('event', 'barrier')", name="kind_valid"),
+        CheckConstraint("(kind = 'event' AND event_id IS NOT NULL) OR "
+                        "(kind = 'barrier' AND event_id IS NULL)", name="payload_valid"),
+        Index("ix_availability_markers_source_time", "source_identity", "availability_at"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    source_identity: Mapped[UUID] = mapped_column(nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # Do not cascade marker history if a user deletes an event.
+    event_id: Mapped[UUID | None] = mapped_column(unique=True)
+    availability_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+
+class ReplicationProgress(Base):
+    __tablename__ = "replication_progress"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+        CheckConstraint("durable_lsn >= 0 AND durable_lsn <= 18446744073709551615", name="lsn_valid"),
+        {"schema": "logs"},
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    durable_lsn: Mapped[int] = mapped_column(Numeric(20, 0), nullable=False)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+class InputProbe(Base):
+    """Administrator-registered public key for one input configuration generation."""
+
+    __tablename__ = "input_probes"
+    __table_args__ = (
+        CheckConstraint("octet_length(public_key) = 32", name="public_key_length"),
+        Index("uq_input_probe_generation", "source_identity", "input_generation", unique=True),
+        Index("uq_input_probe_active_source", "source_identity", unique=True,
+              postgresql_where=text("is_active")),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    source_identity: Mapped[UUID] = mapped_column(nullable=False)
+    input_generation: Mapped[UUID] = mapped_column(nullable=False)
+    public_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+class InputAttestation(Base):
+    __tablename__ = "input_attestations"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="sequence_nonnegative"),
+        CheckConstraint("end_utc > start_utc", name="bounds_valid"),
+        CheckConstraint("state IN ('covered', 'interrupted')", name="state_valid"),
+        CheckConstraint("octet_length(signature) = 64", name="signature_length"),
+        Index("uq_input_attestation_sequence", "probe_id", "sequence", unique=True),
+        Index("ix_input_attestation_source_interval", "source_identity", "start_utc", "end_utc"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    probe_id: Mapped[UUID] = mapped_column(ForeignKey("logs.input_probes.id", ondelete="RESTRICT"), nullable=False)
+    source_identity: Mapped[UUID] = mapped_column(nullable=False)
+    input_generation: Mapped[UUID] = mapped_column(nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    start_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    start_positions: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    end_positions: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    signed_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=text("clock_timestamp()"))
+
+class KafkaCheckpoint(Base):
+    """Durable snapshot produced by the consumer from Kafka metadata/watermarks."""
+
+    __tablename__ = "source_kafka_checkpoints"
+    __table_args__ = (
+        Index("ix_source_checkpoint_observed", "source_identity", "observed_at"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    source_identity: Mapped[UUID] = mapped_column(nullable=False)
+    topic_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    # One entry per metadata partition: low, high and durably committed next offset.
+    partitions: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    worker_instance: Mapped[UUID] = mapped_column(nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=text("clock_timestamp()"))
+
+class SourceInterruption(Base):
+    __tablename__ = "source_interruptions"
+    __table_args__ = (
+        CheckConstraint("kind IN ('source_disabled', 'processing_stopped')", name="kind_valid"),
+        CheckConstraint("ended_at IS NULL OR ended_at >= started_at", name="bounds_valid"),
+        Index("ix_source_interruption_interval", "source_identity", "started_at", "ended_at"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, server_default=text("gen_random_uuid()"))
+    source_identity: Mapped[UUID] = mapped_column(nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=text("clock_timestamp()"))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

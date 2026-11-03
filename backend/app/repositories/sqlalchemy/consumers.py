@@ -6,7 +6,15 @@ from sqlalchemy import exists, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...models import KafkaConnection, KafkaOperationalEvent, ProcessedKafkaRecord, Source
+from ...models import (
+    InputProbe,
+    KafkaCheckpoint,
+    KafkaConnection,
+    KafkaOperationalEvent,
+    ProcessedKafkaRecord,
+    Source,
+    SourceInterruption,
+)
 from ..protocols.consumers import ConsumerSourceConfig
 
 
@@ -17,6 +25,41 @@ class RetentionGapConflict(RuntimeError):
 class SqlAlchemyConsumerStateRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def has_active_input_probe(self, source_id: UUID) -> bool:
+        return self.session.scalar(select(InputProbe.id).where(
+            InputProbe.source_identity == source_id,
+            InputProbe.is_active.is_(True)).limit(1)) is not None
+
+    def save_checkpoint(self, source_id: UUID, topic_id: str, partitions: dict, worker_instance: UUID) -> bool:
+        source = self.session.scalar(select(Source).where(Source.id == source_id).with_for_update(read=True))
+        if (source is None or not source.is_enabled or source.is_archived
+                or source.kafka_topic_identity != topic_id):
+            return False
+        self.session.add(KafkaCheckpoint(source_identity=source_id,
+                                         topic_identity=topic_id, partitions=partitions,
+                                         worker_instance=worker_instance))
+        return True
+
+    def mark_processing_stopped(self, source_id: UUID) -> None:
+        source = self.session.scalar(select(Source).where(Source.id == source_id).with_for_update(read=True))
+        if source is None:
+            return
+        existing = self.session.scalar(select(SourceInterruption.id).where(
+            SourceInterruption.source_identity == source.id,
+            SourceInterruption.kind == "processing_stopped",
+            SourceInterruption.ended_at.is_(None)).limit(1))
+        if existing is None:
+            self.session.add(SourceInterruption(source_identity=source.id, kind="processing_stopped"))
+
+    def mark_processing_resumed(self, source_id: UUID) -> None:
+        source = self.session.scalar(select(Source).where(Source.id == source_id).with_for_update(read=True))
+        if source is not None:
+            self.session.execute(update(SourceInterruption).where(
+                SourceInterruption.source_identity == source.id,
+                SourceInterruption.kind == "processing_stopped",
+                SourceInterruption.ended_at.is_(None),
+            ).values(ended_at=func.clock_timestamp()))
 
     @staticmethod
     def _config(source: Source, connection: KafkaConnection) -> ConsumerSourceConfig:

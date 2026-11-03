@@ -4,13 +4,13 @@
 
 ## Быстрый запуск development
 
-Нужны Docker Engine с Compose и Python с зависимостями backend. Из корня репозитория подготовьте локальные Kafka credentials (PowerShell или Linux shell):
+Нужны Docker Engine с Compose и Python с зависимостями backend. Из корня репозитория подготовьте локальные Kafka и WAL reader credentials (PowerShell или Linux shell):
 
 ```shell
 python scripts/prepare_dev_kafka.py
 ```
 
-Ожидается появление файлов в неотслеживаемой `.dev/`. Перед регистрацией агентов создайте постоянный ключ `.dev/agent_credentials_key` по [инструкции агента](docs/agent-lifecycle.md). Для внешнего индексера нужен отдельный постоянный `EXTERNAL_SECRET_KEY` в корневом `.env`; его подготовка и границы хранения описаны в [развёртывании](docs/deployment.md).
+Ожидается появление файлов в неотслеживаемой `.dev/`, включая `wal_reader_password`. Перед регистрацией агентов создайте постоянный ключ `.dev/agent_credentials_key` по [инструкции агента](docs/agent-lifecycle.md). Для внешнего индексера нужен отдельный постоянный `EXTERNAL_SECRET_KEY` в корневом `.env`; его подготовка и границы хранения описаны в [развёртывании](docs/deployment.md).
 
 После подготовки из корня репозитория выполните:
 

@@ -84,10 +84,10 @@ install -d -o root -g root -m 0700 /etc/diploma /etc/diploma/secrets /etc/diplom
 
 ```shell
 set -eu
-for file in /etc/diploma/secrets/postgres_password /etc/diploma/secrets/database_url /etc/diploma/secrets/oidc_state_secret /etc/diploma/secrets/oidc_client_secret /etc/diploma/secrets/external_secret_key /etc/diploma/secrets/agent_credentials_key /etc/diploma/secrets/kafka_admin_password /etc/diploma/secrets/kafka_reader_password /etc/diploma/tls/web/fullchain.pem /etc/diploma/tls/web/privkey.pem /etc/diploma/tls/kafka/broker.pem /etc/diploma/tls/kafka/ca.pem; do test -s "$file"; done
+for file in /etc/diploma/secrets/postgres_password /etc/diploma/secrets/database_url /etc/diploma/secrets/oidc_state_secret /etc/diploma/secrets/oidc_client_secret /etc/diploma/secrets/external_secret_key /etc/diploma/secrets/agent_credentials_key /etc/diploma/secrets/kafka_admin_password /etc/diploma/secrets/kafka_reader_password /etc/diploma/secrets/wal_reader_password /etc/diploma/secrets/wal_database_url /etc/diploma/tls/web/fullchain.pem /etc/diploma/tls/web/privkey.pem /etc/diploma/tls/kafka/broker.pem /etc/diploma/tls/kafka/ca.pem; do test -s "$file"; done
 setfacl -m u:10001:--x /etc/diploma /etc/diploma/secrets
 setfacl -m u:10001:--x /etc/diploma/tls /etc/diploma/tls/kafka
-setfacl -m u:10001:r-- /etc/diploma/secrets/database_url /etc/diploma/secrets/oidc_state_secret /etc/diploma/secrets/oidc_client_secret /etc/diploma/secrets/external_secret_key /etc/diploma/secrets/agent_credentials_key /etc/diploma/secrets/kafka_admin_password
+setfacl -m u:10001:r-- /etc/diploma/secrets/database_url /etc/diploma/secrets/oidc_state_secret /etc/diploma/secrets/oidc_client_secret /etc/diploma/secrets/external_secret_key /etc/diploma/secrets/agent_credentials_key /etc/diploma/secrets/kafka_admin_password /etc/diploma/secrets/wal_reader_password /etc/diploma/secrets/wal_database_url
 setfacl -m u:1000:--x /etc/diploma /etc/diploma/tls /etc/diploma/tls/kafka
 setfacl -m u:1000:--x /etc/diploma/secrets
 setfacl -m u:1000:r-- /etc/diploma/tls/kafka/broker.pem /etc/diploma/tls/kafka/ca.pem
@@ -122,6 +122,8 @@ KAFKA_BROKER_PEM_FILE=/etc/diploma/tls/kafka/broker.pem
 KAFKA_CA_FILE=/etc/diploma/tls/kafka/ca.pem
 KAFKA_ADMIN_PASSWORD_FILE=/etc/diploma/secrets/kafka_admin_password
 KAFKA_READER_PASSWORD_FILE=/etc/diploma/secrets/kafka_reader_password
+WAL_READER_PASSWORD_FILE=/etc/diploma/secrets/wal_reader_password
+WAL_DATABASE_URL_FILE=/etc/diploma/secrets/wal_database_url
 OIDC_ENABLED=false
 # При включении OIDC задайте OIDC_ISSUER_URL, OIDC_CLIENT_ID и:
 # OIDC_REDIRECT_URI=https://events.example.org/api/v1/auth/oidc/callback

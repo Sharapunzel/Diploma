@@ -49,9 +49,18 @@ from app.services.implementations.processing import (
     DurableProcessingServiceImpl,
     ProcessingStorageError,
 )
+from app.services.implementations.wal_guard import CaptureGuard, CaptureStatus
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 RECEIVED_AT = datetime(2026, 3, 2, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def stage1_consumer_capture_dependency(monkeypatch):
+    """These consumer tests isolate Kafka behavior; WAL capture has its own gate."""
+    monkeypatch.setattr(CaptureGuard, "status", lambda self: CaptureStatus(
+        True, "ready", 0, 1024 * 1024 * 1024, "0/0", datetime.now(UTC),
+    ))
 
 
 def _run_alembic(url: str, *args: str) -> None:
