@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from .endpoints.administration import router as administration_router
 from .endpoints.agents import router as agents_router
+from .endpoints.aggregates import router as aggregates_router
 from .endpoints.auth import router as auth_router
 from .endpoints.connections import router as connections_router
 from .endpoints.diagnostics import router as diagnostics_router
@@ -26,3 +27,4 @@ router.include_router(ecs_router)
 router.include_router(events_router)
 router.include_router(parsed_logs_router)
 router.include_router(diagnostics_router)
+router.include_router(aggregates_router)

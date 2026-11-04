@@ -1,5 +1,6 @@
 """Ordered working-window closure around a durable WAL barrier."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid5
@@ -30,11 +31,12 @@ def _barrier_id(schedule_id: UUID, index: int) -> UUID:
 class WorkingWindowService:
     def __init__(self, repository: WorkingWindowRepository,
                  evidence: CoverageEvidenceRepository, capture: CaptureGuard,
-                 uow: UnitOfWork) -> None:
+                 uow: UnitOfWork, calculator: Callable | None = None) -> None:
         self.repository = repository
         self.evidence = evidence
         self.capture = capture
         self.uow = uow
+        self.calculator = calculator
 
     def _schedule(self, schedule_id: UUID) -> tuple[AggregateSchedule, WindowSchedule]:
         try:
@@ -43,6 +45,9 @@ class WorkingWindowService:
             raise WindowNotReady(str(error)) from error
         if stored is None:
             raise WindowNotReady("schedule_missing")
+        state = self.repository.aggregate_state(schedule_id)
+        if state is not None and state != "active":
+            raise WindowNotReady("aggregate_inactive")
         return stored, WindowSchedule(stored.anchor_utc, stored.duration_seconds)
 
     def _check_capture(self) -> None:
@@ -85,9 +90,14 @@ class WorkingWindowService:
                 raise WindowNotReady("barrier_not_materialized")
             if barrier.created_at < window.scheduled_at or barrier.availability_at < window.scheduled_at:
                 raise WindowNotReady("barrier_before_schedule")
-            count, event_time_min, event_time_max = self.repository.event_bounds(
-                stored.source_identity, window.start, window.end,
-            )
+            calculated = self.calculator(stored, window) if self.calculator else None
+            if calculated is None:
+                count, event_time_min, event_time_max = self.repository.event_bounds(
+                    stored.source_identity, window.start, window.end,
+                )
+            else:
+                count, event_time_min, event_time_max = (calculated[name] for name in (
+                    "event_count", "event_time_min", "event_time_max"))
             if count > 0 and (event_time_min is None or event_time_max is None):
                 raise WindowNotReady("event_timestamp_unavailable")
             completeness, reason, evidence_refs = evaluate_saved_coverage(
@@ -104,6 +114,7 @@ class WorkingWindowService:
                 event_count=count, completeness=completeness, completeness_reason=reason,
                 event_time_min=event_time_min, event_time_max=event_time_max,
                 evidence_refs=evidence_refs,
+                features=calculated["features"] if calculated else None,
             )
             self.repository.save_point(point, stored)
             self.uow.commit()

@@ -2,6 +2,7 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
 from .adapters.replication_slot import PostgreSQLReplicationSlotAdapter
+from .aggregate_composition import build_aggregate_service
 from .config import Settings, settings
 from .db import get_session
 from .ecs import EcsCatalog
@@ -74,6 +75,10 @@ from .services.protocols.processing import DurableProcessingService
 
 def get_settings() -> Settings:
     return settings
+
+
+def get_aggregate_service(request: Request, session: Session = Depends(get_session)):
+    return build_aggregate_service(session, request.app.state.ecs_catalog)
 
 
 def build_auth_service(session: Session, app_settings: Settings) -> AuthService:

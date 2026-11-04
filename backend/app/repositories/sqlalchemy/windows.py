@@ -7,7 +7,14 @@ from sqlalchemy import DateTime, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from ...models import AggregateSchedule, AvailabilityMarker, ParsedLog, Source, WorkingWindowPoint
+from ...models import (
+    Aggregate,
+    AggregateSchedule,
+    AvailabilityMarker,
+    ParsedLog,
+    Source,
+    WorkingWindowPoint,
+)
 
 
 class SqlAlchemyWorkingWindowRepository:
@@ -20,11 +27,15 @@ class SqlAlchemyWorkingWindowRepository:
         return self.session.scalar(select(AggregateSchedule).where(
             AggregateSchedule.id == schedule_id).with_for_update())
 
+    def aggregate_state(self, schedule_id: UUID) -> str | None:
+        return self.session.scalar(select(Aggregate.state).where(Aggregate.schedule_id == schedule_id))
+
     def db_now(self) -> datetime:
         return self.session.scalar(select(func.clock_timestamp()))
 
     def lock_source(self, source_id: UUID) -> bool:
-        source = self.session.scalar(select(Source).where(Source.id == source_id).with_for_update())
+        source = self.session.scalar(select(Source).where(Source.id == source_id)
+            .with_for_update().execution_options(populate_existing=True))
         return source is not None and source.source_type == "kafka"
 
     def ensure_barrier(self, marker_id: UUID, source_id: UUID, at: datetime) -> None:

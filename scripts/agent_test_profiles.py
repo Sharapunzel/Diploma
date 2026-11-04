@@ -467,7 +467,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
         for service, memory in {
             "postgres": "768m", "kafka": "2g", "kafka-acls": "512m",
             "migrate": "512m", "api": "1g", "provisioner": "768m",
-            "wal-bootstrap": "512m", "wal-decoder": "512m",
+            "wal-bootstrap": "512m", "wal-decoder": "512m", "aggregate-worker": "768m",
             "proxy": "256m", "frontend": "2g",
         }.items() if not production or service != "frontend"
     ), encoding="utf-8")
@@ -1595,7 +1595,10 @@ def main() -> None:
     parser.add_argument("profile", choices=["frontend", "backend-db", "kafka-integration", "end-to-end", "smoke-development", "smoke-production", "external-end-to-end"])
     parser.add_argument("--pytest", nargs="*", help="Specific backend test nodes for a focused retry")
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
+    parser.add_argument("--aggregate-only", action="store_true", help="Run the aggregate end-to-end scenario without unrelated UI scenarios")
     args = parser.parse_args()
+    if args.aggregate_only and args.profile != "end-to-end":
+        parser.error("--aggregate-only requires end-to-end")
     run = ROOT / ".test_runs" / "runs" / f"task21-{uuid4().hex}"
     run.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "TEMP": str(run), "TMP": str(run), "TMPDIR": str(run),
@@ -1671,7 +1674,16 @@ def main() -> None:
             env["COMPOSE_DOCKER_CLI_BUILD"] = "1"
         if args.profile == "backend-db":
             command([*compose, "up", "-d", "--wait", "postgres"], env=env)
-            command([sys.executable, "-m", "pytest", "-q", *(args.pytest or ["tests/test_auth_foundation.py", "tests/test_agent_contracts.py"])], env=env, cwd=ROOT / "backend")
+            if args.pytest:
+                command([sys.executable, "-m", "pytest", "-q", *args.pytest], env=env, cwd=ROOT / "backend")
+            else:
+                # The DB profile runs all broker-independent tests through the
+                # same disposable database runner as kafka-integration.
+                selected = sorted(str(p.relative_to(ROOT / "backend")) for p in
+                    (ROOT / "backend/tests").glob("test_*.py") if p.name not in {
+                        "test_kafka_integration.py", "test_window_kafka_evidence.py", "test_agent_recovery.py"})
+                command([sys.executable, "scripts/run_tests.py", "--temporary", "--pytest", *selected],
+                        env=env, cwd=ROOT / "backend")
             migration_env = {**env, "DATABASE_URL": env["TEST_DATABASE_URL"]}
             migration_env.pop("DATABASE_URL_FILE", None)
             command([sys.executable, "-m", "alembic", "upgrade", "head"], env=migration_env, cwd=ROOT / "backend")
@@ -1685,7 +1697,7 @@ def main() -> None:
                 command([sys.executable, "scripts/run_tests.py", "--temporary"], env=env, cwd=ROOT / "backend")
         elif args.profile in {"smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             production = args.profile in {"smoke-production", "external-end-to-end"}
-            services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "proxy"]
+            services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "aggregate-worker", "proxy"]
             if args.profile == "external-end-to-end":
                 services.append("indexer")
             if args.profile in {"smoke-development", "smoke-production"}:
@@ -1713,6 +1725,9 @@ def main() -> None:
             if args.profile in {"end-to-end", "smoke-production"}:
                 verify_agent_metadata(compose, project, env)
             smoke_http(env, production)
+            if args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
+                from aggregate_test_scenarios import aggregate_runtime_smoke
+                aggregate_runtime_smoke(compose, env, production, command)
             if args.profile in {"smoke-development", "smoke-production"}:
                 oidc_administration_smoke(compose, env, production)
             if args.profile == "smoke-development":
@@ -1755,7 +1770,7 @@ def main() -> None:
                          )], env=env)
                 command([*compose, "up", "-d", "--no-deps", "--force-recreate", "--wait", "proxy"], env=env)
                 smoke_http(env, True)
-            if args.profile == "end-to-end":
+            if args.profile == "end-to-end" and not args.aggregate_only:
                 end_to_end(compose, project, env, run)
             if args.profile == "external-end-to-end":
                 external_end_to_end(compose, project, env, run)
@@ -1774,7 +1789,7 @@ def main() -> None:
                         )]
                         print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
                     command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
-                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
+                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "aggregate-worker", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
                         image = f"{project}-{service}"
                         matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
                         if image in matches:

@@ -1,3 +1,4 @@
+from .aggregates import Aggregate, HistoricalAggregatePoint
 from .app import (
     AggregateSchedule,
     AppSetting,
@@ -29,6 +30,7 @@ from .logs import (
 from .oidc_provider import OidcProvider
 
 __all__ = [
+    "Aggregate",
     "AggregateSchedule",
     "AppSetting",
     "AuthSession",
@@ -36,6 +38,7 @@ __all__ = [
     "ExternalConnection",
     "FluentBitAgent",
     "FluentBitAgentTopic",
+    "HistoricalAggregatePoint",
     "InputAttestation",
     "InputProbe",
     "KafkaCheckpoint",

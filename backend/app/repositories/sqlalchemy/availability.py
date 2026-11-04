@@ -49,5 +49,9 @@ class SqlAlchemyAvailabilityProgressRepository:
             if marker.availability_at is not None and marker.availability_at != commit.committed_at:
                 raise InvalidReplicationMessage("inconsistent commit time for marker")
             marker.availability_at = commit.committed_at
+            if (progress.boundary_barrier_id == marker_uuid
+                    and progress.availability_verified_from_at is None):
+                progress.availability_verified_from_at = commit.committed_at
+                progress.boundary_origin = "upgrade_materialized_barrier"
         progress.durable_lsn = max(int(progress.durable_lsn), commit.end_lsn)
         self.session.flush()

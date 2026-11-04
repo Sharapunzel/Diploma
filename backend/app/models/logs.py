@@ -293,6 +293,10 @@ class ReplicationProgress(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     durable_lsn: Mapped[int] = mapped_column(Numeric(20, 0), nullable=False)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    legacy_cutover_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_verified_from_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    boundary_origin: Mapped[str | None] = mapped_column(Text)
+    boundary_barrier_id: Mapped[UUID | None] = mapped_column()
 
 class InputProbe(Base):
     """Administrator-registered public key for one input configuration generation."""

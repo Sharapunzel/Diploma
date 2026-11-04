@@ -134,6 +134,22 @@ services:
         condition: service_completed_successfully
     networks: [internal]
 
+  aggregate-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.aggregate_worker"]
+    restart: unless-stopped
+    stop_grace_period: 70s
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-diploma_user}:${POSTGRES_PASSWORD:-diploma_password}@postgres:5432/${POSTGRES_DB:-diploma_db}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      wal-decoder:
+        condition: service_healthy
+    networks: [internal]
+
   provisioner:
     build:
       context: ./backend

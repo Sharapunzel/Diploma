@@ -9,6 +9,7 @@
 - [Подготовка development и production, запуск и эксплуатация](deployment.md)
 - [Проверочные профили и очистка](agent-test-profiles.md)
 - [Захват времени commit, WAL и доказательства пустого окна](availability-capture.md)
+- [Серверные агрегаты, API, время и ресурсные границы](aggregates.md)
 
 - [Тестовая база и миграции](database.md)
 - [Аутентификация и API](authentication.md)

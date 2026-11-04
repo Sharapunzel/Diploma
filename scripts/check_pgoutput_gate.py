@@ -23,6 +23,7 @@ from psycopg import pq
 from psycopg.conninfo import make_conninfo
 from sqlalchemy import create_engine, select as sa_select
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 import agent_test_profiles as profiles
@@ -302,6 +303,24 @@ def main():
                              env=app_env, cwd=profiles.ROOT / "backend")
             profiles.command([sys.executable, "-B", "-m", "app.wal_bootstrap"],
                              env=app_env, cwd=profiles.ROOT / "backend")
+            first_boundary = db.execute("SELECT legacy_cutover_at,availability_verified_from_at,boundary_origin FROM logs.replication_progress WHERE id=1").fetchone()
+            assert first_boundary[0] is not None and first_boundary[0] == first_boundary[1]
+            assert first_boundary[2] == "first_bootstrap"
+            with psycopg.connect(url) as old_writer:
+                old_writer.execute("LOCK TABLE logs.parsed_logs IN ROW EXCLUSIVE MODE")
+                refused_writer = subprocess.run([sys.executable, "-B", "-m", "app.wal_bootstrap"],
+                    env=app_env, cwd=profiles.ROOT / "backend", capture_output=True, text=True, timeout=20)
+                assert refused_writer.returncode != 0 and "writers_not_stopped" in refused_writer.stderr
+                old_writer.rollback()
+            profiles.command([sys.executable, "-B", "-m", "app.wal_bootstrap"], env=app_env, cwd=profiles.ROOT / "backend")
+            assert db.execute("SELECT legacy_cutover_at,availability_verified_from_at,boundary_origin FROM logs.replication_progress WHERE id=1").fetchone() == first_boundary
+            # Reproduce an existing TASK-30 database: keep its slot/progress,
+            # remove only the newly introduced schema, then apply it again.
+            profiles.command([sys.executable, "-B", "-m", "alembic", "downgrade", "0015_aggregation_foundation"], env=app_env, cwd=profiles.ROOT / "backend")
+            profiles.command([sys.executable, "-B", "-m", "alembic", "upgrade", "head"], env=app_env, cwd=profiles.ROOT / "backend")
+            profiles.command([sys.executable, "-B", "-m", "app.wal_bootstrap"], env=app_env, cwd=profiles.ROOT / "backend")
+            upgrade_boundary = db.execute("SELECT legacy_cutover_at,availability_verified_from_at,boundary_barrier_id FROM logs.replication_progress WHERE id=1").fetchone()
+            assert upgrade_boundary[:2] == (None, None) and upgrade_boundary[2] is not None
             worker_log = run / "decoder.log"
             with worker_log.open("w", encoding="utf-8") as log:
                 worker = subprocess.Popen([sys.executable, "-B", "-m", "app.wal_decoder"],
@@ -316,6 +335,15 @@ def main():
                 time.sleep(0.05)
             else:
                 raise AssertionError("application decoder did not acquire the slot")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                upgraded = db.execute("SELECT legacy_cutover_at,availability_verified_from_at FROM logs.replication_progress WHERE id=1").fetchone()
+                if upgraded[1] is not None:
+                    break
+                time.sleep(.05)
+            marker_boundary = db.execute("SELECT created_at,availability_at FROM logs.availability_markers WHERE id=%s", (upgrade_boundary[2],)).fetchone()
+            assert upgraded[0] is None and upgraded[1] == marker_boundary[1] >= marker_boundary[0]
+            print("Capture boundaries: first bootstrap immutable; legacy upgrade proves only a future barrier boundary", flush=True)
             worker.terminate()
             worker.wait(timeout=10)
             worker = None
@@ -405,6 +433,15 @@ def main():
                     ecs_data={"@timestamp": "2000-01-01T00:00:00Z"})
                 return record, entry
             record, entry = event_pair(1)
+            _, old_entry = event_pair(0)
+            try:
+                with sessions.begin() as session:
+                    session.add(old_entry)
+            except IntegrityError as error:
+                assert error.orig.sqlstate == "23514"
+            else:
+                raise AssertionError("markerless old writer was accepted after capture bootstrap")
+            print("Active writer blocks bootstrap; markerless old writer is rejected at commit", flush=True)
             with sessions.begin() as session:
                 assert capture_status(session, min_safe_bytes=8 * 1024 * 1024).ready
                 assert processing_repository.SqlAlchemyProcessingRepository(session).store_event(record, entry)
@@ -427,6 +464,11 @@ def main():
                 session.add(AggregateSchedule(id=schedule_id, source_identity=source_id,
                                               anchor_utc=anchor, duration_seconds=5))
             def window_service(session):
+                from types import SimpleNamespace
+                from app.dependencies import build_aggregate_service
+                from app.ecs import PackagedEcsCatalog
+                aggregate_service = build_aggregate_service(session, PackagedEcsCatalog.load())
+                rule = {"features": [{"key": "n", "name": "Count", "op": "count"}]}
                 return working_windows.WorkingWindowService(
                     SqlAlchemyWorkingWindowRepository(session),
                     SqlAlchemyCoverageEvidenceRepository(session),
@@ -434,6 +476,8 @@ def main():
                                  PostgreSQLReplicationSlotAdapter(session),
                                  min_safe_bytes=8 * 1024 * 1024),
                     SqlAlchemyUnitOfWork(session),
+                    calculator=lambda stored, window: aggregate_service._working_calculation(
+                        SimpleNamespace(rule=rule), stored, window),
                 )
             writer = sessions()
             writer.begin()
@@ -480,6 +524,7 @@ def main():
             with sessions() as session:
                 point = window_service(session).close_next_window(schedule_id)
                 assert point.event_count == 1 and point.completeness == "unknown"
+                assert point.features == [{"key": "n", "value": 1, "reason": None, "valid_count": 1, "invalid_count": 0}]
                 assert point.event_time_min == point.event_time_max == datetime(2000, 1, 1, tzinfo=UTC)
             db.execute("SELECT pg_sleep(greatest(0, extract(epoch from %s - clock_timestamp())))", (boundary + timedelta(seconds=5),))
             with sessions() as session:
@@ -494,6 +539,7 @@ def main():
             with sessions() as session:
                 point = window_service(session).close_next_window(schedule_id)
                 assert point.event_count == 1 and point.completeness == "unknown"
+                assert point.features[0]["value"] == 1
                 assert point.event_time_min == point.event_time_max == datetime(2000, 1, 1, tzinfo=UTC)
             print("Application barrier waited for writer; before/after commits landed in successive windows", flush=True)
             worker.terminate()

@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 from psycopg import sql
@@ -42,6 +43,11 @@ def bootstrap(url: str, password: str) -> None:
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute("SELECT pg_advisory_lock(1380205361)")
         try:
+            if conn.execute("""SELECT EXISTS (SELECT 1 FROM pg_locks
+                WHERE relation IN ('logs.parsed_logs'::regclass, 'app.sources'::regclass)
+                AND granted AND mode IN ('RowShareLock','RowExclusiveLock')
+                AND pid <> pg_backend_pid())""").fetchone()[0]:
+                raise RuntimeError("writers_not_stopped")
             if conn.execute("SHOW wal_level").fetchone()[0] != "logical":
                 raise RuntimeError("logical WAL is not enabled")
             if conn.execute("SHOW max_slot_wal_keep_size").fetchone()[0] == "-1":
@@ -87,6 +93,22 @@ def bootstrap(url: str, password: str) -> None:
                 FROM pg_replication_slots WHERE slot_name=%s""", (SLOT,)).fetchone()[0]
             if progress is not None and confirmed > progress[0]:
                 raise RuntimeError("slot position is ahead of durable materialization")
-            conn.execute("INSERT INTO logs.replication_progress (id, durable_lsn) VALUES (1, %s) ON CONFLICT DO NOTHING", (confirmed,))
+            # Bootstrap runs with all old writers stopped. Never reconstruct a
+            # first cutover from an LSN, a heartbeat or the earliest marker.
+            if progress is None and not markers:
+                conn.execute("""INSERT INTO logs.replication_progress
+                    (id,durable_lsn,legacy_cutover_at,availability_verified_from_at,boundary_origin)
+                    SELECT 1,%s,at,at,'first_bootstrap' FROM (SELECT clock_timestamp() AS at) AS boundary
+                    ON CONFLICT DO NOTHING""", (confirmed,))
+            else:
+                conn.execute("INSERT INTO logs.replication_progress (id,durable_lsn) VALUES (1,%s) ON CONFLICT DO NOTHING", (confirmed,))
+                boundary = conn.execute("SELECT availability_verified_from_at,boundary_barrier_id FROM logs.replication_progress WHERE id=1").fetchone()
+                if boundary == (None, None):
+                    barrier = uuid4()
+                    # Commit marker and its identity together. The decoder, not
+                    # bootstrap wall time, establishes the durable future bound.
+                    with conn.transaction():
+                        conn.execute("INSERT INTO logs.availability_markers (id,source_identity,kind) VALUES (%s,%s,'barrier')", (barrier, uuid4()))
+                        conn.execute("UPDATE logs.replication_progress SET boundary_barrier_id=%s,boundary_origin='upgrade_barrier_pending' WHERE id=1", (barrier,))
         finally:
             conn.execute("SELECT pg_advisory_unlock(1380205361)")

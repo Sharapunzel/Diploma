@@ -29,6 +29,8 @@ ADMIN_PERMISSIONS = [
     "processing_errors.raw.read",
     "agents.read",
     "agents.write",
+    "aggregates.read",
+    "aggregates.write",
 ]
 GUEST_PERMISSIONS = [
     "connections.read",

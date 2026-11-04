@@ -414,3 +414,4 @@ class WorkingWindowPoint(Base):
     completeness: Mapped[str] = mapped_column(Text, nullable=False)
     completeness_reason: Mapped[str] = mapped_column(Text, nullable=False)
     evidence_refs: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    features: Mapped[list | None] = mapped_column(JSONB)
