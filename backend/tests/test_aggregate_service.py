@@ -442,3 +442,183 @@ def test_serialization_conflict_recalculates_from_fresh_transaction(database, ca
         assert len(calls) == 2
         assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
         assert api.points(card.id, 50, 0)["total"] == 1
+
+@pytest.mark.parametrize('op', ['median', 'percentile', 'mode_count', 'mode_share'])
+def test_exact_materialization_budget_refuses_before_query(database, catalog, source, op):
+    from app.aggregation.rules import AggregateRule
+    body = request(source)
+    body.aggregate_rule = AggregateRule.model_validate({'features': [{
+        'key': 'n', 'name': 'N', 'op': op, 'field': 'network.bytes',
+        **({'percentile': .5} if op == 'percentile' else {})}]})
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        api.repository.estimate_rows = lambda *_: (10000, 10000, 10000)
+        api.repository.calculate = lambda *_: pytest.fail('over-budget exact materialization reached SQL')
+        with pytest.raises(DomainError) as error:
+            api.preview(body)
+        assert error.value.code == 'resource_budget_exceeded'
+        assert error.value.details['path'] == 'total_memory'
+
+
+def test_legacy_create_digest_survives_optional_operator_parameters(database, catalog, source):
+    import hashlib
+    import json
+    key = 'legacy-digest'
+    card, body = create(database, catalog, source, key=key)
+    legacy = body.model_dump(mode='json')
+    legacy['aggregate_rule']['features'] = [
+        {name: getattr(f, name) for name in ('key', 'name', 'op', 'field', 'where', 'expr')}
+        for f in body.aggregate_rule.features]
+    expected = hashlib.sha256(json.dumps(legacy, ensure_ascii=False,
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    with database.session_factory() as session:
+        assert session.get(Aggregate, card.id).request_hash == expected
+        assert service(session, catalog).create(body, UUID(int=1), key).id == card.id
+
+
+def test_validate_accepts_normalizer_second_offset_date(database, catalog, source):
+    from app.aggregation.rules import AggregateRule
+    from app.normalization.convert import convert_value
+    normalized = convert_value(catalog.get('event.created'), '1900-01-01T00:00:00+05:21:10')
+    body = request(source)
+    body.aggregate_rule = AggregateRule.model_validate({'where': {
+        'op': 'eq', 'field': 'event.created', 'value': normalized},
+        'features': [{'key': 'n', 'name': 'N', 'op': 'count'}]})
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        checked = api.validate(body)
+        assert api.preview(body).rule_hash == checked.rule_hash
+
+
+@pytest.mark.parametrize('op', ['has_all', 'has_none', 'has_any'])
+def test_array_literal_budget_refuses_preview_and_atomic_point(database, catalog, source, op):
+    from app.aggregation.rules import AggregateRule
+    body = request(source)
+    body.aggregate_rule = AggregateRule.model_validate({'where': {
+        'op': op, 'field': 'host.ip', 'value': [f'2001:db8::{i:x}' for i in range(256)]},
+        'features': [{'key': 'n', 'name': 'N', 'op': 'count'}]})
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        clock = api.repository.now
+        api.repository.now = lambda: clock() - timedelta(seconds=3)
+        checked = api.validate(body)
+        card = api.create(CreateAggregateRequest(**body.model_dump(), name='Array budget',
+            rule_hash=checked.rule_hash), UUID(int=1), uuid4().hex)
+    with database.session_factory() as session, pytest.raises(WindowNotReady):
+        service(session, catalog).advance(card.id)
+    materialize(database, source)
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        api.budget_limits = replace(api.budget_limits, cost=1000)
+        api.repository.estimate_rows = lambda *_: (1, 1, 22000)
+        api.repository.calculate = lambda *_: pytest.fail('array budget did not stop calculation')
+        for action in [lambda: api.preview(body), lambda: api.advance(card.id)]:
+            with pytest.raises(DomainError) as error:
+                action()
+            assert error.value.code == 'resource_budget_exceeded'
+            assert error.value.details['path'] == 'operator_cost'
+            assert api.points(card.id, 50, 0)['total'] == 0
+            assert api.repository.schedule(card.schedule_id).next_index == card.next_index
+
+
+@pytest.mark.parametrize('value', ['0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00'])
+def test_validate_and_preview_reject_utc_overflow_as_rule_error(database, catalog, source, value):
+    from app.aggregation.rules import AggregateRule
+    from app.normalization.convert import convert_value
+    normalized = convert_value(catalog.get('event.created'), value)
+    body = request(source)
+    body.aggregate_rule = AggregateRule.model_validate({'where': {
+        'op': 'eq', 'field': 'event.created', 'value': normalized},
+        'features': [{'key': 'n', 'name': 'N', 'op': 'count'}]})
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        for action in [lambda: api.validate(body), lambda: api.preview(body)]:
+            with pytest.raises(DomainError) as error:
+                action()
+            assert error.value.status_code == 422
+            assert error.value.code == 'invalid_literal_type'
+            assert error.value.details['path'] == 'where.value'
+        assert session.scalar(select(func.count()).select_from(Aggregate).where(
+            Aggregate.source_identity == source)) == 0
+
+
+@pytest.mark.parametrize('value', ['0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00'])
+@pytest.mark.parametrize('occurred', ['2000-01-01T00:00:00Z',
+    '0001-01-01T00:00:00Z', '9999-12-31T23:59:59.999999Z'])
+def test_bad_date_commits_quality_point_and_cursor_without_retry(database, catalog, source, value, occurred):
+    from app.aggregation.rules import AggregateRule
+    from app.services.implementations.window_schedule import WindowSchedule
+    body = request(source)
+    body.aggregate_rule = AggregateRule.model_validate({'features': [
+        {'key': 'n', 'name': 'N', 'op': 'count'},
+        {'key': 'mode', 'name': 'Mode', 'op': 'mode_count', 'field': 'event.created'}]})
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        clock = api.repository.now
+        api.repository.now = lambda: clock() - timedelta(seconds=3)
+        checked = api.validate(body)
+        card = api.create(CreateAggregateRequest(**body.model_dump(), name='Date boundary',
+            rule_hash=checked.rule_hash), UUID(int=1), uuid4().hex)
+    with database.session_factory.begin() as session:
+        origin = session.get(Source, source)
+        stored = session.get(AggregateSchedule, card.schedule_id)
+        window = WindowSchedule(stored.anchor_utc, stored.duration_seconds).window(card.next_index)
+        at = window.start + timedelta(microseconds=500000)
+        event = ParsedLog(id=uuid4(), source_id=source, connection_id=origin.connection_id,
+            normalizer_version=1, normalizer_name='synthetic', source_name=origin.name,
+            connection_name='synthetic', kafka_topic=origin.topic_name, kafka_partition=0,
+            kafka_offset=0, deduplication_key=str(uuid4()), fluent_bit_collected_at=at,
+            backend_received_at=at, backend_processed_at=at, raw='synthetic date',
+            ecs_data={'@timestamp': occurred, 'event': {'created': value}})
+        session.add(event)
+        session.flush()
+        event_id = event.id
+        session.add(AvailabilityMarker(id=uuid4(), source_identity=source, kind='event',
+            event_id=event_id, created_at=at, availability_at=at))
+    with database.session_factory() as session, pytest.raises(WindowNotReady):
+        service(session, catalog).advance(card.id)
+    materialize(database, source)
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        point = api.advance(card.id)
+        assert point.event_count == 1 and point.features[0]['value'] == 1
+        assert point.features[1] == {'key': 'mode', 'value': None, 'reason': 'invalid_input_type',
+                                     'valid_count': 0, 'invalid_count': 1}
+        assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
+        saved_id, saved_features = point.id, point.features
+        # Retry reaches the next window's barrier, never rewrites the bad point.
+        with pytest.raises(WindowNotReady):
+            api.advance(card.id)
+        assert api.points(card.id, 50, 0)['total'] == 1
+        assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
+    with database.session_factory.begin() as session:
+        session.get(ParsedLog, event_id).ecs_data = {'@timestamp': occurred,
+                                                    'event': {'created': '2000-01-01T00:00:00Z'}}
+    with database.session_factory() as session:
+        for zone in ['UTC', 'America/New_York', 'Pacific/Kiritimati']:
+            session.execute(select(func.set_config('TimeZone', zone, True)))
+            saved = service(session, catalog).points(card.id, 50, 0)['items'][0]
+            assert saved.id == saved_id and [item.model_dump() for item in saved.features] == saved_features
+            assert saved.event_time_min == saved.event_time_max == datetime.fromisoformat(occurred)
+
+
+def test_saved_historical_utc_bounds_are_read_without_timezone_overflow(database, catalog, source):
+    card, body = create(database, catalog, source)
+    with database.session_factory.begin() as session:
+        point = HistoricalAggregatePoint(aggregate_id=card.id, start_utc=body.window_start_utc,
+            end_utc=body.window_start_utc + timedelta(seconds=1), actual_started_at=card.created_at,
+            actual_completed_at=card.created_at, event_count=2,
+            event_time_min=datetime.min.replace(tzinfo=UTC), event_time_max=datetime.max.replace(tzinfo=UTC),
+            features=[{'key': 'n', 'value': 2, 'reason': None, 'valid_count': 2, 'invalid_count': 0}],
+            time_basis='backend_processed_at_historical', completeness='unknown',
+            completeness_reason='legacy_coverage_unproven', evidence_refs={})
+        session.add(point)
+    for zone in ['UTC', 'America/New_York', 'Pacific/Kiritimati']:
+        with database.session_factory() as session:
+            session.execute(select(func.set_config('TimeZone', zone, True)))
+            api = service(session, catalog)
+            for saved in [api.points(card.id, 50, 0)['items'][0],
+                          api.repository.historical(card.id, body.window_start_utc)]:
+                assert saved.event_time_min == datetime.min.replace(tzinfo=UTC)
+                assert saved.event_time_max == datetime.max.replace(tzinfo=UTC)
+            assert not session.dirty

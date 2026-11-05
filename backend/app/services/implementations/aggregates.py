@@ -12,8 +12,10 @@ from sqlalchemy.exc import DBAPIError
 from ...aggregation.budget import estimate
 from ...aggregation.results import interpret_result
 from ...aggregation.rules import (
+    OPERATORS,
     Limits,
     RuleError,
+    compatible,
     compile_rule,
     field_support_reason,
     operator_catalog,
@@ -150,7 +152,7 @@ class AggregateService:
                    if body.time_basis == "availability_at" else None)
         budget = self._cost(compiled, body.source_id, window.start, window.end, body.time_basis,
                             schedule.duration_seconds, True)
-        values = interpret_result(self.repository.calculate(body.source_id, window.start, window.end, body.time_basis, compiled), compiled)
+        values = interpret_result(self.repository.calculate(body.source_id, window.start, window.end, body.time_basis, compiled), compiled, schedule.duration_seconds)
         # Recheck the actual statement's snapshot, even if writes occurred after
         # estimation. Never return a truncated or over-budget partial result.
         estimate(compiled, values["observed_rows"], budget["source_rows"], schedule.duration_seconds,
@@ -175,7 +177,13 @@ class AggregateService:
         self.repository.limits(self.budget_limits, True)
         if not key or len(key) > 200:
             raise DomainError("idempotency_key_required", "Укажите Idempotency-Key до 200 символов", 422)
-        digest = hashlib.sha256(json.dumps(body.model_dump(mode="json"), ensure_ascii=False,
+        request_document = body.model_dump(mode="json")
+        # Preserve pre-extension idempotency digests as well as rule hashes.
+        # Other legacy nullable fields must retain their original serialization.
+        for feature in request_document["aggregate_rule"]["features"]:
+            if feature.get("percentile") is None:
+                feature.pop("percentile", None)
+        digest = hashlib.sha256(json.dumps(request_document, ensure_ascii=False,
             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         scoped_key = str(actor) + ":" + key
         self.repository.idempotency_lock(scoped_key)
@@ -282,7 +290,9 @@ class AggregateService:
         fields, total = self.catalog.list_fields(query, None, None, None, limit, offset)
         return {"items": [{"name": f.name, "type": f.type, "is_array": f.is_array,
                 "description": f.description, "supported": field_support_reason(f, self.catalog) is None,
-                "reason": field_support_reason(f, self.catalog)}
+                "reason": field_support_reason(f, self.catalog),
+                "operators": [op.name for op in OPERATORS.values()
+                    if field_support_reason(f, self.catalog) is None and compatible(op, f)]}
                 for f in fields], "total": total}
 
     def operators(self):
@@ -292,7 +302,7 @@ class AggregateService:
         from ...aggregation.rules import AggregateRule
         compiled = compile_rule(AggregateRule.model_validate(aggregate.rule), self.catalog, self.budget_limits)
         budget = self._cost(compiled, stored.source_identity, window.start, window.end, "availability_at", stored.duration_seconds, False)
-        values = interpret_result(self.repository.calculate(stored.source_identity, window.start, window.end, "availability_at", compiled), compiled)
+        values = interpret_result(self.repository.calculate(stored.source_identity, window.start, window.end, "availability_at", compiled), compiled, stored.duration_seconds)
         estimate(compiled, values["observed_rows"], budget["source_rows"], stored.duration_seconds, self.budget_limits, False, values.pop("observed_width"))
         return values
 
@@ -362,7 +372,7 @@ class AggregateService:
             from ...aggregation.rules import AggregateRule
             compiled = compile_rule(AggregateRule.model_validate(aggregate.rule), self.catalog, self.budget_limits)
             budget = self._cost(compiled, aggregate.source_identity, window.start, window.end, basis, schedule.duration_seconds, False)
-            values = interpret_result(self.repository.calculate(aggregate.source_identity, window.start, window.end, basis, compiled), compiled)
+            values = interpret_result(self.repository.calculate(aggregate.source_identity, window.start, window.end, basis, compiled), compiled, schedule.duration_seconds)
             estimate(compiled, values["observed_rows"], budget["source_rows"], schedule.duration_seconds, self.budget_limits, False, values.pop("observed_width"))
         completeness, reason, refs = (evaluate_saved_coverage(self.evidence, aggregate.source_identity,
             window.start, window.end, barrier.availability_at) if barrier else ("unknown", "legacy_coverage_unproven", {}))

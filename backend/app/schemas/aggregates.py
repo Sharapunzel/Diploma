@@ -60,6 +60,9 @@ class UTCResponse(Node):
 
 
 class BudgetEstimate(Node):
+    exact_materialized_features: int = 0
+    array_elements_limit: int = 4096
+    statement_columns: int = 0
     estimated_rows: int
     source_rows: int
     operator_weight: int
@@ -158,6 +161,9 @@ class PointPage(Node):
 
 
 class OperatorCard(Node):
+    weight_formula: str = "weight"
+    arity: dict[str, int | None] | None = None
+    compatible_fields: list[dict[str, str | bool]] = Field(default_factory=list)
     name: str
     kind: str
     inputs: list[str]
@@ -169,6 +175,7 @@ class OperatorCard(Node):
 
 
 class AggregateField(Node):
+    operators: list[str] = Field(default_factory=list)
     name: str
     type: str
     is_array: bool

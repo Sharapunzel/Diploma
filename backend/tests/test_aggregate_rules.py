@@ -59,6 +59,9 @@ WEB_RULE = {
 @pytest.mark.parametrize("document", [AUTH_RULE, WEB_RULE])
 def test_two_source_rules_have_stable_hash_and_order(document, catalog):
     compiled = compile_rule(AggregateRule.model_validate(document), catalog)
+    assert compiled.sha256 == (
+        "4bac2c10136fa9c262ced27458b6ca9e5937036e5103faef911feeafc8e6d260" if document is AUTH_RULE
+        else "89caaf11675a2116ff0b0b5d7f1599d7d144361711c2d3e5831bafa1fc604290")
     roundtrip = compile_rule(AggregateRule.model_validate_json(json.dumps(document)), catalog)
     assert roundtrip.sha256 == compiled.sha256
     assert [f.key for f in compiled.rule.features] == [f["key"] for f in document["features"]]
@@ -68,12 +71,11 @@ def test_two_source_rules_have_stable_hash_and_order(document, catalog):
 
 
 @pytest.mark.parametrize("patch,code", [
-    ({"op": "percentile", "field": "network.bytes"}, "unknown_operator"),
+    ({"op": "unknown_statistic", "field": "network.bytes"}, "unknown_operator"),
     ({"op": "sum", "field": "user.id"}, "unsupported_field_type"),
     ({"op": "sum", "field": "event.category"}, "unsupported_field_type"),
     ({"op": "sum", "field": "network.bytes); DROP TABLE app.users;--"}, "unknown_field"),
     ({"op": "count", "field": "user.id"}, "invalid_arguments"),
-    ({"op": "distinct_count", "field": "http.request.body.content"}, "unsupported_field_type"),
     ({"op": "derive", "expr": {"ref": "later"}}, "unknown_or_forward_reference"),
 ])
 def test_rejects_unknown_operations_paths_and_implicit_types(patch, code, catalog):
@@ -190,11 +192,11 @@ def test_worker_import_does_not_load_http_composition():
                     "assert 'app.api.v1.router' not in sys.modules")], check=True)
 
 
-def test_catalog_excludes_future_operations():
+def test_catalog_includes_extended_operations():
     catalog = {entry["name"]: entry for entry in operator_catalog()}
-    assert "percentile" not in catalog and "not" not in catalog
+    assert "percentile" in catalog and "not" in catalog
     assert catalog["distinct_count"]["weight"] == 8
-    assert catalog["has_any"]["inputs"] == ("keyword_array",)
+    assert catalog["has_any"]["inputs"] == ("typed_array",)
 
 
 def test_non_finite_literal_is_addressed(catalog):

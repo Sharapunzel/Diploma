@@ -40,10 +40,48 @@ db.dispose()
     output = command([*compose, "exec", "-T", "-e", f"SMOKE_USER={username}",
         "-e", f"SMOKE_PASSWORD={password}", "api", "python", "-c", setup], env=env, capture=True)
     data = json.loads(output.strip().splitlines()[-1])
+    seed = """
+import json,os
+from datetime import UTC,datetime
+from uuid import UUID,uuid4
+from sqlalchemy import select
+from app.config import settings
+from app.db import Database
+from app.models import Source,ParsedLog,ProcessedKafkaRecord
+from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
+from app.normalization.convert import convert_value
+from app.ecs import PackagedEcsCatalog
+db=Database(settings.database_url)
+catalog=PackagedEcsCatalog.load()
+created=convert_value(catalog.get('event.created'),'2000-01-01T05:21:10+05:21:10')
+import time
+if os.environ.get('SMOKE_START'):
+ start=datetime.fromisoformat(os.environ['SMOKE_START'])
+ while datetime.now(UTC)<start:
+  time.sleep(.01)
+offset=int(os.environ.get('SMOKE_OFFSET','1'))
+for index,source_id in enumerate(json.loads(os.environ['SMOKE_SOURCES'])):
+ with db.session_factory.begin() as s:
+  source=s.scalar(select(Source).where(Source.id==UUID(source_id)).with_for_update(read=True))
+  now=datetime.now(UTC);rid=uuid4()
+  record=ProcessedKafkaRecord(id=rid,connection_id=source.connection_id,connection_identity=source.connection_id,kafka_topic_identity=source_id,source_id=source.id,kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=offset,result_status='complete',backend_received_at=now,backend_processed_at=now)
+  ecs={'@timestamp':'2000-01-01T00:00:00Z','source':{'ip':'192.0.2.1'},'cloud':{'entity':{'attributes':{'managed':True}}}}
+  ecs.update({'event':{'category':['authentication'],'outcome':'failure'},'user':{'id':'synthetic-user'}} if index==0 else {'event':{'category':['web']},'http':{'request':{'method':'GET'}},'network':{'bytes':100}})
+  ecs['event'].update({'created':created,'dataset':'synthetic_'+str(index)})
+  ecs['event']['start']=convert_value(catalog.get('event.start'),'0001-01-01T00:00:00Z' if index==0 else '9999-12-31T23:59:59.999999Z')
+  ecs['event']['end']=convert_value(catalog.get('event.end'),'0001-01-01T00:00:00+01:00' if index==0 else '9999-12-31T23:59:59-01:00')
+  event=ParsedLog(source_id=source.id,connection_id=source.connection_id,normalizer_version=1,normalizer_name='synthetic',source_name=source.name,connection_name='synthetic',kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=offset,deduplication_key=str(rid),fluent_bit_collected_at=now,backend_received_at=now,backend_processed_at=now,raw='synthetic',ecs_data=ecs)
+  assert SqlAlchemyProcessingRepository(s).store_event(record,event)
+db.dispose()
+"""
     port = env["HTTPS_BIND" if production else "PROXY_BIND"].split(":")[1]
     origin = f"{'https' if production else 'http'}://localhost:{port}"
     verified = datetime.fromisoformat(data["verified_from"])
-    anchor = verified.replace(microsecond=0) + timedelta(seconds=1)
+    anchor = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=4)
+    assert anchor > verified
+    command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
+             "-e", "SMOKE_START=" + anchor.isoformat(), "-e", "SMOKE_OFFSET=0",
+             "api", "python", "-c", seed], env=env)
     deadline = time.monotonic() + 20
     while datetime.now(UTC) < anchor + timedelta(seconds=1):
         assert time.monotonic() < deadline
@@ -56,6 +94,7 @@ db.dispose()
         expect(client.post("/api/v1/auth/local/login", json={"username": username, "password": password}))
         csrf = {"X-CSRF-Token": expect(client.get("/api/v1/auth/session"))["csrf_token"]}
         ids = []
+        expected_features = {}
         for index, source in enumerate(data["sources"]):
             rule = {"features": [{"key": "count", "name": "Count", "op": "count"},
                 {"key": "unique", "name": "Unique", "op": "distinct_count", "field": "user.id"}]}
@@ -69,43 +108,52 @@ db.dispose()
                 rule["features"] += [
                     {"key": "failures", "name": "Failures", "op": "count", "where": {"op": "eq", "field": "event.outcome", "value": "failure"}},
                     {"key": "ratio", "name": "Ratio", "op": "derive", "expr": {"op": "divide", "args": [{"ref": "failures"}, {"ref": "count"}]}}]
+            # Extended operations traverse the same validate/preview/create,
+            # historical and permanent-worker paths as legacy features.
+            rule["where"] = {"op": "all", "args": [rule["where"],
+                {"op": "not", "args": [{"op": "eq", "field": "event.outcome", "value": "ignored"}]},
+                {"op": "not_in", "field": "event.dataset", "value": ["ignored"]},
+                {"op": "starts_with", "field": "event.dataset", "value": "synthetic_"},
+                {"op": "in_cidr", "field": "source.ip", "value": "192.0.2.0/24"},
+                {"op": "between", "field": "event.created", "value": ["1999-01-01T00:00:00Z", "2001-01-01T00:00:00Z"]},
+                {"op": "has_none", "field": "event.category", "value": ["ignored"]}]}
+            rule["features"] += [
+                {"key": "mode", "name": "Mode", "op": "mode_share", "field": "event.dataset"},
+                {"key": "pct", "name": "Percent", "op": "derive", "expr": {"op": "percent", "args": [{"ref": "mode"}]}},
+                {"key": "rate", "name": "Rate", "op": "derive", "expr": {"op": "per_second", "args": [{"ref": "count"}]}},
+                {"key": "present", "name": "Present", "op": "present_count", "field": "source.ip"},
+                {"key": "managed", "name": "Managed", "op": "true_count", "field": "cloud.entity.attributes.managed"},
+                {"key": "date_mode", "name": "Date mode", "op": "mode_count", "field": "event.created"},
+                {"key": "date_share", "name": "Date share", "op": "mode_share", "field": "event.created"},
+                {"key": "boundary_date", "name": "Boundary date", "op": "mode_count", "field": "event.start"},
+                {"key": "invalid_date", "name": "Invalid date", "op": "mode_count", "field": "event.end"},
+                {"key": "r2", "name": "Ratio", "op": "derive", "expr": {"op": "ratio", "args": [{"ref": "managed"}, {"ref": "count"}]}}]
+            if index:
+                rule["features"] += [{"key": op, "name": op, "op": op, "field": "network.bytes",
+                                      **({"percentile": .75} if op == "percentile" else {})}
+                                     for op in ["range", "variance", "stddev", "median", "percentile", "mode_count"]]
             body = {"source_id": source, "aggregate_rule": rule,
                     "schedule": {"boundary": anchor.isoformat(), "timezone": "UTC", "duration_seconds": 1}}
             validated = expect(client.post("/api/v1/aggregates/validate", json=body, headers=csrf))
             preview_body = {**body, "window_start_utc": anchor.isoformat(), "time_basis": "availability_at"}
             preview = expect(client.post("/api/v1/aggregates/preview", json=preview_body, headers=csrf))
             assert preview["completeness"] == "unverified"
+            assert preview["event_count"] == 1
             created = expect(client.post("/api/v1/aggregates", json={**preview_body,
                 "name": "Runtime aggregate", "rule_hash": validated["rule_hash"]},
                 headers={**csrf, "Idempotency-Key": uuid4().hex}), 201)
             ids.append(created["id"])
+            expected_features[created["id"]] = preview["features"]
             historical = expect(client.post(f"/api/v1/aggregates/{created['id']}/historical-points",
                 json={"window_start_utc": anchor.isoformat()}, headers=csrf))
+            assert preview["features"] == historical["features"]
+            assert preview["event_count"] == historical["event_count"] == 1
+            assert [f["key"] for f in preview["features"]] == validated["feature_keys"]
             assert historical["kind"] == "historical" and historical["time_basis"] == "availability_at"
             repeated = expect(client.post(f"/api/v1/aggregates/{created['id']}/historical-points",
                 json={"window_start_utc": anchor.isoformat()}, headers=csrf))
             assert repeated["id"] == historical["id"]
-        seed = """
-import json,os
-from datetime import UTC,datetime
-from uuid import UUID,uuid4
-from sqlalchemy import select
-from app.config import settings
-from app.db import Database
-from app.models import Source,ParsedLog,ProcessedKafkaRecord
-from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
-db=Database(settings.database_url)
-for index,source_id in enumerate(json.loads(os.environ['SMOKE_SOURCES'])):
- with db.session_factory.begin() as s:
-  source=s.scalar(select(Source).where(Source.id==UUID(source_id)).with_for_update(read=True))
-  now=datetime.now(UTC);rid=uuid4()
-  record=ProcessedKafkaRecord(id=rid,connection_id=source.connection_id,connection_identity=source.connection_id,kafka_topic_identity=source_id,source_id=source.id,kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=0,result_status='complete',backend_received_at=now,backend_processed_at=now)
-  ecs={'@timestamp':'2000-01-01T00:00:00Z'}
-  ecs.update({'event':{'category':['authentication'],'outcome':'failure'},'user':{'id':'synthetic-user'}} if index==0 else {'event':{'category':['web']},'http':{'request':{'method':'GET'}},'network':{'bytes':100}})
-  event=ParsedLog(source_id=source.id,connection_id=source.connection_id,normalizer_version=1,normalizer_name='synthetic',source_name=source.name,connection_name='synthetic',kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=0,deduplication_key=str(rid),fluent_bit_collected_at=now,backend_received_at=now,backend_processed_at=now,raw='synthetic',ecs_data=ecs)
-  assert SqlAlchemyProcessingRepository(s).store_event(record,event)
-db.dispose()
-"""
+
         command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
                  "api", "python", "-c", seed], env=env)
         def working(aggregate_id):
@@ -128,8 +176,11 @@ db.dispose()
         time.sleep(2.2)
         command([*compose, "up", "-d", "--no-deps", "--no-build", "aggregate-worker"], env=env)
         command([*compose, "exec", "-d", "-e", "TZ=Pacific/Honolulu", "aggregate-worker", "python", "-m", "app.aggregate_worker"], env=env)
+        command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
+                 "-e", "SMOKE_OFFSET=2", "api", "python", "-c", seed], env=env)
         deadline = time.monotonic() + 20
-        while not all(len(working(aggregate_id)) >= before[aggregate_id] + 2 for aggregate_id in ids):
+        while not all(len(working(aggregate_id)) >= before[aggregate_id] + 2
+                      and sum(p["event_count"] == 1 for p in working(aggregate_id)) >= 2 for aggregate_id in ids):
             assert time.monotonic() < deadline, "Worker did not recover missed windows"
             time.sleep(.1)
         for aggregate_id in ids:
@@ -141,8 +192,19 @@ db.dispose()
                        and p["scheduled_at"] == p["end_utc"] for p in points)
             assert all(p["features"][0]["value"] == p["event_count"] and p["completeness"] != "complete" for p in points)
             event_point = next(p for p in points if p["event_count"] == 1)
+            assert event_point["features"] == expected_features[aggregate_id]
             assert event_point["event_time_min"].startswith("2000-01-01")
+            values = {f["key"]: f for f in event_point["features"]}
+            assert values["mode"]["value"] == 1 and values["pct"]["value"] == 100
+            assert values["rate"]["value"] == 1 and values["present"]["value"] == 1
+            assert values["managed"]["value"] == values["r2"]["value"] == 1
+            assert values["date_mode"]["value"] == values["date_share"]["value"] == 1
+            assert values["boundary_date"]["value"] == 1
+            assert values["invalid_date"] == {"key": "invalid_date", "value": None,
+                "reason": "invalid_input_type", "valid_count": 0, "invalid_count": 1}
+            assert all(f["reason"] is None for key, f in values.items() if key != "invalid_date")
             if aggregate_id == ids[1]:
+                assert [values[op]["value"] for op in ["range", "variance", "stddev", "median", "percentile", "mode_count"]] == [0, 0, 0, 100, 100, 1]
                 assert event_point["features"][2]["value"] == 100
             else:
                 assert event_point["features"][3]["value"] == 1

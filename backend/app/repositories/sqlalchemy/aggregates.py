@@ -1,9 +1,11 @@
 """PostgreSQL queries for immutable aggregates and their snapshots."""
 
+from datetime import UTC
 from uuid import UUID
 
 from sqlalchemy import Text, exists, func, select, text, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ...aggregation.rules import CompiledRule, Limits
 from ...models import (
@@ -33,6 +35,10 @@ class SqlAlchemyAggregateRepository:
         timeout = limits.preview_timeout_ms if preview else limits.working_timeout_ms
         self.session.execute(select(func.set_config("statement_timeout", str(timeout), True)))
         self.session.execute(select(func.set_config("work_mem", f"{limits.work_mem_mb}MB", True)))
+        # Large guarded JSON expressions otherwise trigger LLVM compilation
+        # even for a one-row window. Keep latency bounded by query work rather
+        # than compiling hundreds of transient expression functions per point.
+        self.session.execute(select(func.set_config("jit", "off", True)))
 
     def _base(self, source_id, start, end, basis):
         query = select(ParsedLog.ecs_data).where(ParsedLog.source_id == source_id)
@@ -109,13 +115,26 @@ class SqlAlchemyAggregateRepository:
         working = select(WorkingWindowPoint).where(WorkingWindowPoint.schedule_id == aggregate.schedule_id)
         historical = select(HistoricalAggregatePoint).where(HistoricalAggregatePoint.aggregate_id == aggregate.id)
         total = sum(self.session.scalar(select(func.count()).select_from(q.subquery())) for q in (working, historical))
-        items = list(self.session.scalars(working.order_by(WorkingWindowPoint.start_utc.desc(), WorkingWindowPoint.id).limit(offset + limit)))
-        items += list(self.session.scalars(historical.order_by(HistoricalAggregatePoint.start_utc.desc(), HistoricalAggregatePoint.id).limit(offset + limit)))
+        items = self._point_rows(working.order_by(WorkingWindowPoint.start_utc.desc(), WorkingWindowPoint.id).limit(offset + limit), WorkingWindowPoint)
+        items += self._point_rows(historical.order_by(HistoricalAggregatePoint.start_utc.desc(), HistoricalAggregatePoint.id).limit(offset + limit), HistoricalAggregatePoint)
         items.sort(key=lambda p: (-p.start_utc.timestamp(), str(p.id)))
         return items[offset:offset + limit], total
 
+    def _point_rows(self, query, model):
+        # Preserve ORM snapshots, but transport ECS bounds in technical UTC:
+        # timestamptz's local rendering can exceed Python's range at a boundary.
+        query = query.options(defer(model.event_time_min), defer(model.event_time_max)).add_columns(
+            func.timezone("UTC", model.event_time_min), func.timezone("UTC", model.event_time_max))
+        items = []
+        for point, minimum, maximum in self.session.execute(query):
+            set_committed_value(point, "event_time_min", minimum.replace(tzinfo=UTC) if minimum is not None else None)
+            set_committed_value(point, "event_time_max", maximum.replace(tzinfo=UTC) if maximum is not None else None)
+            items.append(point)
+        return items
+
     def historical(self, aggregate_id, start):
-        return self.session.scalar(select(HistoricalAggregatePoint).where(HistoricalAggregatePoint.aggregate_id == aggregate_id, HistoricalAggregatePoint.start_utc == start))
+        items = self._point_rows(select(HistoricalAggregatePoint).where(HistoricalAggregatePoint.aggregate_id == aggregate_id, HistoricalAggregatePoint.start_utc == start), HistoricalAggregatePoint)
+        return items[0] if items else None
 
     def add_historical(self, point):
         self.session.add(point)
