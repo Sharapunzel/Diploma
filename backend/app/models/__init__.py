@@ -15,6 +15,7 @@ from .app import (
     WorkingWindowPoint,
 )
 from .auth import AuthSession
+from .detectors import Detector, DetectorOutcome, DetectorWarmup, Finding
 from .logs import (
     AvailabilityMarker,
     InputAttestation,
@@ -35,7 +36,11 @@ __all__ = [
     "AppSetting",
     "AuthSession",
     "AvailabilityMarker",
+    "Detector",
+    "DetectorOutcome",
+    "DetectorWarmup",
     "ExternalConnection",
+    "Finding",
     "FluentBitAgent",
     "FluentBitAgentTopic",
     "HistoricalAggregatePoint",

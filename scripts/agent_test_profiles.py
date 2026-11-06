@@ -1596,7 +1596,10 @@ def main() -> None:
     parser.add_argument("--pytest", nargs="*", help="Specific backend test nodes for a focused retry")
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
     parser.add_argument("--aggregate-only", action="store_true", help="Run the aggregate end-to-end scenario without unrelated UI scenarios")
+    parser.add_argument("--rcf", action="store_true", help="Run the mandatory Linux/JVM RCF gate in backend-db")
     args = parser.parse_args()
+    if args.rcf and args.profile != "backend-db":
+        parser.error("--rcf requires backend-db")
     if args.aggregate_only and args.profile != "end-to-end":
         parser.error("--aggregate-only requires end-to-end")
     run = ROOT / ".test_runs" / "runs" / f"task21-{uuid4().hex}"
@@ -1656,6 +1659,8 @@ def main() -> None:
         before = inventory(env)
         (run / "docker-before.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
         env, compose, project = prepare(run, args.profile)
+        if args.rcf:
+            compose += ["--profile", "verification"]
         if args.profile == "external-end-to-end":
             compose += ["-f", str(wazuh_compose_overlay(run, env))]
         print(f"Profile={args.profile}; project={project}; run={run}", flush=True)
@@ -1666,7 +1671,7 @@ def main() -> None:
             print("Resolved Compose config passed isolated-resource checks", flush=True)
             successful = True
             return
-        if args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
+        if args.rcf or args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             builder = project + "_builder"
             command(["docker", "buildx", "create", "--name", builder, "--driver", "docker-container",
                      "--driver-opt", "network=host", "--bootstrap"], env=env)
@@ -1674,7 +1679,14 @@ def main() -> None:
             env["COMPOSE_DOCKER_CLI_BUILD"] = "1"
         if args.profile == "backend-db":
             command([*compose, "up", "-d", "--wait", "postgres"], env=env)
-            if args.pytest:
+            if args.rcf:
+                command([*compose, "build", "ml-verification"], env=env)
+                command([*compose, "run", "--rm", "--no-deps", "ml-verification",
+                         "python", "scripts/run_tests.py", "--temporary", "--pytest",
+                         *(args.pytest or ["tests/ml/rcf_gate.py", "tests/ml/rcf_service.py",
+                                          "tests/test_detector_numeric.py", "tests/test_detector_rules.py",
+                                          "tests/ml/rcf_migrations.py"])], env=env, timeout=600)
+            elif args.pytest:
                 command([sys.executable, "-m", "pytest", "-q", *args.pytest], env=env, cwd=ROOT / "backend")
             else:
                 # The DB profile runs all broker-independent tests through the
@@ -1806,7 +1818,7 @@ def main() -> None:
                         )]
                         print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
                     command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
-                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "aggregate-worker", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp"):
+                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "aggregate-worker", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp", "ml-verification"):
                         image = f"{project}-{service}"
                         matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
                         if image in matches:

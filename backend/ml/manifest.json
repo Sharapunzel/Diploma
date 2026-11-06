@@ -1,0 +1,54 @@
+{
+  "aws_tag": "4.4.0-java",
+  "jre_image": "eclipse-temurin:17.0.17_10-jre-jammy@sha256:e071b8279f46ec62d7d9edcb254fc16589f74219b0808032981aa23f48a36c15",
+  "artifacts": [
+    {
+      "filename": "randomcutforest-core-4.4.0.jar",
+      "url": "https://repo.maven.apache.org/maven2/software/amazon/randomcutforest/randomcutforest-core/4.4.0/randomcutforest-core-4.4.0.jar",
+      "sha256": "2e851c82add6d4bcdd13e5cd85fdd091b8a28185fe104775761e8ff6606fd51b",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "randomcutforest-parkservices-4.4.0.jar",
+      "url": "https://repo.maven.apache.org/maven2/software/amazon/randomcutforest/randomcutforest-parkservices/4.4.0/randomcutforest-parkservices-4.4.0.jar",
+      "sha256": "f6d0c91177536063bd2c66825acec8431972d11895628c8f8b65d18edf6cae01",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "randomcutforest-testutils-4.4.0.jar",
+      "url": "https://repo.maven.apache.org/maven2/software/amazon/randomcutforest/randomcutforest-testutils/4.4.0/randomcutforest-testutils-4.4.0.jar",
+      "sha256": "2f218c41a720add9b7f29335de7bf148d2f58b9b3612eb4160002643a20d400b",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "jackson-databind-2.18.3.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.18.3/jackson-databind-2.18.3.jar",
+      "sha256": "510bdda75a7a6186c5bf33b851239488a1450906ae5757121f2e1cc48a7e108f",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "jackson-core-2.18.3.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.18.3/jackson-core-2.18.3.jar",
+      "sha256": "056bc4d3e5e53ce821450fa97b3f9e0f8dde125cf6da6884353bb1f09582e1d9",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "jackson-annotations-2.18.3.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-annotations/2.18.3/jackson-annotations-2.18.3.jar",
+      "sha256": "8aa5740d80b5a5025508b41bbadbaa1fb3772267c628b2e30681a4f45f8b8931",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "jpype1-1.6.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/c4/a4/6038228e44cbcdb8f96ff2518cd6c577730f31fb62e9f46de7efdfabc2de/jpype1-1.6.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "sha256": "b56d7b662ce353c7f876e9ff3d4e775918348340795801e1f00c3b6241006264",
+      "license": "Apache-2.0"
+    },
+    {
+      "filename": "packaging-25.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl",
+      "sha256": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484",
+      "license": "Apache-2.0 OR BSD-2-Clause"
+    }
+  ]
+}

@@ -10,6 +10,7 @@
 - [Проверочные профили и очистка](agent-test-profiles.md)
 - [Захват времени commit, WAL и доказательства пустого окна](availability-capture.md)
 - [Серверные агрегаты, API, время и ресурсные границы](aggregates.md)
+- [Технический gate официального AWS RCF и числовая подготовка](detectors.md)
 
 - [Тестовая база и миграции](database.md)
 - [Аутентификация и API](authentication.md)

@@ -7,6 +7,7 @@
 ```powershell
 python scripts/agent_test_profiles.py frontend
 python scripts/agent_test_profiles.py backend-db
+python scripts/agent_test_profiles.py backend-db --rcf
 python scripts/agent_test_profiles.py kafka-integration
 python scripts/agent_test_profiles.py end-to-end
 python scripts/agent_test_profiles.py end-to-end --aggregate-only
@@ -14,6 +15,15 @@ python scripts/agent_test_profiles.py external-end-to-end
 python scripts/agent_test_profiles.py smoke-development
 python scripts/agent_test_profiles.py smoke-production
 ```
+
+`backend-db --rcf` собирает закреплённый Linux ML-target и запускает одноразовый
+verification service на сети той же PostgreSQL. JVM heap — 512 MiB,
+контейнер — 1 GiB/2 CPU; внутренний TEST_DATABASE_URL использует postgres:5432.
+Тесты mapper replay, реального сервиса/транзакций и обратимости миграции
+выполняются без skip при отсутствующих Java/JAR. Обычные host-наборы их
+не собирают автоматически. Зависимости, ограничения и точная селекция —
+в [контракте детекторов](detectors.md). Lifecycle inventory/build/run/cleanup
+общий с остальными профилями; постоянно работающий detector-worker не добавлен.
 
 Команды одинаковы для Windows PowerShell и Linux shell. Добавьте `--check-only`, чтобы проверить resolved Compose без запуска сервисов; если внешний профиль при этом скачал Wazuh-образ, он удалит только новый образ. Docker-профиль печатает имя изолированного Compose-проекта и адреса без паролей; успешный запуск завершается кодом 0 после проверки очистки. При ошибке скрипт сообщает точные идентификаторы остатка и путь временного прогона: проверьте принадлежность ресурсов по Compose label и не удаляйте чужие тома. Постоянная проверка раннего отказа и `--check-only` запускается командой `python -m pytest -q scripts/test_agent_test_profiles_cleanup.py`. Не запускайте несколько профилей на одной общей тестовой БД одновременно.
 

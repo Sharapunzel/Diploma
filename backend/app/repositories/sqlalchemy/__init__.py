@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime
 from uuid import UUID
 
@@ -16,6 +17,15 @@ class SqlAlchemyUnitOfWork:
 
     def rollback(self) -> None:
         self.session.rollback()
+
+    @contextmanager
+    def read_snapshot(self):
+        self.session.rollback()
+        self.session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        try:
+            yield
+        finally:
+            self.session.rollback()
 
 
 class SqlAlchemyUserRepository:

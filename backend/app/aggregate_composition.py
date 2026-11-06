@@ -10,6 +10,7 @@ from .ecs import EcsCatalog
 from .repositories.sqlalchemy import SqlAlchemyUnitOfWork
 from .repositories.sqlalchemy.aggregates import SqlAlchemyAggregateRepository
 from .repositories.sqlalchemy.capture import SqlAlchemyCaptureStateRepository
+from .repositories.sqlalchemy.detectors import SqlAlchemyDetectorRepository
 from .repositories.sqlalchemy.evidence import SqlAlchemyCoverageEvidenceRepository
 from .repositories.sqlalchemy.windows import SqlAlchemyWorkingWindowRepository
 from .services.implementations.aggregates import AggregateService
@@ -25,4 +26,5 @@ def build_aggregate_service(session: Session, catalog: EcsCatalog) -> AggregateS
     return AggregateService(SqlAlchemyAggregateRepository(session),
         SqlAlchemyWorkingWindowRepository(session), SqlAlchemyCoverageEvidenceRepository(session),
         CaptureGuard(SqlAlchemyCaptureStateRepository(session), PostgreSQLReplicationSlotAdapter(session)),
-        SqlAlchemyUnitOfWork(session), catalog, limits)
+        SqlAlchemyUnitOfWork(session), catalog, limits,
+        detectors=SqlAlchemyDetectorRepository(session))

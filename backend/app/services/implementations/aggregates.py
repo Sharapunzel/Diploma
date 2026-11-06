@@ -73,9 +73,10 @@ def future_index(schedule, now):
 
 class AggregateService:
     def __init__(self, repository: AggregateRepository, windows, evidence, capture,
-                 uow: UnitOfWork, catalog, limits: Limits = Limits()):
+                 uow: UnitOfWork, catalog, limits: Limits = Limits(), *, detectors):
         self.repository, self.windows, self.evidence = repository, windows, evidence
         self.capture, self.uow, self.catalog, self.budget_limits = capture, uow, catalog, limits
+        self.detectors = detectors
 
     def _source(self, source_id):
         source = self.repository.source(source_id)
@@ -281,6 +282,7 @@ class AggregateService:
             schedule.next_index, aggregate.state, aggregate.archived_at = next_index, "active", None
         elif action == "delete":
             aggregate.state, aggregate.deleted_at, aggregate.deleted_by = "deleted", now, actor
+            self.detectors.stop_for_aggregate(aggregate.id, "aggregate_deleted", now)
         self.uow.commit()
         return self.card(aggregate_id)
 
