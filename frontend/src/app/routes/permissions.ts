@@ -37,6 +37,12 @@ export const navigationGroups = [
     pages: [{ path: "/events", label: "События", permission: "events.read" }],
   },
   {
+    label: "Аномалии",
+    pages: [
+      { path: "/aggregates", label: "Агрегаты", permission: "aggregates.read" },
+    ],
+  },
+  {
     label: "Управление",
     pages: [
       {

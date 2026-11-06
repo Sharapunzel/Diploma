@@ -70,6 +70,21 @@ const AdministrationPage = lazy(() =>
     ({ AdministrationPage }) => ({ default: AdministrationPage }),
   ),
 );
+const AggregatesPage = lazy(() =>
+  import("../../pages/aggregates/AggregatesPage").then((m) => ({
+    default: m.AggregatesPage,
+  })),
+);
+const AggregateCreatePage = lazy(() =>
+  import("../../pages/aggregates/AggregateCreatePage").then((m) => ({
+    default: m.AggregateCreatePage,
+  })),
+);
+const AggregateCardPage = lazy(() =>
+  import("../../pages/aggregates/AggregateCardPage").then((m) => ({
+    default: m.AggregateCardPage,
+  })),
+);
 
 function LoadingStatus() {
   return (
@@ -198,6 +213,8 @@ export function AppRoutes() {
                     <AgentsPage />
                   ) : page.path === "/diagnostics" ? (
                     <DiagnosticsPage />
+                  ) : page.path === "/aggregates" ? (
+                    <AggregatesPage />
                   ) : page.path === "/administration" ? (
                     <AdministrationPage />
                   ) : (
@@ -207,6 +224,22 @@ export function AppRoutes() {
               }
             />
           ))}
+          <Route
+            path="/aggregates/new"
+            element={
+              <Protected permission="aggregates.write">
+                <AggregateCreatePage />
+              </Protected>
+            }
+          />
+          <Route
+            path="/aggregates/:id"
+            element={
+              <Protected permission="aggregates.read">
+                <AggregateCardPage />
+              </Protected>
+            }
+          />
           <Route
             path="/agents/:id"
             element={

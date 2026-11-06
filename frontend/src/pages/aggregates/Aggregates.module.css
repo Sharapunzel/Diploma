@@ -1,0 +1,129 @@
+.page {
+  box-sizing: border-box;
+  width: 100%;
+  position: relative;
+  min-height: 140px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  max-width: 1600px;
+  margin: 0 auto;
+  overflow-wrap: anywhere;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr));
+  gap: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.node {
+  border: 1px solid var(--color-border, #8886);
+  border-radius: 8px;
+  padding: 12px;
+  margin-block: 8px;
+  min-width: 0;
+}
+.children {
+  border-left: 2px solid var(--color-accent);
+  padding-left: 10px;
+  min-width: 0;
+}
+.code {
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 13px/1.5 monospace;
+}
+.scroll {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow: auto;
+}
+.chart {
+  width: 100%;
+  min-width: 240px;
+  height: auto;
+}
+.chartFigure {
+  margin: 0;
+  min-width: 0;
+  width: 100%;
+}
+.chartLabels {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.table {
+  min-width: 640px;
+  border-collapse: collapse;
+  width: 100%;
+}
+.table th,
+.table td {
+  min-width: 128px;
+  padding: 8px;
+  border-bottom: 1px solid #8885;
+  text-align: left;
+  vertical-align: top;
+}
+.table th {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.pointsTable {
+  min-width: 1450px;
+}
+.pointsTable > thead > tr > th:nth-child(1) {
+  min-width: 180px;
+}
+.pointsTable > thead > tr > th:nth-child(2) {
+  min-width: 260px;
+}
+.pointsTable > thead > tr > th:nth-child(3) {
+  min-width: 220px;
+}
+.pointsTable > thead > tr > th:nth-child(4) {
+  min-width: 100px;
+}
+.pointsTable > thead > tr > th:nth-child(5) {
+  min-width: 640px;
+}
+.notice {
+  font-size: 13px;
+  opacity: 0.85;
+}
+.page input,
+.page textarea,
+.page select {
+  max-width: 100%;
+}
+@media (max-width: 480px) {
+  .node {
+    padding: 8px;
+  }
+  .children {
+    padding-left: 4px;
+  }
+  .page {
+    gap: 10px;
+  }
+}

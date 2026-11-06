@@ -10,7 +10,7 @@ from uuid import uuid4
 import httpx
 
 
-def aggregate_runtime_smoke(compose, env, production, command):
+def aggregate_runtime_smoke(compose, env, production, command, browser=None):
     """Exercise the real proxy/API/decoder/worker, including restart and history."""
     username, password = "aggregate-" + uuid4().hex, secrets.token_urlsafe(24)
     setup = """
@@ -60,8 +60,8 @@ if os.environ.get('SMOKE_START'):
  while datetime.now(UTC)<start:
   time.sleep(.01)
 offset=int(os.environ.get('SMOKE_OFFSET','1'))
-for index,source_id in enumerate(json.loads(os.environ['SMOKE_SOURCES'])):
- with db.session_factory.begin() as s:
+with db.session_factory.begin() as s:
+ for index,source_id in enumerate(json.loads(os.environ['SMOKE_SOURCES'])):
   source=s.scalar(select(Source).where(Source.id==UUID(source_id)).with_for_update(read=True))
   now=datetime.now(UTC);rid=uuid4()
   record=ProcessedKafkaRecord(id=rid,connection_id=source.connection_id,connection_identity=source.connection_id,kafka_topic_identity=source_id,source_id=source.id,kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=offset,result_status='complete',backend_received_at=now,backend_processed_at=now)
@@ -82,6 +82,34 @@ db.dispose()
     command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
              "-e", "SMOKE_START=" + anchor.isoformat(), "-e", "SMOKE_OFFSET=0",
              "api", "python", "-c", seed], env=env)
+    # The fixture is one transaction, so both sources have the same real commit
+    # timestamp. Wait for durable WAL materialization before choosing its one-second
+    # preview window; process startup/SQL flush time is not a commit-time oracle.
+    materialized = """
+import json,os,time
+from uuid import UUID
+from sqlalchemy import select
+from app.config import settings
+from app.db import Database
+from app.models import AvailabilityMarker
+sources=[UUID(value) for value in json.loads(os.environ['SMOKE_SOURCES'])]
+db=Database(settings.database_url);deadline=time.monotonic()+20
+while True:
+ with db.session_factory() as s:
+  values=s.scalars(select(AvailabilityMarker.availability_at).where(AvailabilityMarker.kind=='event',AvailabilityMarker.source_identity.in_(sources))).all()
+ if len(values)==len(sources) and all(value is not None for value in values):
+  assert len(set(values))==1, 'Synthetic sources did not share one commit'
+  print(values[0].isoformat());break
+ assert time.monotonic()<deadline, 'Seed event WAL markers were not materialized'
+ time.sleep(.05)
+db.dispose()
+"""
+    committed = command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
+                         "api", "python", "-c", materialized], env=env, capture=True)
+    commit_time = datetime.fromisoformat(committed.strip().splitlines()[-1])
+    print(f"Synthetic seed: requested_start={anchor.isoformat()}, materialized_commit={commit_time.isoformat()}", flush=True)
+    anchor = commit_time.replace(microsecond=0)
+    assert anchor >= verified, "Seed window precedes verified capture history"
     deadline = time.monotonic() + 20
     while datetime.now(UTC) < anchor + timedelta(seconds=1):
         assert time.monotonic() < deadline
@@ -138,7 +166,12 @@ db.dispose()
             preview_body = {**body, "window_start_utc": anchor.isoformat(), "time_basis": "availability_at"}
             preview = expect(client.post("/api/v1/aggregates/preview", json=preview_body, headers=csrf))
             assert preview["completeness"] == "unverified"
-            assert preview["event_count"] == 1
+            assert preview["event_count"] == 1, (
+                f"Aggregate seeded preview mismatch: source_index={index}, "
+                f"start={preview['start_utc']}, end={preview['end_utc']}, "
+                f"observed={preview['observed_rows']}, selected={preview['event_count']}, "
+                f"basis={preview['time_basis']}, quality={preview['completeness']}"
+            )
             created = expect(client.post("/api/v1/aggregates", json={**preview_body,
                 "name": "Runtime aggregate", "rule_hash": validated["rule_hash"]},
                 headers={**csrf, "Idempotency-Key": uuid4().hex}), 201)
@@ -217,6 +250,14 @@ db.dispose()
             time.sleep(.15)
             assert expect(client.get(f"/api/v1/aggregates/{aggregate_id}/points"))["total"] == stable
         command([*compose, "exec", "-T", "api", "python", "-c", change_zone.replace("Asia/Tokyo", "UTC")], env=env)
+        # Keep the same synthetic user, sources, WAL and worker alive for UI compatibility.
+        # The enclosing profile owns the database/Compose cleanup even on browser failure.
+        if browser is not None:
+            browser_ids = browser({"username": username, "password": password,
+                                   "sources": data["sources"], "anchor": anchor.isoformat()})
+            for identity in browser_ids:
+                expect(client.delete(f"/api/v1/aggregates/{identity}", headers=csrf))
+            ids.extend(browser_ids)
         cleanup = """
 import json,os
 from uuid import UUID

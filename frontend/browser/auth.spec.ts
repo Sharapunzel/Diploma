@@ -386,8 +386,43 @@ test("mobile navigation, account layout and viewport bounds", async ({
   page,
 }) => {
   await localLogin(page, "/");
+  const session = await (await page.request.get("/api/v1/auth/session")).json();
+  expect(session.permissions).toEqual(
+    expect.arrayContaining([
+      "connections.read",
+      "sources.read",
+      "agents.read",
+      "normalizers.read",
+      "events.read",
+      "aggregates.read",
+      "users.read",
+      "settings.read",
+    ]),
+  );
+  const expectedLinks = [
+    { label: "Главная", path: "/" },
+    { label: "Подключения", path: "/connections" },
+    { label: "Источники", path: "/sources" },
+    { label: "Агенты", path: "/agents" },
+    { label: "Нормализаторы", path: "/normalizers" },
+    { label: "Диагностика", path: "/diagnostics" },
+    { label: "События", path: "/events" },
+    { label: "Агрегаты", path: "/aggregates" },
+    { label: "Администрирование", path: "/administration" },
+  ];
+  const verifyLinks = async (nav: Locator) => {
+    await expect(nav.getByRole("link")).toHaveCount(9);
+    expect(
+      await nav.getByRole("link").evaluateAll((links) =>
+        links.map((link) => ({
+          label: link.getAttribute("aria-label") || link.textContent?.trim(),
+          path: link.getAttribute("href"),
+        })),
+      ),
+    ).toEqual(expectedLinks);
+  };
   const desktopNav = page.getByRole("navigation", { name: "Основное меню" });
-  await expect(desktopNav.locator(".ant-menu-item-group-title")).toHaveCount(3);
+  await expect(desktopNav.locator(".ant-menu-item-group-title")).toHaveCount(4);
   const desktopGroupHeadings = await desktopNav
     .locator(".ant-menu-item-group-title")
     .evaluateAll((titles) =>
@@ -398,6 +433,7 @@ test("mobile navigation, account layout and viewport bounds", async ({
   expect(desktopGroupHeadings).toEqual([
     "Обработка данных",
     "Анализ данных",
+    "Аномалии",
     "Управление",
   ]);
   const headingAndItemFontSizes = await desktopNav.evaluate((element) => ({
@@ -409,7 +445,14 @@ test("mobile navigation, account layout and viewport bounds", async ({
     item: getComputedStyle(element.querySelector(".ant-menu-item a")!).fontSize,
   }));
   expect(headingAndItemFontSizes.heading).toBe(headingAndItemFontSizes.item);
-  await expect(desktopNav.getByRole("link")).toHaveCount(8);
+  await verifyLinks(desktopNav);
+  await desktopNav.getByRole("link", { name: "Агрегаты", exact: true }).click();
+  await expect(page).toHaveURL(/\/aggregates$/);
+  await expect(page.getByTestId("workspace-title")).toHaveText("Агрегаты");
+  await expect(desktopNav.locator(".ant-menu-item-selected a")).toHaveAttribute(
+    "href",
+    "/aggregates",
+  );
   await desktopNav.getByRole("link", { name: "Администрирование" }).click();
   await expect(page).toHaveURL(/\/administration$/);
   await expect(page.getByTestId("workspace-title")).toHaveText(
@@ -593,7 +636,32 @@ test("mobile navigation, account layout and viewport bounds", async ({
       );
       await expect(
         page.getByTestId("compact-navigation").getByRole("separator"),
-      ).toHaveCount(3);
+      ).toHaveCount(4);
+      const compact = page.getByTestId("compact-navigation");
+      await verifyLinks(compact);
+      expect(
+        await compact
+          .getByRole("separator")
+          .evaluateAll((items) =>
+            items.map((item) => item.getAttribute("aria-label")),
+          ),
+      ).toEqual([
+        "Обработка данных",
+        "Анализ данных",
+        "Аномалии",
+        "Управление",
+      ]);
+      await tabTo(
+        page,
+        compact.getByRole("link", { name: "Агрегаты", exact: true }),
+      );
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(/\/aggregates$/);
+      await expect(
+        compact.getByRole("link", { name: "Агрегаты", exact: true }),
+      ).toHaveAttribute("aria-current", "page");
+      await compact.getByRole("link", { name: "Главная", exact: true }).click();
+      await expect(page).toHaveURL(/\/$/);
       await page.getByRole("button", { name: "Развернуть меню" }).click();
       await expect(
         page.getByTestId("workspace-brand").locator("span"),
@@ -645,7 +713,7 @@ test("mobile navigation, account layout and viewport bounds", async ({
     await mobile.click();
     const nav = page.getByRole("navigation", { name: "Мобильное меню" });
     await expect(nav).toBeVisible();
-    await expect(nav.locator(".ant-menu-item-group-title")).toHaveCount(3);
+    await expect(nav.locator(".ant-menu-item-group-title")).toHaveCount(4);
     const mobileGroupHeadings = await nav
       .locator(".ant-menu-item-group-title")
       .evaluateAll((titles) =>
@@ -656,6 +724,7 @@ test("mobile navigation, account layout and viewport bounds", async ({
     expect(mobileGroupHeadings).toEqual([
       "Обработка данных",
       "Анализ данных",
+      "Аномалии",
       "Управление",
     ]);
     expect(
@@ -676,6 +745,20 @@ test("mobile navigation, account layout and viewport bounds", async ({
     await page.keyboard.press("Escape");
     await expect(mobile).toBeFocused();
     await expect(nav).not.toBeVisible();
+    await mobile.click();
+    await verifyLinks(nav);
+    await nav.getByRole("link", { name: "Агрегаты", exact: true }).click();
+    await expect(page).toHaveURL(/\/aggregates$/);
+    await expect(nav).not.toBeVisible();
+    await expect(page.getByTestId("workspace-title")).toHaveText("Агрегаты");
+    await mobile.click();
+    await expect(nav.locator(".ant-menu-item-selected a")).toHaveAttribute(
+      "href",
+      "/aggregates",
+    );
+    await page.keyboard.press("Escape");
+    await expect(mobile).toBeFocused();
+    await page.goto("/");
 
     const account = page.getByRole("button", {
       name: `Аккаунт: ${username}`,

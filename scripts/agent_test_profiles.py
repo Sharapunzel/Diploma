@@ -1727,7 +1727,24 @@ def main() -> None:
             smoke_http(env, production)
             if args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
                 from aggregate_test_scenarios import aggregate_runtime_smoke
-                aggregate_runtime_smoke(compose, env, production, command)
+                def aggregate_browser(fixtures):
+                    result = run / "aggregate-browser-owned.json"
+                    config = run / "aggregate-browser-config.json"
+                    config.write_text(json.dumps({**fixtures, "result": str(result)}), encoding="utf-8")
+                    browser_env = {**env, "AGGREGATE_BROWSER_CONFIG": str(config),
+                                   "PLAYWRIGHT_BASE_URL": f"http://localhost:{env['PROXY_BIND'].split(':')[1]}"}
+                    if not browser_env.get("PLAYWRIGHT_CHROME_PATH"):
+                        for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                                          r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"):
+                            if Path(candidate).is_file():
+                                browser_env["PLAYWRIGHT_CHROME_PATH"] = candidate
+                                break
+                    command([NPM, "run", "test:browser", "--", "aggregates.live.spec.ts", "aggregates.ui.spec.ts",
+                             "--workers=1", "--output", str(run / "aggregate-browser-results")],
+                            env=browser_env, cwd=ROOT / "frontend", timeout=600)
+                    return json.loads(result.read_text(encoding="utf-8"))
+                aggregate_runtime_smoke(compose, env, production, command,
+                                        browser=aggregate_browser if args.profile == "end-to-end" and args.aggregate_only else None)
             if args.profile in {"smoke-development", "smoke-production"}:
                 oidc_administration_smoke(compose, env, production)
             if args.profile == "smoke-development":

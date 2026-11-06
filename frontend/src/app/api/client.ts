@@ -24,7 +24,10 @@ type AuthEventHandlers = {
   csrfInvalid: () => Promise<void>;
 };
 
-type ApiRequestOptions = RequestInit & { ignoreUnauthorized?: boolean };
+type ApiRequestOptions = RequestInit & {
+  ignoreUnauthorized?: boolean;
+  decodeResponse?: (body: string) => unknown;
+};
 
 export class ApiClient {
   private csrf: string | null = null;
@@ -46,7 +49,11 @@ export class ApiClient {
   }
 
   async request<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
-    const { ignoreUnauthorized = false, ...fetchOptions } = options;
+    const {
+      ignoreUnauthorized = false,
+      decodeResponse,
+      ...fetchOptions
+    } = options;
     const method = (fetchOptions.method || "GET").toUpperCase();
     const headers = new Headers(fetchOptions.headers);
     if (!["GET", "HEAD", "OPTIONS"].includes(method) && this.csrf) {
@@ -76,7 +83,7 @@ export class ApiClient {
       }
       throwIfAborted(controller.signal);
 
-      if (response.status === 204) {
+      if (response.status === 204 && !decodeResponse) {
         throwIfAborted(controller.signal);
         return undefined as T;
       }
@@ -85,7 +92,8 @@ export class ApiClient {
       try {
         const body = await response.text();
         throwIfAborted(controller.signal);
-        if (body) payload = JSON.parse(body) as unknown;
+        if (response.ok && decodeResponse) payload = decodeResponse(body);
+        else if (body) payload = JSON.parse(body) as unknown;
       } catch (error) {
         if (controller.signal.aborted) throw abortError();
         if (isAbort(error)) throw error;

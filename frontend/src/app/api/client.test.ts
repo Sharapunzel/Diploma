@@ -4,6 +4,108 @@ import { ApiClient, ApiError, errorText } from "./client";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("ApiClient", () => {
+  it.each([200, 201, 204, 205])(
+    "always invokes an opt-in decoder for empty success %s",
+    async (status) => {
+      const fetch = vi.fn().mockResolvedValue(
+        new Response(null, {
+          status,
+          headers: { "X-Request-ID": "empty-id" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const decodeResponse = vi.fn(() => {
+        throw new Error("required DTO");
+      });
+      const client = new ApiClient();
+      await expect(
+        client.request("/required", { decodeResponse }),
+      ).rejects.toMatchObject({
+        status,
+        code: "invalid_response",
+        requestId: "empty-id",
+      });
+      expect(decodeResponse).toHaveBeenCalledExactlyOnceWith("");
+      client.cancelPending();
+      expect(fetch.mock.calls[0][1].signal.aborted).toBe(false);
+    },
+  );
+  it("preserves empty successes without a decoder and cleans completed requests", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 205 }));
+    vi.stubGlobal("fetch", fetch);
+    const client = new ApiClient();
+    expect(await client.request("/legacy")).toBeUndefined();
+    expect(await client.request("/legacy")).toBeNull();
+    expect(await client.request("/legacy")).toBeNull();
+    client.cancelPending();
+    expect(
+      fetch.mock.calls.every(([, options]) => !options.signal.aborted),
+    ).toBe(true);
+  });
+  it("keeps auth/error handling independent of the success decoder without replay", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json(
+          {
+            code: "csrf_invalid",
+            message: "private",
+            request_id: "csrf-id",
+            details: null,
+          },
+          { status: 403 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 401 }));
+    vi.stubGlobal("fetch", fetch);
+    const client = new ApiClient(),
+      unauthorized = vi.fn(),
+      csrfInvalid = vi.fn().mockResolvedValue(undefined),
+      decodeResponse = vi.fn();
+    client.setAuthHandlers({ unauthorized, csrfInvalid });
+    await expect(
+      client.request("/x", { method: "POST", decodeResponse }),
+    ).rejects.toMatchObject({ code: "csrf_invalid", requestId: "csrf-id" });
+    await expect(
+      client.request("/x", { decodeResponse }),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(csrfInvalid).toHaveBeenCalledTimes(1);
+    expect(unauthorized).toHaveBeenCalledTimes(1);
+    expect(decodeResponse).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    client.cancelPending();
+    expect(
+      fetch.mock.calls.every(([, options]) => !options.signal.aborted),
+    ).toBe(true);
+  });
+  it("does not decode a response body after cancellation and releases pending state", async () => {
+    let finish!: (body: string) => void;
+    const body = new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+    const fetch = vi
+      .fn()
+      .mockResolvedValue({ status: 200, ok: true, text: () => body });
+    vi.stubGlobal("fetch", fetch);
+    const client = new ApiClient(),
+      controller = new AbortController(),
+      decodeResponse = vi.fn();
+    const request = client.request("/x", {
+      signal: controller.signal,
+      decodeResponse,
+    });
+    await Promise.resolve();
+    controller.abort();
+    finish("{}");
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+    expect(decodeResponse).not.toHaveBeenCalled();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}")));
+    await expect(client.request("/next")).resolves.toEqual({});
+  });
   it("uses same-origin cookies and CSRF for all unsafe methods, including search", async () => {
     const fetchMock = vi
       .fn()

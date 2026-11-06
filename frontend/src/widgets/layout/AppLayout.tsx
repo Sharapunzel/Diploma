@@ -30,10 +30,14 @@ export const AppLayout = observer(({ children }: { children: ReactNode }) => {
       : location.pathname.endsWith("/edit")
         ? "Редактор нормализатора"
         : "Просмотр нормализатора"
-    : location.pathname === homePage.path
-      ? homePage.label
-      : (pages.find((page) => page.path === location.pathname)?.label ??
-        "Страница не найдена");
+    : location.pathname.startsWith("/aggregates/")
+      ? location.pathname === "/aggregates/new"
+        ? "Новый агрегат"
+        : "Карточка агрегата"
+      : location.pathname === homePage.path
+        ? homePage.label
+        : (pages.find((page) => page.path === location.pathname)?.label ??
+          "Страница не найдена");
 
   useEffect(() => {
     layout.setMobileOpen(false);
