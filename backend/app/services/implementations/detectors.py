@@ -9,6 +9,7 @@ from uuid import uuid4, uuid5
 from sqlalchemy.exc import DBAPIError
 
 from ...aggregation.rules import RuleError
+from ...core.errors import DomainError
 from ...detection.contracts import (
     DetectionError,
     ModelConfig,
@@ -17,10 +18,11 @@ from ...detection.contracts import (
     digest,
     feature_vector,
 )
-from ...detection.execution import REASONS, require_owner
+from ...detection.execution import REASONS, reason_details, require_owner, safe_reason
 from ...detection.history import warmup_plan, warmup_summary
 from ...repositories.protocols import UnitOfWork
 from ...repositories.protocols.detectors import DetectorRepository
+from ...schemas.detectors import CreateDetectorRequest, DetectorCard, DetectorPage, DetectorSummary
 
 
 def transaction(method):
@@ -40,6 +42,44 @@ def active(context):
         raise DetectionError("aggregate_inactive")
 
 
+def public_transaction(method):
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except DetectionError as error:
+            self.uow.rollback()
+            code = str(error)
+            if code == "detector_context_not_found":
+                raise DomainError("detector_not_found", "Детектор или агрегат не найден.", 404) from None
+            if code in {"aggregate_inactive", "aggregate_deleted"}:
+                raise DomainError(code, REASONS[code], 409) from None
+            if isinstance(error, StaleCandidate):
+                raise DomainError("detector_conflict", "Состояние детектора изменилось. Прочитайте карточку перед новым действием.", 409) from None
+            raise DomainError("invalid_detector", "Проверьте параметры детектора и ресурсный бюджет.",
+                422, reason_details(code)) from None
+        except DBAPIError as error:
+            self.uow.rollback()
+            code = getattr(error.orig, "sqlstate", "") or ""
+            if error.connection_invalidated or code.startswith("08") or code in {"55P03", "57014", "57P01", "40001", "40P01"}:
+                raise DomainError("detector_unavailable", REASONS["temporary_unavailable"], 503) from None
+            raise
+        except Exception:
+            self.uow.rollback()
+            raise
+    return run
+
+
+def public_reason(value, details=None):
+    if not value:
+        return None
+    code = safe_reason(value)
+    factor = reason_details(value).get("factor")
+    if details:
+        factor = reason_details("resource_budget:" + str(details.get("factor"))).get("factor") or factor
+    return {"code": code, "message": REASONS[code], "factor": factor}
+
+
 def unarchived_start(context, index):
     schedule = context["schedule"]
     left = schedule["anchor_utc"] + timedelta(seconds=index * schedule["duration_seconds"])
@@ -56,6 +96,125 @@ class DetectorService:
         self.repository, self.history, self.windows = repository, history, windows
         self.capture, self.uow, self.models = capture, uow, models
         self.owner = owner
+
+    @public_transaction
+    def command(self, action, actor, key, target=None, payload=None):
+        if not isinstance(key, str) or not key.strip() or len(key) > 200:
+            raise DomainError("invalid_idempotency_key", "Требуется непустой Idempotency-Key до 200 символов.", 422)
+        if action not in {"create", "start", "stop"}:
+            raise DomainError("invalid_detector_action", "Неизвестная команда детектора.", 422)
+        normalized = {}
+        body = None
+        if action == "create":
+            from pydantic import ValidationError
+            try:
+                body = CreateDetectorRequest.model_validate(payload)
+            except ValidationError:
+                raise DomainError("invalid_detector", "Проверьте параметры детектора.", 422) from None
+            normalized = body.model_dump(mode="json")
+            target = body.aggregate_id
+        elif payload:
+            raise DomainError("invalid_detector", "Команда не принимает параметры конфигурации.", 422)
+        fingerprint = digest({"target": str(target), "payload": normalized})
+        stored = self.repository.command(actor, action, key)
+        if stored is not None:
+            if stored["fingerprint"] != fingerprint:
+                raise DomainError("idempotency_conflict", "Ключ уже использован для другой команды.", 409)
+            self.uow.rollback()
+            return self._receipt(stored)
+        if body is not None:
+            target = self._create(body.aggregate_id, actor, body.name, body.config.model_dump(),
+                body.accelerated, body.step_seconds)
+        elif action == "start":
+            self._start(target)
+        else:
+            self._stop(target)
+        receipt = self._receipt(self.repository.receipt(actor, action, key, fingerprint, target))
+        try:
+            self.uow.commit()
+        except Exception as error:
+            # The server cannot distinguish an unacknowledged commit from rollback.
+            raise DomainError("detector_command_unconfirmed", "Результат команды не подтверждён. Прочитайте карточку и повторите тот же запрос с тем же ключом.",
+                503, {"outcome": "unknown", "resolution": "read_card_and_retry_same_key"}) from error
+        return receipt
+
+    @staticmethod
+    def _receipt(row):
+        return {"operation_id": row["id"], **{key: row[key] for key in (
+            "detector_id", "action", "recorded_at", "execution_generation", "start_request_id")}}
+
+    @public_transaction
+    def public_card(self, detector_id):
+        with self.uow.read_snapshot():
+            return DetectorCard.model_validate(self._public_projection(self.repository.public_context(detector_id)))
+
+    @public_transaction
+    def public_list(self, limit=50, offset=0, aggregate_id=None, execution_state=None):
+        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 100000:
+            raise DomainError("invalid_detector_page", "Недопустимые границы страницы.", 422)
+        if execution_state is not None and execution_state not in {
+            "created", "requested", "starting", "running", "stopped", "failed", "terminated"}:
+            raise DomainError("invalid_detector_state", "Неизвестное состояние исполнения.", 422)
+        with self.uow.read_snapshot():
+            contexts, total = self.repository.public_page(limit, offset, aggregate_id, execution_state)
+            return DetectorPage(items=[DetectorSummary.model_validate(self._public_projection(c, summary=True))
+                for c in contexts], total=total, limit=limit, offset=offset)
+
+    def _public_projection(self, context, summary=False):
+        d, a, s = context["detector"], context["aggregate"], context["schedule"]
+        index = d["consumed_index"] + 1 if d["consumed_index"] is not None else d["evaluation_start_index"]
+        scheduled = (context["next_start"] + timedelta(seconds=s["duration_seconds"])) if index is not None else None
+        point = self.repository.public_next_point(s["id"], index) if index is not None else None
+        code = (d["failure_code"] if d["execution_state"] == "failed" else
+            "manual_stop" if d["execution_state"] == "stopped" else
+            "aggregate_deleted" if d["execution_state"] == "terminated" else
+            "warmup_required" if d["execution_state"] == "created" else
+            "aggregate_inactive" if a["state"] != "active" else None)
+        if code is None and d["execution_state"] == "running":
+            code = ("working_point_pending" if point is None else
+                "working_point_gap" if scheduled - timedelta(seconds=s["duration_seconds"]) < point["start_utc"] else
+                "working_point_not_completed" if point["end_utc"] > context["now"] else None)
+        if code is None and d["execution_state"] in {"requested", "starting"}:
+            code = "warmup_required" if d["evaluation_start_index"] is None else None
+
+        def window(value):
+            if value is None:
+                return None
+            if value["kind"] == "skipped":
+                value = {**value, "evaluation_started_at": None, "evaluation_completed_at": None}
+            return {**value, "reason": public_reason(value["reason"]), "late": bool(value["late"])}
+
+        result = {"id": d["id"], "name": d["name"][:200], "aggregate_id": d["aggregate_id"],
+            "aggregate_name": a["name"][:200], "aggregate_state": a["state"],
+            "source_id": a["source_identity"], "source_name": a["source_name"][:200],
+            "created_at": d["created_at"], "execution_state": d["execution_state"], "model_state": d["state"],
+            "accelerated": d["accelerated"], "accelerated_used": d["accelerated_used"],
+            "reason": public_reason(code, (d["last_failure"] or {}).get("details")
+                if d["execution_state"] == "failed" else None),
+            "last_consumed": window(self.repository.public_result(d["id"], d["consumed_index"])),
+            "last_evaluated": window(self.repository.public_result(d["id"], d["evaluated_index"])),
+            "backlog": (max(0, (context["now"] - scheduled) // timedelta(seconds=s["duration_seconds"]) + 1)
+                if scheduled is not None else None),
+            "lag_seconds": max(0, (context["now"] - scheduled).total_seconds()) if scheduled is not None else None}
+        if summary:
+            return result
+        failure = d["last_failure"]
+        warmup = self.repository.public_warmup(d["active_attempt_id"]) if d["active_attempt_id"] else None
+        if warmup is not None and not warmup["inputs"]:
+            warmup = None
+        if warmup is not None:
+            warmup = {**warmup_summary(warmup, d), "cutoff": warmup["cutoff"],
+                "step_seconds": d["step_seconds"], "required_windows": ModelConfig(**d["config"]).minimum_inputs,
+                "status": warmup["status"], "reason": public_reason(warmup["reason"] or d["reason"])}
+        return {**result, "config": d["config"], "feature_keys": d["feature_keys"],
+            "feature_names": [name[:200] for name in d["feature_names"]], "anchor_utc": s["anchor_utc"],
+            "duration_seconds": s["duration_seconds"], "step_seconds": d["step_seconds"],
+            **{key: d[key] for key in ("revision", "execution_generation", "start_request_id", "start_requested_at",
+                "execution_started_at", "stopped_at", "updated_at")},
+            "last_failure": {"reason": public_reason(failure.get("code"), failure.get("details")),
+                "at": failure["at"], "start_request_id": failure.get("start_request_id")} if failure else None,
+            "warmup": warmup, "recovery": self.repository.public_recovery(d["id"]),
+            "next_scheduled_at": scheduled, "waiting_for_point": point is None if index is not None else None}
 
     def _execution(self, context):
         require_owner(self.owner)
@@ -96,8 +255,14 @@ class DetectorService:
 
     @transaction
     def start(self, detector_id):
+        self._start(detector_id)
+        self.uow.commit()
+        return self.state(detector_id)
+
+    def _start(self, detector_id):
         context = self.repository.lock_context(detector_id)
-        if context["aggregate"]["state"] == "deleted" or context["detector"]["state"] == "stopped":
+        if (context["aggregate"]["state"] == "deleted" or context["detector"]["state"] == "stopped"
+                or context["detector"]["execution_state"] == "terminated"):
             raise DetectionError("aggregate_deleted")
         active(context)
         detector = context["detector"]
@@ -105,16 +270,17 @@ class DetectorService:
             if detector["checkpoint"] is not None and detector["execution_state"] == "stopped":
                 self.repository.record_recovery(context, "manual_resume", 0)
             self.repository.control(context, "requested", new_request=True)
-        self.uow.commit()
-        return self.state(detector_id)
 
     @transaction
     def stop(self, detector_id):
+        self._stop(detector_id)
+        self.uow.commit()
+        return self.state(detector_id)
+
+    def _stop(self, detector_id):
         context = self.repository.lock_context(detector_id)
         if context["detector"]["execution_state"] not in {"stopped", "terminated"}:
             self.repository.control(context, "stopped", "manual_stop")
-        self.uow.commit()
-        return self.state(detector_id)
 
     @transaction
     def acquire_owner(self, owner_id, backend_pid):
@@ -190,6 +356,11 @@ class DetectorService:
 
     @transaction
     def create(self, aggregate_id, actor, name, config=None, accelerated=False, step=None):
+        identity = self._create(aggregate_id, actor, name, config, accelerated, step)
+        self.uow.commit()
+        return identity
+
+    def _create(self, aggregate_id, actor, name, config=None, accelerated=False, step=None):
         context = self.repository.aggregate_context(aggregate_id, True)
         active(context)
         aggregate, schedule = context["aggregate"], context["schedule"]
@@ -217,7 +388,6 @@ class DetectorService:
             "feature_names": [f["name"] for f in features], "rule_hash": aggregate["rule_hash"],
             "state": "waiting", "reason": "warmup_required", "revision": 0,
             "accelerated": accelerated, "step_seconds": step, "accelerated_used": False})
-        self.uow.commit()
         return identity
 
     @transaction

@@ -3,11 +3,41 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Text, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..db import Base
+
+
+class DetectorCommand(Base):
+    __tablename__ = "detector_commands"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "action", "key", name="uq_detector_command_scope"),
+        CheckConstraint("action IN ('create','start','stop')", name="action_valid"),
+        CheckConstraint("length(key) BETWEEN 1 AND 200 AND btrim(key) <> ''", name="key_valid"),
+        CheckConstraint("length(fingerprint) = 64", name="fingerprint_valid"),
+        CheckConstraint("execution_generation >= 0", name="generation_valid"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    actor_id: Mapped[UUID] = mapped_column()
+    action: Mapped[str] = mapped_column(Text)
+    key: Mapped[str] = mapped_column(Text)
+    fingerprint: Mapped[str] = mapped_column(Text)
+    detector_id: Mapped[UUID] = mapped_column(ForeignKey("logs.detectors.id", ondelete="RESTRICT"))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    execution_generation: Mapped[int] = mapped_column(BigInteger)
+    start_request_id: Mapped[UUID | None] = mapped_column()
 
 
 class Detector(Base):

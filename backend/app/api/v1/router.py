@@ -5,6 +5,7 @@ from .endpoints.agents import router as agents_router
 from .endpoints.aggregates import router as aggregates_router
 from .endpoints.auth import router as auth_router
 from .endpoints.connections import router as connections_router
+from .endpoints.detectors import router as detectors_router
 from .endpoints.diagnostics import router as diagnostics_router
 from .endpoints.ecs import router as ecs_router
 from .endpoints.events import router as events_router
@@ -28,3 +29,4 @@ router.include_router(events_router)
 router.include_router(parsed_logs_router)
 router.include_router(diagnostics_router)
 router.include_router(aggregates_router)
+router.include_router(detectors_router)

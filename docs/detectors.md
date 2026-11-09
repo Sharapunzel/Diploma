@@ -3,8 +3,171 @@
 Сервис создаёт конфигурацию, сохраняет входы прогрева, обрабатывает одну
 следующую working point и атомарно сохраняет checkpoint, курсор, outcome и
 находку. Постоянный `detector-worker` выполняет явно разрешённую работу в обоих
-Compose-режимах. Пользовательские HTTP и UI относятся к следующим задачам.
+Compose-режимах. HTTP управления и диагностики описан ниже; UI относится к TASK-37.
 Техническая готовность модели не гарантирует качество обнаружения.
+
+## HTTP управления и диагностики
+
+Все маршруты имеют префикс `/api/v1/detectors`. Они используют серверную
+сессию; POST также требуют `X-CSRF-Token`. Миграция `0020_detector_commands`
+добавляет `detectors.read` и `detectors.write` существующей системной роли
+администратора. Гость этих прав не получает. Проверка прав выполняется при
+каждом запросе, в том числе при повторе ранее принятой команды. API работает
+без JRE/JPype/JAR и не вызывает модель, подготовку истории или worker по HTTP.
+
+| Метод | Успех / DTO | Право |
+| --- | --- | --- |
+| `POST /detectors` | 201 `DetectorCommandReceipt` | `detectors.write` |
+| `GET /detectors` | 200 `DetectorPage` | `detectors.read` |
+| `GET /detectors/{id}` | 200 `DetectorCard` | `detectors.read` |
+| `POST /detectors/{id}/start` | 202 `DetectorCommandReceipt` | `detectors.write` |
+| `POST /detectors/{id}/stop` | 200 `DetectorCommandReceipt` | `detectors.write` |
+
+Примеры JSON создания (подставьте UUID сохранённого активного агрегата):
+
+```json
+{"aggregate_id":"00000000-0000-4000-8000-000000000100","name":"Число событий"}
+```
+
+```json
+{"aggregate_id":"00000000-0000-4000-8000-000000000100","name":"Ускоренный прогрев","accelerated":true,"step_seconds":60,"config":{"trees":100,"sample_size":256,"output_after":256,"seed":42}}
+```
+
+Во втором примере длительность агрегата должна быть не меньше 60 секунд.
+Config можно передать частично; defaults: trees=100, sample_size=256,
+output_after=256, seed=42. Размерность/ключи/порядок признаков определяет сервер.
+Все целые строгие: bool, дроби и числовые строки не подходят; неизвестные поля
+отвергаются, включая dimensions и параметры runtime. Имя обрезается по внешним
+пробелам, затем имеет длину 1–200. В обычном режиме step отсутствует/null;
+любое заданное значение отвергается. В ускоренном режиме нужен целый шаг
+1..duration включительно. Принятые ограничения ModelConfig/ресурсной оценки
+действуют и здесь. Создание не проверяет историю и оставляет execution=created.
+Разные намерения создания одного агрегата дают независимые модели.
+
+### Ключи, квитанции и потерянный ответ
+
+Для каждого POST нужен `Idempotency-Key`: строка до 200 символов, содержащая
+непробельный символ. На одно намерение клиент создаёт один ключ и сохраняет
+его вместе с телом до подтверждения результата. Scope — actor UUID из сессии,
+action и точное значение ключа. SHA-256 включает target и нормализованный body:
+UUID в стандартном виде, обрезанное имя, все defaults config, явные
+accelerated=false/step=null при их отсутствии. Порядок JSON-полей не влияет.
+Ключи не обрезаются; их содержимое клиент не должен менять при повторе.
+
+Квитанция имеет только `operation_id`, `detector_id`, `action` (create/start/stop),
+`recorded_at` (aware UTC), `execution_generation` (целое) и `start_request_id`
+(UUID/null). recorded_at — часы БД внутри транзакции регистрации, а не WAL-время
+commit. Квитанция выдаётся после подтверждённого commit. Поколение и start UUID
+относятся к принятой операции; текущую карточку нужно читать отдельным GET.
+
+Тот же actor/action/key с теми же параметрами возвращает первоначальные
+квитанцию и код успеха. Другой target/body даёт 409 idempotency_conflict.
+Повтор старого start после stop не запускает модель; старый stop после нового
+start не останавливает её. Старое создание остаётся повторяемым после start
+или удаления агрегата. Повтор failed-start с прежним ключом не создаёт новую
+попытку: новый ручной запуск требует нового ключа. Авторизация всегда текущая.
+
+Command-key lock предшествует schedule-lock и detector-lock. Журнал с unique
+constraint `(actor_id,action,key)` и предметное изменение фиксируются одним
+сервисным UoW/commit. Репозитории не коммитят. CLI переиспользует те же внутренние
+операции без HTTP-журнала и сохраняет прежние результаты. Разные команды
+сериализуются lifecycle-блокировками; порядок определяется транзакциями,
+а не временем клика. Незавершённого processing-key после rollback нет.
+Журнал долговечный, без TTL; downgrade 0020 сознательно удаляет его и новые
+права, сохраняя существующие модели, историю и остальные права/сессии.
+
+При потере ответа нельзя автоматически создавать новый ключ или обещать,
+что изменение не произошло. `503 detector_command_unconfirmed` содержит
+`details.outcome=unknown` и `resolution=read_card_and_retry_same_key`.
+Прочитайте GET карточки (для создания UUID может ещё быть неизвестен), затем
+явно повторите исходный POST с теми же body/key для получения квитанции.
+Потеря acknowledgement после commit не создаёт вторую модель/попытку.
+
+Start/stop принимают пустое тело либо `{}`. `202 start` подтверждает короткую
+команду, после которой GET показывает requested. Историю/модель готовит worker:
+starting, затем running либо failed с причиной. GET и новые события не повторяют
+неудавшийся запуск. При checkpoint start продолжает прежний курсор и backlog.
+Start уже requested/starting/running не создаёт новую попытку. Stop не ждёт JVM;
+повтор для stopped/terminated не повышает generation. Удалённый/архивный
+агрегат не допускает новый start; удаление сохраняет доступную карточку истории.
+
+### DTO чтения и nullable
+
+`GET /detectors?limit=50&offset=0&aggregate_id=UUID&execution_state=running`
+принимает limit=1..100, offset=0..100000; оба фильтра необязательны.
+`DetectorPage` содержит items, total, limit, offset. Фильтры у total и items
+одинаковы, сортировка created_at DESC, id DESC. Возвращаются все execution
+states, включая created/stopped/failed/terminated, без исключения удалённой истории.
+
+`DetectorSummary` содержит:
+
+| Поля | Смысл / null |
+| --- | --- |
+| id/name, aggregate_id/aggregate_name/aggregate_state, source_id/source_name, created_at | UUID и сохранённые имена; aggregate_state=active/archived/deleted |
+| execution_state, model_state | Раздельные перечисления из таблицы состояний; running не подтверждает health процесса |
+| accelerated, accelerated_used | Настройка и provenance успешного ускоренного прогрева; used означает 🔥, без оценки опасности |
+| reason | `{code,message,factor}` либо null; factor только известный ресурсный фактор/null, русское сообщение по allowlist |
+| last_consumed, last_evaluated | Отдельные `DetectorWindow` либо null до соответствующего перехода |
+| backlog, lag_seconds | Число наступивших окон от следующей границы / задержка этой границы; null до подтверждённой границы оценки, даже при начатом прогреве |
+
+DetectorWindow: точный целый index, kind=evaluated/skipped, safe reason/null,
+start_utc/end_utc/scheduled_at, aggregation_started_at/aggregation_completed_at,
+evaluation_started_at/evaluation_completed_at (null для skipped), late.
+Skipped продвигает только consumed, поэтому last_evaluated может относиться
+к более раннему окну либо отсутствовать. Точные индексы/config не приводятся к float.
+
+`DetectorCard` добавляет:
+
+| Поля | Смысл / null |
+| --- | --- |
+| config | dimensions/trees/sample_size/output_after/seed, целые неизменяемые значения |
+| feature_keys/feature_names | Полные закреплённые списки в серверном порядке |
+| anchor_utc/duration_seconds/step_seconds | Неизменяемое UTC-расписание и шаг прогрева |
+| revision/execution_generation/updated_at | Сохранённые revision, поколение и время |
+| start_request_id/start_requested_at/execution_started_at/stopped_at | Текущая идентичность запроса и сохранённые даты; null до появления соответствующего факта |
+| last_failure | `{reason,at,start_request_id}` либо null; прошлый failure не подменяет reason текущего запуска |
+| warmup | Сводка активной сохранённой попытки либо null, когда попытки ещё нет или её batch пуст |
+| recovery | Последний диапазон `{reason,first_index,last_index,started_at}` либо null; reason=crash_recovery/manual_resume |
+| next_scheduled_at/waiting_for_point | Следующий срок с учётом intentional archive / отсутствие готовой точки; null до границы оценки |
+
+Warmup содержит cutoff, step_seconds, required_windows (минимум ModelConfig),
+planned_windows, materialized_windows, feature_valid_windows, eligible_windows,
+ineligible_windows, materialized_coverage_seconds, eligible_coverage_seconds,
+readiness (model state), reason/null и status=preparing/prepared/waiting/ready.
+Числа и охват выводятся общей warmup_summary только из сохранённых фактов.
+Пустая/ещё не материализованная попытка даёт null. Покрытие —
+объединение интервалов; 512 перекрывающихся точек не означают 512 независимых
+периодов или 100% готовности. Решение ready подтверждает worker, не процент.
+
+Каждый GET читает один read-only REPEATABLE READ snapshot без изменения
+revision, модели, курсора или ключей. Все даты — aware UTC; TimeZone БД не
+меняет значения/расчёты. Список ограничен 100 строками. На строку читаются только
+последние consumed/evaluated outcomes и одна следующая граница; карточка читает
+один последний recovery и максимум 4096 лёгких записей metadata прогрева.
+Имена в публичных ответах ограничены 200 символами. reason/message берутся из
+фиксированного словаря; factor только из allowlist. Feature keys/config сохраняют
+пределы принятых агрегаторного и модельного бюджетов, без нового порога числа признаков.
+SQL-проекции не материализуют checkpoint, inputs-векторы, outcomes/findings payload,
+события, runtime paths, PID, токены и полный массив recovery/archive истории.
+Подготовка новых точек ради GET не выполняется.
+
+Ошибки сохраняют envelope `{code,message,request_id,details}` и X-Request-ID:
+401 — нет/истекла сессия; 403 — право/CSRF; 404 — неизвестный UUID ресурса;
+422 — DTO/config/step/key; 409 — lifecycle или конфликт ключа; 503 — известная
+временная недоступность/таймаут либо неизвестный commit с явным outcome.
+Непредвиденные ошибки остаются безопасными 500 общего механизма.
+Детали драйвера/SQL/исходный DetectionError в ответы не включаются.
+
+Адресная проверка HTTP и команд:
+
+```powershell
+python -B scripts/agent_test_profiles.py backend-db --pytest tests/test_detector_api.py
+```
+
+Тесты используют настоящий app/router/session/CSRF и PostgreSQL, независимые
+соединения, rollback/потерю acknowledgement, lifecycle/replay, bounded projections,
+UTC, миграцию 0019→0020 и downgrade/upgrade. Полные проверки ревью выбирает
+Этапный архитектор по влиянию; новый API не добавляет frontend-потребителя.
 
 ## Воспроизведение
 
@@ -204,7 +367,7 @@ prepare-warmup/warmup/advance-one возвращают `managed_worker_required`
 указанием start/state. Сервисные операции требуют проверенного ExecutionOwner.
 Пароли не передаются аргументами.
 При неизвестном исходе сначала прочитайте state; автоматического повторного
-обучения нет. Клиентский HTTP/API и права интерфейса здесь не вводятся.
+обучения нет. HTTP использует отдельные права и долговечные квитанции, описанные ниже.
 
 Полная регрессия прежнего backend: `python -B scripts/agent_test_profiles.py kafka-integration`.
 ML/DB и обратимость миграции: `python -B scripts/agent_test_profiles.py backend-db --rcf`.

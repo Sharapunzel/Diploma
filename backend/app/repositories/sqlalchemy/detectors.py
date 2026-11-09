@@ -21,6 +21,7 @@ from ...models import (
     Aggregate,
     AggregateSchedule,
     Detector,
+    DetectorCommand,
     DetectorCoordinator,
     DetectorOutcome,
     DetectorRecovery,
@@ -51,6 +52,121 @@ def single_flush(method):
 class SqlAlchemyDetectorRepository:
     def __init__(self, session):
         self.session = session
+
+    def command(self, actor, action, key):
+        # Dedicated signed int64 namespace derived from all scope components.
+        # A hash collision only serializes unrelated commands; uniqueness is SQL.
+        token = int(digest([str(actor), action, key])[:16], 16)
+        if token >= 2**63:
+            token -= 2**64
+        self.session.execute(select(func.set_config("lock_timeout", "5000", True)))
+        self.session.execute(select(func.set_config("statement_timeout", "30000", True)))
+        self.session.execute(select(func.pg_advisory_xact_lock(token)))
+        row = self.session.scalar(select(DetectorCommand).where(
+            DetectorCommand.actor_id == actor, DetectorCommand.action == action, DetectorCommand.key == key))
+        return snapshot(row) if row else None
+
+    def receipt(self, actor, action, key, fingerprint, detector_id):
+        values = self.session.execute(select(Detector.execution_generation, Detector.start_request_id).where(
+            Detector.id == detector_id)).one()
+        row = DetectorCommand(id=uuid4(), actor_id=actor, action=action, key=key,
+            fingerprint=fingerprint, detector_id=detector_id,
+            recorded_at=self.session.scalar(select(func.clock_timestamp())),
+            execution_generation=values.execution_generation, start_request_id=values.start_request_id)
+        self.session.add(row)
+        self.session.flush()
+        return snapshot(row)
+
+    def public_page(self, limit, offset, aggregate_id=None, execution_state=None):
+        conditions = []
+        if aggregate_id is not None:
+            conditions.append(Detector.aggregate_id == aggregate_id)
+        if execution_state is not None:
+            conditions.append(Detector.execution_state == execution_state)
+        total = self.session.scalar(select(func.count()).select_from(Detector).where(*conditions))
+        ids = self.session.scalars(select(Detector.id).where(*conditions).order_by(
+            Detector.created_at.desc(), Detector.id.desc()).limit(limit).offset(offset))
+        return [self.public_context(identity) for identity in list(ids)], total
+
+    def public_context(self, detector_id):
+        # Column projections deliberately never instantiate Detector/its checkpoint.
+        columns = [getattr(Detector, key) for key in (
+            "id", "aggregate_id", "name", "created_at", "config", "feature_keys", "feature_names",
+            "state", "reason", "revision", "accelerated", "step_seconds", "accelerated_used",
+            "active_attempt_id", "evaluation_start_index", "consumed_index", "evaluated_index",
+            "updated_at", "execution_state", "execution_generation", "start_request_id",
+            "start_requested_at", "execution_started_at", "stopped_at", "failure_code", "last_failure")]
+        detector = self.session.execute(select(*columns).where(Detector.id == detector_id)).mappings().first()
+        if detector is None:
+            raise DetectionError("detector_context_not_found")
+        detector = {key: utc(value) for key, value in detector.items()}
+        aggregate = self.session.execute(select(Aggregate.schedule_id, Aggregate.name,
+            Aggregate.source_identity, Aggregate.source_name, Aggregate.state
+            ).where(Aggregate.id == detector["aggregate_id"])).mappings().one()
+        schedule = self.session.execute(select(AggregateSchedule.id, AggregateSchedule.anchor_utc,
+            AggregateSchedule.duration_seconds).where(AggregateSchedule.id == aggregate["schedule_id"])).mappings().one()
+        context = {"detector": detector, "aggregate": dict(aggregate),
+            "schedule": {key: utc(value) for key, value in schedule.items()},
+            "now": utc(self.session.scalar(select(func.clock_timestamp())))}
+        index = (detector["consumed_index"] + 1 if detector["consumed_index"] is not None
+                 else detector["evaluation_start_index"])
+        context["next_start"] = None
+        if index is not None:
+            base = context["schedule"]["anchor_utc"] + timedelta(seconds=index * schedule["duration_seconds"])
+            # Return one UTC boundary, never the full archive history.
+            context["next_start"] = utc(self.session.scalar(text("""WITH RECURSIVE boundary(t) AS (
+                SELECT CAST(:base AS timestamptz)
+                UNION ALL
+                SELECT next.t FROM boundary b CROSS JOIN LATERAL (
+                    SELECT max((span->>'end_utc')::timestamptz) AS t
+                    FROM logs.aggregates a, jsonb_array_elements(a.skipped_ranges) span
+                    WHERE a.id=:id AND span->>'reason'='intentional_archive'
+                      AND (span->>'start_utc')::timestamptz <= b.t
+                      AND (span->>'end_utc')::timestamptz > b.t) next WHERE next.t IS NOT NULL
+                ) SELECT max(t) FROM boundary"""), {"base": base, "id": detector["aggregate_id"]}))
+        return context
+
+    def public_warmup(self, attempt_id):
+        # Strip vector/value fields inside PostgreSQL, not after fetching JSONB.
+        # The pure shared summary receives only bounded per-window metadata.
+        row = self.session.execute(text("""SELECT cutoff, plan, status, reason,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object(
+              'start', i->'start', 'end', i->'end', 'completeness', i->'completeness',
+              'quality_reason', i->'quality_reason') ||
+              CASE WHEN i ? 'ml_input' THEN jsonb_build_object('ml_input', true) ELSE '{}'::jsonb END ||
+              CASE WHEN i ? 'exact' THEN jsonb_build_object('exact', true) ELSE '{}'::jsonb END)
+              FROM (SELECT value AS i FROM jsonb_array_elements(inputs) WITH ORDINALITY AS x(value,n)
+                    WHERE n <= 4096) lightweight), '[]'::jsonb) AS inputs
+            FROM logs.detector_warmups WHERE id=:id"""), {"id": attempt_id}).mappings().first()
+        return {**dict(row), "cutoff": utc(row["cutoff"])} if row else None
+
+    def public_recovery(self, detector_id):
+        row = self.session.execute(select(DetectorRecovery.reason, DetectorRecovery.first_index,
+            DetectorRecovery.last_index, DetectorRecovery.started_at).where(
+                DetectorRecovery.detector_id == detector_id).order_by(
+                    DetectorRecovery.started_at.desc(), DetectorRecovery.id.desc()).limit(1)).mappings().first()
+        return {key: utc(value) for key, value in row.items()} if row else None
+
+    def public_result(self, detector_id, index):
+        if index is None:
+            return None
+        row = self.session.execute(select(DetectorOutcome.window_index.label("index"),
+            DetectorOutcome.kind, DetectorOutcome.reason, WorkingWindowPoint.start_utc,
+            WorkingWindowPoint.end_utc, WorkingWindowPoint.scheduled_at,
+            WorkingWindowPoint.actual_started_at.label("aggregation_started_at"),
+            WorkingWindowPoint.actual_completed_at.label("aggregation_completed_at"),
+            DetectorOutcome.data["actual_started_at"].astext.label("evaluation_started_at"),
+            DetectorOutcome.data["actual_completed_at"].astext.label("evaluation_completed_at"),
+            DetectorOutcome.data["late"].as_boolean().label("late")
+            ).join(WorkingWindowPoint, WorkingWindowPoint.id == DetectorOutcome.working_point_id).where(
+                DetectorOutcome.detector_id == detector_id, DetectorOutcome.window_index == index)).mappings().first()
+        return {key: utc(value) for key, value in row.items()} if row else None
+
+    def public_next_point(self, schedule_id, index):
+        row = self.session.execute(select(WorkingWindowPoint.start_utc, WorkingWindowPoint.end_utc).where(
+            WorkingWindowPoint.schedule_id == schedule_id, WorkingWindowPoint.window_index >= index
+            ).order_by(WorkingWindowPoint.window_index).limit(1)).mappings().first()
+        return {key: utc(value) for key, value in row.items()} if row else None
 
     def check_owner(self, owner):
         require_owner(owner)

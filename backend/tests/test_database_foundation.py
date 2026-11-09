@@ -31,6 +31,8 @@ ADMIN_PERMISSIONS = [
     "agents.write",
     "aggregates.read",
     "aggregates.write",
+    "detectors.read",
+    "detectors.write",
 ]
 GUEST_PERMISSIONS = [
     "connections.read",

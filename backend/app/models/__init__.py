@@ -17,6 +17,7 @@ from .app import (
 from .auth import AuthSession
 from .detectors import (
     Detector,
+    DetectorCommand,
     DetectorCoordinator,
     DetectorOutcome,
     DetectorRecovery,
@@ -44,6 +45,7 @@ __all__ = [
     "AuthSession",
     "AvailabilityMarker",
     "Detector",
+    "DetectorCommand",
     "DetectorCoordinator",
     "DetectorOutcome",
     "DetectorRecovery",

@@ -81,6 +81,11 @@ def get_aggregate_service(request: Request, session: Session = Depends(get_sessi
     return build_aggregate_service(session, request.app.state.ecs_catalog)
 
 
+def get_detector_service(request: Request, session: Session = Depends(get_session)):
+    from .detector_composition import build_detector_service
+    return build_detector_service(session, request.app.state.ecs_catalog)
+
+
 def build_auth_service(session: Session, app_settings: Settings) -> AuthService:
     return AuthService(
         users=SqlAlchemyUserRepository(session),

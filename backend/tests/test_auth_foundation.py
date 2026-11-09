@@ -3639,6 +3639,7 @@ def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_
             expected = before[role_id][1] - {
                 "processing_errors.raw.read", "agents.read", "agents.write",
                 "aggregates.read", "aggregates.write",
+                "detectors.read", "detectors.write",
             }
             if role_id == GUEST_ID:
                 expected.add("users.read")  # Rolling back 0013 restores the former permission.
