@@ -2,6 +2,8 @@
 
 Система принимает события от управляемых агентов Fluent Bit через Kafka, нормализует их в ECS и хранит в PostgreSQL. Внешние ECS-документы читаются из OpenSearch-совместимого индексера. Интерфейс построен на React и FastAPI.
 
+Для доработки проекта, в том числе с агентом, начните с [AGENTS.md](AGENTS.md): он задаёт роли, обязательные правила и маршрут чтения. Назначение и границы проекта — в [обзоре](harness/overview.md), состояние этапов — в [дорожной карте](harness/roadmap.md).
+
 ## Быстрый запуск development
 
 Нужны Docker Engine с Compose и Python с зависимостями backend. Из корня репозитория подготовьте локальные Kafka и WAL reader credentials (PowerShell или Linux shell):

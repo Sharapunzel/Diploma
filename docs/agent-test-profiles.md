@@ -1,6 +1,35 @@
 # Проверочные профили агентов
 
-Эта инструкция нужна исполнителю и архитектору для изолированной регрессии и сквозной приёмки.
+Эта инструкция описывает команды единого изолированного контура. Распределение проверок между Исполнителем, Этапным архитектором и Главным архитектором, статусы ревью/приёмки и условия коммита задаёт обязательная [политика тестирования](../harness/testing-policy.md).
+
+## Состав полного прогона
+
+После успешного ревью Этапный архитектор выполняет следующий набор на итоговом варианте задачи. Такой же охват используется при полной приёмке этапа. Отсутствие изменений в компоненте не исключает его из этой фазы.
+
+| Область | Команда из корня проекта или способ проверки |
+| --- | --- |
+| Frontend: типы, lint, форматирование, весь Vitest и сборка | `python -B scripts/agent_test_profiles.py frontend` |
+| Весь обычный backend, PostgreSQL и реальная Kafka | `python -B scripts/agent_test_profiles.py kafka-integration` без `--pytest` |
+| Целевой Linux/JVM RCF, сервис, транзакции, миграции и числовые контракты; Alembic upgrade/check | `python -B scripts/agent_test_profiles.py backend-db --rcf` без `--pytest` |
+| Постоянные тесты подготовки стенда и очистки | `python -B -m pytest scripts/test_prepare_dev_kafka.py scripts/test_agent_test_profiles_cleanup.py` с временными путями в каталоге прогона |
+| Общий pgoutput gate: протокол, replay и потеря слота | `python -B scripts/check_pgoutput_gate.py` |
+| Собственный сквозной путь через UI | `python -B scripts/agent_test_profiles.py end-to-end` |
+| Дополнительные live/UI-сценарии агрегатов | `python -B scripts/agent_test_profiles.py end-to-end --aggregate-only` |
+| Внешний индексер, API и UI | `python -B scripts/agent_test_profiles.py external-end-to-end` |
+| Постоянные браузерные сценарии | Playwright на подготовленном изолированном development/production-контуре; ограничения текущих команд описаны ниже |
+| Запуск, повторный запуск, HTTP(S), сессия, OIDC и TLS | `python -B scripts/agent_test_profiles.py smoke-development` и `python -B scripts/agent_test_profiles.py smoke-production` |
+
+Не повторяйте обычный полный `backend-db` после полного `kafka-integration`: его тесты уже выполнены. Проверки Alembic сохраняются в `backend-db --rcf`. Отдельный `backend-db --wal` не требуется, если прошли оба smoke: они уже выполняют тот же WAL bootstrap-сценарий. Он не заменяет общий `check_pgoutput_gate.py`. Исторический исследовательский `check_commit_timestamp_retention.py` не является обязательной ежедневной регрессией.
+
+Профиль `frontend` не запускает Playwright. Сквозные и smoke-профили подготавливают fixtures и проверяют live-сценарии, но текущий CLI не объединяет все browser specs в один полный запуск: например, `smoke-development` выбирает только один сценарий `auth.spec.ts`, а mock-сценарии `events`, `resources*` и `normalizers*` в профили не включены. `end-to-end --aggregate-only` нужен отдельно: только эта ветка текущего runner запускает `aggregates.live.spec.ts` и `aggregates.ui.spec.ts`. Не называйте весь браузерный набор пройденным по одному `frontend` или smoke.
+
+Остальные браузерные сценарии выполняются на изолированном стенде тех же development Compose-файлов с подготовкой из существующего контура. Полный `auth.spec.ts` требует `PLAYWRIGHT_USERNAME`, `PLAYWRIGHT_PASSWORD` и `PLAYWRIGHT_OIDC=1`; mock-сценариям нужны доступный frontend и `PLAYWRIGHT_BASE_URL`. Из `frontend` mock-набор выбирается командой `npm run test:browser -- events.spec.ts 'resources.*\.spec\.ts' 'normalizers.*\.spec\.ts' --workers=1 --output <абсолютный-каталог-прогона>/browser-results`. Все временные пути и Chromium соответствуют правилам ниже и [resource-policy.md](../harness/resource-policy.md). `playwright.config.ts` не поднимает web server, а профиль CLI не умеет оставлять smoke-стенд работающим: запуск параллельно к завершающемуся smoke по его порту не является воспроизводимым решением. Если для полного браузерного набора требуется автоматизация, её включают в существующий профиль в рамках активной задачи; до выполнения этих сценариев полный браузерный прогон не подтверждён.
+
+## Проверки затронутых областей
+
+До предкоммитной фазы выбирайте тесты по политике роли. Для backend поддерживаются `backend-db --pytest <test nodes>`, `kafka-integration --pytest <test nodes>` и `backend-db --rcf --pytest <test nodes>`. Для frontend из его каталога можно выполнить `npm exec -- vitest run <test files> --maxWorkers=1` и выбранные specs через `npm run test:browser -- <specs>`, соблюдая общие правила временных путей и очистки. Аргумент `--pytest` не ограничивает профиль `frontend`: его текущая реализация всегда запускает весь frontend-профиль.
+
+## Запуск, окружение и очистка
 
 Перед обычным `down` smoke сохраняет в каталоге прогона точные привязки томов к контейнерам своего Compose-проекта. При финальной очистке учитываются и оставшиеся после `down` анонимные тома образов Kafka. Удаление разрешается только для записанной привязки, если том отсутствовал в исходном инвентаре, имеет ожидаемые метки и больше не подключён к контейнеру. Посторонние и исходные тома сохраняются; неопределённая принадлежность приводит к явной ошибке очистки.
 
