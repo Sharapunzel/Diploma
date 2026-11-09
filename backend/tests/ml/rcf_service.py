@@ -12,11 +12,13 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 
+from app.adapters.detector_lock import DetectorSessionLock
 from app.aggregate_composition import build_aggregate_service
 from app.db import Database
 from app.detection.aws_rcf import AwsModelFactory
 from app.detection.contracts import DetectionError, StaleCandidate, digest
-from app.detector_cli import build_detector_service
+from app.detector_composition import build_detector_service as compose_detector_service
+from app.detector_composition import build_worker_detector_service
 from app.ecs import PackagedEcsCatalog
 from app.models import (
     Detector,
@@ -27,7 +29,38 @@ from app.models import (
     Source,
     WorkingWindowPoint,
 )
+from app.repositories.sqlalchemy.detectors import SqlAlchemyDetectorRepository
 from app.schemas.aggregates import AggregatePreviewRequest, CreateAggregateRequest
+
+OWNER = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def coordinator(database):
+    global OWNER
+    lock = DetectorSessionLock(os.environ["TEST_DATABASE_URL"])
+    pid = lock.acquire()
+    assert pid is not None
+    with database.session_factory.begin() as session:
+        OWNER = SqlAlchemyDetectorRepository(session).acquire_owner(uuid4(), pid)
+    yield lock
+    lock.close()
+    OWNER = None
+
+
+def build_detector_service(session, catalog):
+    return compose_detector_service(session, catalog, OWNER)
+
+
+def prepare(service, identity):
+    # Explicit administrative authorization followed by coordinator acceptance.
+    state = service.state(identity)["detector"]["execution_state"]
+    if state not in {"requested", "starting", "running"}:
+        service.start(identity)
+        state = "requested"
+    if state == "requested":
+        service.begin_start(identity)
+    return service.prepare_warmup(identity)
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +154,7 @@ def prepared(setup, accelerated=False, timezone=None):
                                   config={"sample_size": 16, "output_after": 16, "trees": 20},
                                   accelerated=accelerated, step=1 if accelerated else None)
         freeze_attempt_clock(service, setup.cutoff)
-        result = service.prepare_warmup(detector)
+        result = prepare(service, detector)
         assert result["state"] == "prepared", result
         assert service.warmup(detector) == {"state": "ready"}
         assert service.state(detector)["detector"]["accelerated_used"] is accelerated
@@ -158,6 +191,9 @@ def test_warmup_and_first_working_finding(setup, accelerated):
     assert finding["exact_values"] == [1000] and finding["accelerated_used"] is accelerated
     assert finding["event_time_min"] is None and finding["event_time_max"] is None
     assert finding["attribution"] and finding["expected"]
+    with setup.database.session_factory() as session:
+        saved = session.scalar(select(Finding).where(Finding.detector_id == identity))
+        assert not saved.late and saved.data["recovery"] == []
     checkpoint = stored(setup, identity)["checkpoint"]
     assert advance(setup, identity)["reason"] == "working_point_pending"
     assert stored(setup, identity)["checkpoint"] == checkpoint
@@ -270,7 +306,8 @@ def test_corrupt_committed_checkpoint_stops_with_durable_diagnostic(setup):
     state = stored(setup, identity)
     assert state["state"] == "error" and "checkpoint" in state["reason"]
     assert state["consumed_index"] is None and state["checkpoint"] == bad
-    assert advance(setup, identity)["state"] == "waiting"
+    with pytest.raises(DetectionError, match="execution_not_authorized"):
+        advance(setup, identity)
 
 
 def test_constant_history_waits(setup):
@@ -280,7 +317,7 @@ def test_constant_history_waits(setup):
         identity = service.create(setup.card.id, UUID(int=1), "Constant",
                                   config={"sample_size": 16, "output_after": 16})
         freeze_attempt_clock(service, setup.cutoff)
-        assert service.prepare_warmup(identity)["state"] == "prepared"
+        assert prepare(service, identity)["state"] == "prepared"
         assert service.warmup(identity) == {"state": "waiting", "reason": "constant_history"}
 
 
@@ -351,11 +388,68 @@ def test_archive_gap_resume_and_final_delete(setup):
     assert stored(setup, identity)["state"] == "stopped"
 
 
+def test_worker_discards_candidate_archived_during_real_model_and_resumes(setup):
+    from threading import Event
+
+    from app.models import AggregateSchedule
+    from app.services.implementations.detector_worker import DetectorWorker
+
+    history(setup)
+    identity = prepared(setup)
+    point(setup, 480, 1000)
+    with setup.database.session_factory.begin() as session:
+        session.get(AggregateSchedule, setup.card.schedule_id).next_index = 481
+    before = stored(setup, identity)
+    raced = []
+    def build(session, catalog, owner, cancel):
+        service = build_worker_detector_service(session, catalog, owner, cancel)
+        original = service.models.restore
+        def restore(*args):
+            model = original(*args)
+            process = model.process
+            def archive_after_process(values):
+                result = process(values)
+                if not raced:
+                    with setup.database.session_factory() as other:
+                        build_aggregate_service(other, catalog).lifecycle(setup.card.id, "archive", UUID(int=1))
+                    raced.append(True)
+                return result
+            model.process = archive_after_process
+            return model
+        service.models.restore = restore
+        freeze_attempt_clock(service, datetime.now(UTC) + timedelta(days=1))
+        return service
+    worker = DetectorWorker(setup.database.session_factory, build, setup.catalog, Event(), None)
+    worker.owner = OWNER
+    assert worker._step(identity)["state"] == "stale" and raced
+    after = stored(setup, identity)
+    assert after["execution_state"] == "running" and after["state"] == "ready"
+    assert after["failure_code"] is None and after["last_failure"] == before["last_failure"]
+    assert after["checkpoint"] == before["checkpoint"] and after["consumed_index"] == before["consumed_index"]
+    with setup.database.session_factory() as session:
+        assert not session.scalar(select(func.count()).select_from(DetectorOutcome).where(DetectorOutcome.detector_id == identity))
+        assert not session.scalar(select(func.count()).select_from(Finding).where(Finding.detector_id == identity))
+        service = build_detector_service(session, setup.catalog)
+        assert worker._step(identity)["state"] == "waiting"
+        with pytest.raises(DetectionError, match="aggregate_inactive"):
+            service.start(identity)
+        card = build_aggregate_service(session, setup.catalog).lifecycle(setup.card.id, "resume", UUID(int=1))
+        assert card.skipped_ranges
+    assert worker._step(identity)["state"] == "evaluated"
+    point(setup, card.next_index, 2)
+    assert worker._step(identity)["state"] == "evaluated"
+    final = stored(setup, identity)
+    assert final["execution_state"] == "running" and final["consumed_index"] == card.next_index
+    assert final["active_attempt_id"] == before["active_attempt_id"]
+
+
 def test_unknown_hole_never_jumps_cursor(setup):
     history(setup)
     identity = prepared(setup)
     point(setup, 481, 1000)
     assert advance(setup, identity)["reason"] == "working_point_gap"
+    with setup.database.session_factory() as session:
+        assert build_detector_service(session, setup.catalog).state(identity)["diagnostics"]["code"] == "working_point_gap"
     assert stored(setup, identity)["consumed_index"] is None
 
 
@@ -387,14 +481,15 @@ def test_competing_warmup_attempt_cannot_confirm_old_candidate(setup):
         identity = service.create(setup.card.id, UUID(int=1), "Warmup race",
             config={"sample_size": 16, "output_after": 16, "trees": 20})
         freeze_attempt_clock(service, setup.cutoff)
-        service.prepare_warmup(identity)
+        prepare(service, identity)
         original_warmup = service.models.warmup
         def compete(*args):
             checkpoint = original_warmup(*args)
             with setup.database.session_factory() as competing:
                 other = build_detector_service(competing, setup.catalog)
                 freeze_attempt_clock(other, setup.cutoff)
-                assert other.prepare_warmup(identity)["state"] == "prepared"
+                other.stop(identity)
+                assert prepare(other, identity)["state"] == "prepared"
                 assert other.warmup(identity)["state"] == "ready"
             return checkpoint
         service.models.warmup = compete
@@ -418,18 +513,37 @@ def test_real_model_more_than_five_dimensions_and_constant_coordinate():
     assert result["grade"] > 0 and len(result["expected"]) == 7
 
 
-def test_database_timezone_preserves_warmup_and_decisions(setup):
+def test_database_timezone_preserves_warmup_and_decisions(setup, monkeypatch):
+    import time
     history(setup)
-    first = prepared(setup, timezone="Asia/Tokyo")
-    second = prepared(setup, timezone="America/New_York")
-    assert stored(setup, first)["checkpoint"] == stored(setup, second)["checkpoint"]
-    point(setup, 480, 1000)
-    results = []
-    for identity, timezone in [(first, "Asia/Tokyo"), (second, "America/New_York")]:
-        with setup.database.session_factory() as session:
-            session.execute(select(func.set_config("TimeZone", timezone, False)))
-            results.append(build_detector_service(session, setup.catalog).advance_one(identity))
-    assert results[0] == results[1]
+    previous = os.environ.get("TZ")
+    try:
+        monkeypatch.setenv("TZ", "Asia/Tokyo")
+        time.tzset()
+        first = prepared(setup, timezone="Asia/Tokyo")
+        monkeypatch.setenv("TZ", "America/New_York")
+        time.tzset()
+        second = prepared(setup, timezone="America/New_York")
+        assert stored(setup, first)["checkpoint"] == stored(setup, second)["checkpoint"]
+        point(setup, 480, 1000)
+        results = []
+        for identity, timezone in [(first, "Asia/Tokyo"), (second, "America/New_York")]:
+            monkeypatch.setenv("TZ", timezone)
+            time.tzset()
+            with setup.database.session_factory() as session:
+                session.execute(select(func.set_config("TimeZone", timezone, False)))
+                service = build_detector_service(session, setup.catalog)
+                freeze_attempt_clock(service, setup.cutoff + timedelta(seconds=1.1))
+                service.recover(identity)
+                results.append(service.advance_one(identity))
+                assert session.scalar(select(Finding.late).where(Finding.detector_id == identity))
+        assert results[0] == results[1]
+    finally:
+        if previous is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", previous)
+        time.tzset()
 
 
 @pytest.mark.parametrize("phase", ["prepare", "warmup"])
@@ -441,7 +555,7 @@ def test_delete_cancels_unconfirmed_warmup(setup, phase):
             config={"sample_size": 16, "output_after": 16, "trees": 20})
         freeze_attempt_clock(service, setup.cutoff)
         if phase == "warmup":
-            service.prepare_warmup(identity)
+            prepare(service, identity)
             original = service.models.warmup
         else:
             original = service.history.materialize
@@ -455,7 +569,7 @@ def test_delete_cancels_unconfirmed_warmup(setup, phase):
         else:
             service.history.materialize = delete_before_final_save
         with pytest.raises(DetectionError, match="aggregate_inactive"):
-            (service.warmup if phase == "warmup" else service.prepare_warmup)(identity)
+            (service.warmup(identity) if phase == "warmup" else prepare(service, identity))
     state = stored(setup, identity)
     assert state["state"] == "stopped" and state["checkpoint"] is None
 
@@ -486,7 +600,7 @@ def test_legacy_or_unknown_history_waits_without_training(setup):
         freeze_attempt_clock(service, setup.cutoff)
         service.history.aggregates.progress = lambda: SimpleNamespace(
             availability_verified_from_at=None, legacy_cutover_at=setup.cutoff)
-        result = service.prepare_warmup(identity)
+        result = prepare(service, identity)
         assert result["state"] == "waiting" and result["reason"] == "legacy_coverage_unproven"
         assert stored(setup, identity)["checkpoint"] is None
 
@@ -498,6 +612,8 @@ def test_preparation_locks_source_before_detector(setup):
         identity = service.create(setup.card.id, UUID(int=1), "Lock order",
             config={"sample_size": 16, "output_after": 16, "trees": 20})
         freeze_attempt_clock(service, setup.cutoff)
+        service.start(identity)
+        service.begin_start(identity)
         trace = []
         aggregate_context = service.repository.aggregate_context
         lock_source = service.windows.lock_source
@@ -519,7 +635,7 @@ def test_preparation_locks_source_before_detector(setup):
         service.repository.aggregate_context = aggregate
         service.windows.lock_source = source
         service.repository._row = detector
-        assert service.prepare_warmup(identity)["state"] == "prepared"
+        assert prepare(service, identity)["state"] == "prepared"
         assert trace[0] == "schedule" and trace.index("source") < trace.index("detector")
 
 
@@ -537,10 +653,10 @@ def test_source_lock_wait_is_bounded_and_does_not_commit_attempt(setup):
         freeze_attempt_clock(service, setup.cutoff)
         started = time.monotonic()
         with pytest.raises(DBAPIError):
-            service.prepare_warmup(identity)
+            prepare(service, identity)
         assert 4 <= time.monotonic() - started < 12
     state = stored(setup, identity)
-    assert state["revision"] == 0 and state["active_attempt_id"] is None
+    assert state["revision"] == 2 and state["active_attempt_id"] is None
 
 
 @pytest.mark.parametrize("phase", ["fit", "collision", "convert"])
@@ -586,7 +702,7 @@ def test_preparation_deadline_stops_numeric_work_without_committing_batch(setup,
             controlled.setattr(numeric, "exact", counted_exact)
             controlled.setattr(numeric.Affine, "convert", counted_convert)
             controlled.setattr(detector_history.time, "monotonic", lambda: clock["now"])
-            result = service.prepare_warmup(identity)
+            result = prepare(service, identity)
         assert clock["expired_at"] is not None
         assert clock["exact"] - clock["expired_at"] <= 1
         assert clock["exact"] <= {"fit": 601, "collision": 1026, "convert": 1537}[phase]
@@ -773,7 +889,7 @@ def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup):
                 removed.append(True)
             return result
         service.history.aggregates.calculate = delete_during_batch
-        result = service.prepare_warmup(identity)
+        result = prepare(service, identity)
         assert result["state"] == "prepared", result
         attempt = service.repository.attempt(result["attempt_id"])
         assert [item["features"][0]["value"] for item in attempt["inputs"]] == [
@@ -783,3 +899,322 @@ def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup):
         summary = service.state(identity)["warmup"]["summary"]
         assert summary["eligible_windows"] == plan["count"] == 71
         assert summary["eligible_coverage_seconds"] == plan["coverage_seconds"] == 80
+
+
+def test_created_detector_requires_request_and_fenced_owner(setup):
+    history(setup)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Explicit start")
+        assert service.state(identity)["detector"]["execution_state"] == "created"
+        for operation in (service.prepare_warmup, service.warmup, service.advance_one):
+            with pytest.raises(DetectionError, match="execution_not_authorized"):
+                operation(identity)
+        unowned = compose_detector_service(session, setup.catalog)
+        with pytest.raises(DetectionError, match="managed_worker_required"):
+            unowned.prepare_warmup(identity)
+        first = service.start(identity)["detector"]
+        second = service.start(identity)["detector"]
+        assert first["start_request_id"] == second["start_request_id"]
+        assert first["revision"] == second["revision"]
+        assert service.state(identity).get("warmup") is None
+        service.stop(identity)
+        before = service.state(identity)["detector"]
+        assert service.stop(identity)["detector"] == before
+
+
+@pytest.mark.parametrize("phase", ["prepare", "warmup", "advance"])
+def test_manual_stop_fences_every_candidate_and_its_diagnostic(setup, phase):
+    history(setup)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Stop race",
+            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        freeze_attempt_clock(service, setup.cutoff)
+        service.start(identity)
+        service.begin_start(identity)
+        if phase != "prepare":
+            service.prepare_warmup(identity)
+        if phase == "advance":
+            service.warmup(identity)
+            point(setup, 480, 1000)
+            freeze_attempt_clock(service, setup.cutoff + timedelta(seconds=2))
+        before = service.state(identity)["detector"]
+        def stop():
+            with setup.database.session_factory() as other:
+                build_detector_service(other, setup.catalog).stop(identity)
+        if phase == "prepare":
+            original = service.history.materialize
+            def race(*args):
+                result = original(*args)
+                stop()
+                return result
+            service.history.materialize = race
+            operation = service.prepare_warmup
+        elif phase == "warmup":
+            original = service.models.warmup
+            def race(*args):
+                result = original(*args)
+                stop()
+                return result
+            service.models.warmup = race
+            operation = service.warmup
+        else:
+            original = service.models.restore
+            def race(*args):
+                model = original(*args)
+                process = model.process
+                def process_race(values):
+                    result = process(values)
+                    stop()
+                    return result
+                model.process = process_race
+                return model
+            service.models.restore = race
+            operation = service.advance_one
+        with pytest.raises(StaleCandidate):
+            operation(identity)
+        after = service.state(identity)["detector"]
+        assert after["execution_state"] == "stopped" and after["failure_code"] is None
+        assert after["checkpoint"] == before["checkpoint"]
+        assert after["consumed_index"] == before["consumed_index"]
+        with pytest.raises(StaleCandidate):
+            service.fail(identity, "model_process_failed", {"detector": before})
+        assert service.state(identity)["detector"] == after
+
+
+def test_failed_or_interrupted_initial_start_needs_manual_retry(setup):
+    history(setup, constant=True)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Failed start",
+            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        freeze_attempt_clock(service, setup.cutoff)
+        prepare(service, identity)
+        service.warmup(identity)
+        failed = service.state(identity)["detector"]
+        assert failed["execution_state"] == "failed" and failed["failure_code"] == "history_quality"
+        assert failed["last_failure"]["code"] == "history_quality"
+        assert failed["last_failure"]["start_request_id"] == str(failed["start_request_id"])
+        service.recover(identity)
+        assert service.state(identity)["detector"] == failed
+        with pytest.raises(DetectionError, match="execution_not_authorized"):
+            service.prepare_warmup(identity)
+        service.start(identity)
+        service.begin_start(identity)
+        request = service.state(identity)["detector"]["start_request_id"]
+        assert service.state(identity)["detector"]["last_failure"] == failed["last_failure"]
+        service.recover(identity)
+        state = service.state(identity)["detector"]
+        assert state["execution_state"] == "failed" and state["failure_code"] == "start_interrupted"
+        assert state["start_request_id"] == request
+        service.start(identity)
+        assert service.state(identity)["detector"]["start_request_id"] != request
+
+
+@pytest.mark.parametrize("late_materialization", [False, True])
+@pytest.mark.parametrize("reason", ["crash_recovery", "manual_resume"])
+def test_short_recovery_and_manual_backlog_keep_late_until_materialization(setup, reason, late_materialization):
+    history(setup)
+    identity = prepared(setup)
+    # scheduled cutoff+1 has passed; cutoff+2 is still in the future.
+    recovered_at = setup.cutoff + timedelta(seconds=1.1)
+    if not late_materialization:
+        point(setup, 480, 1000)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        freeze_attempt_clock(service, recovered_at)
+        if reason == "manual_resume":
+            service.stop(identity)
+            service.start(identity)
+            service.begin_start(identity)
+            service.resume(identity)
+        else:
+            service.recover(identity)
+            service.recover(identity)  # repeated takeover must retain the range
+        ranges = service.state(identity)["recovery"]
+        assert ranges and all(r["first_index"] == r["last_index"] == 480 for r in ranges)
+        assert all(r["reason"] == reason for r in ranges)
+        before = service.state(identity)["detector"]
+        if late_materialization:
+            assert service.advance_one(identity)["state"] == "waiting"
+            point(setup, 480, 1000)
+        assert service.advance_one(identity)["state"] == "evaluated"
+        after = service.state(identity)["detector"]
+        assert after["active_attempt_id"] == before["active_attempt_id"]
+        assert after["checkpoint"]["body"]["updates"] == before["checkpoint"]["body"]["updates"] + 1
+    with setup.database.session_factory() as session:
+        finding = session.scalar(select(Finding).where(Finding.detector_id == identity))
+        assert finding.late and finding.data["recovery"][0]["reason"] == reason
+
+
+def test_standby_takeover_fences_old_candidate_and_preserves_other_states(setup, coordinator):
+    global OWNER
+    history(setup)
+    identity = prepared(setup)
+    point(setup, 480, 1000)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        expected = service.repository.read_context(identity)
+        service.uow.rollback()
+        standby = DetectorSessionLock(os.environ["TEST_DATABASE_URL"])
+        assert standby.acquire() is None
+        old = OWNER
+        coordinator.close()
+        pid = coordinator.acquire()
+        with setup.database.session_factory.begin() as other:
+            OWNER = SqlAlchemyDetectorRepository(other).acquire_owner(uuid4(), pid)
+        assert OWNER.generation > old.generation
+        with pytest.raises(StaleCandidate, match="ownership_lost"):
+            service._lock(expected)
+        service.uow.rollback()
+        new = build_detector_service(session, setup.catalog)
+        new.recover(identity)
+        assert new.advance_one(identity)["state"] == "evaluated"
+        new.stop(identity)
+        stopped = new.state(identity)["detector"]
+        new.recover(identity)
+        assert new.state(identity)["detector"] == stopped
+
+
+def test_physical_owner_loss_after_flush_rejects_commit(setup, coordinator):
+    global OWNER
+    from sqlalchemy.exc import DBAPIError
+    history(setup)
+    identity = prepared(setup)
+    point(setup, 480, 1000)
+    before = stored(setup, identity)
+    try:
+        with setup.database.session_factory() as session:
+            service = build_detector_service(session, setup.catalog)
+            commit = service.uow.commit
+            def lose_connection_before_commit():
+                coordinator.close()
+                commit()
+            service.uow.commit = lose_connection_before_commit
+            with pytest.raises(DBAPIError, match="ownership lost"):
+                service.advance_one(identity)
+        assert stored(setup, identity)["checkpoint"] == before["checkpoint"]
+        assert stored(setup, identity)["consumed_index"] is None
+    finally:
+        pid = coordinator.acquire()
+        with setup.database.session_factory.begin() as session:
+            OWNER = SqlAlchemyDetectorRepository(session).acquire_owner(uuid4(), pid)
+
+
+def test_manual_resume_consumes_entire_backlog_without_rewarming(setup):
+    history(setup)
+    identity = prepared(setup)
+    point(setup, 480, 2)
+    advance(setup, identity)
+    before = stored(setup, identity)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        service.stop(identity)
+        point(setup, 481, 0, "unknown")
+        point(setup, 482, None)
+        point(setup, 483, 1000)
+        service.start(identity)
+        service.begin_start(identity)
+        with pytest.raises(DetectionError, match="execution_not_authorized"):
+            service.advance_one(identity)
+        service.resume(identity)
+        assert [service.advance_one(identity)["state"] for _ in range(3)] == ["skipped", "skipped", "evaluated"]
+        after = service.state(identity)["detector"]
+        assert after["consumed_index"] == after["evaluated_index"] == 483
+        assert after["active_attempt_id"] == before["active_attempt_id"]
+        assert after["checkpoint"]["body"]["updates"] == before["checkpoint"]["body"]["updates"] + 1
+
+
+def test_added_history_never_retries_failed_start_without_command(setup):
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Missing history",
+            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        freeze_attempt_clock(service, setup.anchor + timedelta(seconds=1))
+        result = prepare(service, identity)
+        assert result["state"] == "waiting"
+        failed = service.state(identity)["detector"]
+        assert failed["execution_state"] == "failed"
+        history(setup)
+        service.recover(identity)
+        assert service.state(identity)["detector"] == failed
+        assert identity not in service.candidates()
+        freeze_attempt_clock(service, setup.cutoff)
+        assert prepare(service, identity)["state"] == "prepared"
+        assert service.warmup(identity)["state"] == "ready"
+
+
+@pytest.mark.parametrize("failure", ["operator_cost", "total_memory", "statement_timeout", "invalid_rule"])
+def test_confirmed_history_failure_finishes_committed_attempt(setup, monkeypatch, failure):
+    from app.aggregation.rules import RuleError
+
+    history(setup)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Budget failure",
+            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        freeze_attempt_clock(service, setup.cutoff)
+        def fail_materialization(*_):
+            if failure == "statement_timeout":
+                # Real PostgreSQL abort: the failure must be saved in a new,
+                # short transaction after rolling back the failed snapshot.
+                session.execute(select(func.set_config("statement_timeout", "20", True)))
+                session.execute(select(func.pg_sleep(.1)))
+            code = "invalid_rule" if failure == "invalid_rule" else "resource_budget_exceeded"
+            raise RuleError(code, failure, "arbitrary private diagnostic")
+        with monkeypatch.context() as controlled:
+            controlled.setattr(service.history, "materialize", fail_materialization)
+            assert prepare(service, identity)["state"] == "waiting"
+        state = service.state(identity)
+        failed = state["detector"]
+        factor = "preparation_seconds" if failure == "statement_timeout" else failure
+        assert failed["execution_state"] == "failed"
+        assert failed["failure_code"] == ("history_quality" if failure == "invalid_rule" else "resource_limit")
+        assert failed["last_failure"]["details"] == ({} if failure == "invalid_rule" else {"factor": factor})
+        assert "private" not in str(state)
+        assert failed["checkpoint"] is None and failed["consumed_index"] is None
+        assert state["warmup"]["status"] == "waiting" and state["warmup"]["inputs"] == []
+        service.recover(identity)
+        assert service.state(identity)["detector"] == failed
+        assert identity not in service.candidates()
+        old_attempt = failed["active_attempt_id"]
+        assert prepare(service, identity)["state"] == "prepared"
+        assert service.state(identity)["detector"]["active_attempt_id"] != old_attempt
+        assert service.warmup(identity)["state"] == "ready"
+
+
+def test_bounded_selection_reaches_models_after_first_page(setup):
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identities = []
+        for _ in range(5):
+            identity = service.create(setup.card.id, UUID(int=1), "Independent")
+            service.start(identity)
+            identities.append(identity)
+        observed, after = [], None
+        while True:
+            page = service.candidates(after, 2)
+            if not page:
+                break
+            observed.extend(page)
+            after = page[-1]
+        assert set(identities) <= set(observed)
+        assert observed == sorted(set(observed))
+
+
+def test_archive_between_request_and_acceptance_fails_once_with_reason(setup):
+    from threading import Event
+
+    from app.services.implementations.detector_worker import DetectorWorker
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Archive race")
+        service.start(identity)
+        build_aggregate_service(session, setup.catalog).lifecycle(setup.card.id, "archive", UUID(int=1))
+    worker = DetectorWorker(setup.database.session_factory, build_worker_detector_service, setup.catalog, Event(), None)
+    worker.owner = OWNER
+    assert worker._step(identity)["state"] == "failed"
+    state = stored(setup, identity)
+    assert state["execution_state"] == "failed" and state["failure_code"] == "aggregate_inactive"
+    assert state["active_attempt_id"] is None

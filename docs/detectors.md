@@ -1,8 +1,9 @@
-# Серверное ядро детекторов AWS RCF
+# Детекторы AWS RCF и постоянный worker
 
 Сервис создаёт конфигурацию, сохраняет входы прогрева, обрабатывает одну
 следующую working point и атомарно сохраняет checkpoint, курсор, outcome и
-находку. Постоянные detector-worker, HTTP и UI относятся к последующим задачам.
+находку. Постоянный `detector-worker` выполняет явно разрешённую работу в обоих
+Compose-режимах. Пользовательские HTTP и UI относятся к следующим задачам.
 Техническая готовность модели не гарантирует качество обнаружения.
 
 ## Воспроизведение
@@ -16,7 +17,7 @@ python -B scripts/agent_test_profiles.py backend-db --rcf
 Штатный runner создаёт изолированные PostgreSQL, сеть, том и Buildx builder,
 проверяет resolved Compose, собирает `backend/Dockerfile.ml`, затем запускает
 одноразовый `ml-verification` на той же сети. Внутри вызывается
-`backend/scripts/run_tests.py --temporary --pytest tests/ml/rcf_gate.py tests/ml/rcf_service.py tests/test_detector_numeric.py tests/test_detector_rules.py tests/ml/rcf_migrations.py`.
+`backend/scripts/run_tests.py --temporary --pytest tests/ml/rcf_gate.py tests/ml/rcf_service.py tests/test_detector_numeric.py tests/test_detector_rules.py tests/ml/rcf_worker.py tests/ml/rcf_migrations.py`.
 `TEST_DATABASE_URL` указывает на `postgres:5432/diploma_test`; runner создаёт
 отдельную временную БД и удаляет её. После проверки, в том числе неуспешной,
 удаляются контейнеры, сеть, том, собственные образы, builder/cache и каталог
@@ -184,7 +185,7 @@ Raw score, anomaly grade и data confidence сохраняются отдель�
 Attribution всегда официальный score-attribution, не процент/значение признака;
 affine к нему не применяется. Finding сохраняет source UUID, имена, точные факты,
 окно, ECS @timestamp range; пустое окно не получает выдуманный диапазон.
-Late=false: recovery-маркировка относится к следующей задаче.
+`late` определяется долговечными recovery-диапазонами, описанными ниже.
 
 ## Административная CLI и проверки
 
@@ -193,13 +194,15 @@ Late=false: recovery-маркировка относится к следующе
 ```bash
 python -m app.detector_cli create AGGREGATE_UUID --actor ADMIN_UUID --name RCF
 python -m app.detector_cli create AGGREGATE_UUID --actor ADMIN_UUID --name RCF --accelerated --step 60
-python -m app.detector_cli prepare-warmup DETECTOR_UUID
-python -m app.detector_cli warmup DETECTOR_UUID
-python -m app.detector_cli advance-one DETECTOR_UUID
+python -m app.detector_cli start DETECTOR_UUID
+python -m app.detector_cli stop DETECTOR_UUID
 python -m app.detector_cli state DETECTOR_UUID
 ```
 
-Команды bounded, без daemon-loop. Пароли не передаются аргументами.
+Start подтверждает постановку запроса, а не завершение прогрева. Прежние
+prepare-warmup/warmup/advance-one возвращают `managed_worker_required` с
+указанием start/state. Сервисные операции требуют проверенного ExecutionOwner.
+Пароли не передаются аргументами.
 При неизвестном исходе сначала прочитайте state; автоматического повторного
 обучения нет. Клиентский HTTP/API и права интерфейса здесь не вводятся.
 
@@ -211,3 +214,134 @@ mapper replay, сбой до commit/потерю ack после commit, stale ca
 sessions, lifecycle, signed coverage через настоящий агрегатный сервис и один
 REPEATABLE READ batch при конкурентном удалении событий. Времена и данные
 синтетические; эти проверки не являются нагрузочным тестом.
+
+## Разрешение исполнения
+
+Готовность модели (`waiting/warming/ready/error`, окончательный `stopped` после
+удаления агрегата) отделена от `execution_state`:
+
+| Значение | Смысл |
+| --- | --- |
+| `created` | Создан без разрешения; worker не готовит историю и не обучает |
+| `requested` | Долговечный запрос пользователя, ещё не принятый worker |
+| `starting` | Worker принял запрос; готовит модель или проверяет checkpoint |
+| `running` | Запуск подтверждён атомарно с checkpoint |
+| `stopped` | Ручная остановка; checkpoint, курсор и история сохранены |
+| `failed` | Подтверждённый неуспех/прерванный запуск; нужен ручной start |
+| `terminated` | Агрегат удалён; start запрещён окончательно |
+
+Миграция 0019 сохраняет старые checkpoints, inputs, outcomes и findings, но не
+выдаёт прежним детекторам разрешение. Start фиксирует UUID запроса,
+start_requested_at по часам БД и новое поколение. Повтор для
+requested/starting/running сохраняет идентичность. Долгих SQL/ML в start нет.
+Stop повышает поколение и revision до возврата, отменяя право прежних кандидатов
+на запись, включая ошибку/inputs. Он не ждёт JVM и не останавливает агрегат или
+соседние детекторы. Повтор stop безопасен.
+
+Неудачный прогрев не повторяется после polling, новых данных или рестарта.
+Pending WAL-барьер — ожидание той же попытки, а не новый cutoff. Начатый
+первоначальный запуск после потери координатора получает start_interrupted и
+ждёт ручного start. Ещё не принятый requested допустимо выполнить после рестарта.
+Потеря acknowledgement разрешается чтением подтверждённой БД.
+
+При checkpoint start проверяет envelope и продолжает прежние модель, cutoff и
+курсор; повреждение даёт checkpoint_invalid, новый лес не создаётся. Все
+накопившиеся доступные точки обрабатываются по порядку. Ручная пауза не создаёт
+пропущенный диапазон агрегата. Неизвестные дыры ждут точку; только признанный
+intentional_archive позволяет обойти отсутствующие индексы. Новый start
+архивного/недоступного агрегата отклоняется. Уже running может ждать его возврата.
+Если агрегат архивирован во время оценки, кандидат отбрасывается без ошибки
+модели и без отзыва разрешения; после resume работа продолжается с checkpoint.
+
+## Владение и recovery
+
+Один координатор на БД удерживает session advisory lock `(1380205362, 1)` на
+отдельном autocommit-соединении. Standby ждёт без recovery. Запись
+logs.detector_coordinator хранит монотонное поколение, UUID владельца, PID
+lock-сессии и время БД. Получение поколения предшествует recovery/вычислениям.
+Общая composition root собирает репозиторий, UnitOfWork и модельную фабрику.
+Сервисный сценарий проверяет физический lock и фиксирует поколение отдельной
+короткой транзакцией до recovery; при ошибке выполняется rollback и переизбрание.
+Публикация takeover и финальный save сериализованы блокировкой этой записи.
+Порядок: coordinator → schedule → Source только для барьера → Detector.
+Start/stop/delete используют schedule → Detector и не ждут ML.
+
+Перед mutation и непосредственно перед commit проверяются session lock в
+pg_locks, UUID/PID/поколение координатора, разрешение/поколение запроса,
+revision/config hash/active attempt/входной курсор. Coordinator row удерживается
+до commit, сериализуя финальную транзакцию и публикацию нового владения.
+Отложенные constraint triggers проверяют LOCAL fencing token на commit:
+потеря физического lock-соединения после flush также откатывает транзакцию.
+После потери lock новое планирование прекращается, незавершённый JVM-кандидат
+отменяется. Rollback/неизвестный commit требуют нового чтения БД; изменённая
+JVM-модель не переиспользуется.
+
+До восполнения running-моделей сохраняются detector_recoveries: первый и
+последний уже наступившие непотреблённые индексы, время БД, поколение и причина
+crash_recovery. Граница выводится из UTC anchor/duration, evaluation_start,
+consumed и scheduled_at, без поиска materialized points. Повторный takeover не
+стирает диапазоны; точка, появившаяся позже, сохраняет происхождение. Ручное
+возобновление сохраняет manual_resume. Outcome и находка содержат применённые
+диапазоны; finding получает late=true. Обычная задержка polling late не создаёт.
+При сроках 10:00/10:05 восстановление в 10:01 уже помечает находку за 10:00.
+
+State читает один REPEATABLE READ snapshot: модель, execution state, запрос,
+безопасную причину, inputs/summary/🔥, recovery, последнее consumed/evaluated окно,
+последнюю неудачу с UTC-временем и идентичностью её запроса (она сохраняется при
+новом start/stop), фактические моменты агрегирования/оценки, следующий scheduled_at, backlog/lag и
+ожидание точки. Отсутствие первой оценки даёт null. Стабильные коды и русские
+объяснения находятся в detection/execution.py: history_insufficient,
+history_quality, resource_limit, checkpoint_invalid, start_interrupted,
+working_point_pending, aggregate_inactive, aggregate_deleted, manual_stop,
+temporary_unavailable. Неподтверждённый отказ БД не объявляется сохранённым.
+Для ресурсной ошибки last_failure.details.factor сохраняет только известный
+фактор бюджета (например model_seconds, checkpoint_bytes, operator_cost или
+total_memory); SQL timeout подготовки даёт preparation_seconds. Подтверждённый
+отказ завершает попытку и требует нового ручного start; произвольный
+текст драйвера в структурированные детали не переносится.
+
+## Поставка и проверки worker
+
+Detector-worker использует принятый Linux ML-target без отдельного Java HTTP
+сервиса. Один кандидат, контейнер 1 GiB/2 CPU, JVM heap 512 MiB, ML timeout
+120 с, подготовка 30 с, shutdown grace 40 с. Образ содержит проверенные JRE/JAR;
+обычный API Java не получает. Worker не публикует порты и получает только URL
+PostgreSQL (production: DATABASE_URL_FILE), без Kafka/OIDC/agent secrets и
+Docker socket. Он ждёт миграций и здорового WAL-декодера.
+
+SIGTERM/SIGINT прекращают планирование, освобождают lock и отменяют дочерний
+Python/JVM-процесс; SQL ограничен timeout. Healthcheck app.detector_health читает
+heartbeat, фазу/deadline и проверяет БД, не запускает JVM. Допустимый долгий шаг
+не считается зависанием; просроченная фаза, умерший цикл и недоступная БД дают
+unhealthy. Standby/отсутствие моделей допустимы. Выбор по UUID с циклическим
+продолжением и ограниченной выборкой обслуживает модели после первых N.
+
+Полный backend-db --rcf включает tests/ml/rcf_worker.py (CLI, health/deadline,
+отмена процесса) и расширенные rcf_service.py (управление, fencing,
+standby/takeover, recovery/late), прежние модельные и миграционные тесты.
+Адресная проверка изменённой поставки:
+
+```powershell
+python -B scripts/agent_test_profiles.py smoke-development --detector-only
+python -B scripts/agent_test_profiles.py smoke-production --detector-only
+```
+
+Профиль доступен Исполнителю и Этапному архитектору и может покрывать smoke
+затронутой поставки worker перед коммитом. UI/OIDC/TLS-agent не добавляются,
+если их пути не затронуты; ограничения запуска лишних сервисов описаны в
+[инструкции профилей](agent-test-profiles.md). Полные smoke и собственный E2E
+выбираются по влиянию либо при полной приёмке этапа; они также включают сценарий: два источника, synthetic saved history,
+обычный/ускоренный режим (здесь шаг=duration; перекрытие проверяет ML/DB),
+реальные WAL/aggregate/RCF worker, обычная/аномальная последовательность,
+сохранённое объяснение и завершение до следующей 5-секундной границы.
+API временно остановлен только на время синтетического обработчика/probe,
+чтобы реальный Kafka-consumer не присваивал его тестовые topic identities.
+Источники включены во время этого входа; после сценария они выключаются и API
+возвращается. Признаки остановки не удаляются и не обходятся.
+Синтетические доказательства синхронизируются тестовой блокировкой первой
+проверки покрытия до готовности реальных WAL-барьеров и свежих checkpoint;
+правила полноты не меняются. Блокировка снята до RCF и входит в замер от
+scheduled_at до подтверждённой видимости обоих outcomes в БД.
+Прежний секундный aggregate smoke сохраняет порог. Running up и down/up проверяют
+сохранность ручной остановки, checkpoint/inputs/history. Предел произвольной
+нагрузки этим сценарием не измеряется.

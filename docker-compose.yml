@@ -1,6 +1,32 @@
 name: diploma
 
 services:
+  detector-worker:
+    platform: linux/amd64
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.ml
+      target: ml
+    command: ["python", "-m", "app.detector_worker"]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 2
+    stop_grace_period: 40s
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-diploma_user}:${POSTGRES_PASSWORD:-diploma_password}@postgres:5432/${POSTGRES_DB:-diploma_db}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      wal-decoder:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.detector_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    networks: [internal]
+
   ml-verification:
     profiles: [verification]
     platform: linux/amd64

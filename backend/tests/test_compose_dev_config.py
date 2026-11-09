@@ -68,3 +68,10 @@ def test_dev_compose_passes_external_key_and_oidc_settings():
         "127.0.0.1:19093,localhost:19093,[::1]:19093,kafka:9092"
     )
     assert config["services"]["api"]["depends_on"]["kafka-acls"]["condition"] == "service_completed_successfully"
+    worker = config["services"]["detector-worker"]
+    assert worker["build"]["dockerfile"] == "Dockerfile.ml"
+    assert worker["command"] == ["python", "-m", "app.detector_worker"]
+    assert int(worker["mem_limit"]) == 1024**3 and float(worker["cpus"]) == 2
+    assert not worker.get("ports") and not worker.get("secrets")
+    assert set(worker["environment"]) == {"DATABASE_URL"}
+    assert worker["healthcheck"]["test"] == ["CMD", "python", "-m", "app.detector_health"]

@@ -1,4 +1,10 @@
 services:
+  detector-worker:
+    environment:
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets: [database_url]
+
   postgres:
     environment:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password

@@ -37,9 +37,10 @@ def capture_lifecycle(compose, env, production, command, smoke_http, record_volu
         states = {row["Service"]: row for row in rows}
         for service in ("migrate", "wal-bootstrap"):
             assert states[service]["State"] == "exited" and states[service]["ExitCode"] == 0, service
-        for service in ("api", "aggregate-worker", "wal-decoder"):
+        for service in ("api", "aggregate-worker", "detector-worker", "wal-decoder"):
             assert states[service]["State"] == "running", service
         command([*compose, "exec", "-T", "wal-decoder", "python", "-m", "app.wal_health"], env=env)
+        command([*compose, "exec", "-T", "detector-worker", "python", "-m", "app.detector_health"], env=env)
         smoke_http(env, production)
 
     def secret_snapshot():

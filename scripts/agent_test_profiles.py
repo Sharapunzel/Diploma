@@ -512,7 +512,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
         for service, memory in {
             "postgres": "768m", "kafka": "2g", "kafka-acls": "512m",
             "migrate": "512m", "api": "1g", "provisioner": "768m",
-            "wal-bootstrap": "512m", "wal-decoder": "512m", "aggregate-worker": "768m",
+            "wal-bootstrap": "512m", "wal-decoder": "512m", "aggregate-worker": "768m", "detector-worker": "1g",
             "proxy": "256m", "frontend": "2g",
         }.items() if not production or service != "frontend"
     ), encoding="utf-8")
@@ -1642,10 +1642,13 @@ def main() -> None:
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
     parser.add_argument("--aggregate-only", action="store_true", help="Run the aggregate end-to-end scenario without unrelated UI scenarios")
     parser.add_argument("--rcf", action="store_true", help="Run the mandatory Linux/JVM RCF gate in backend-db")
+    parser.add_argument("--detector-only", action="store_true", help="Exercise detector worker and Compose lifecycle in the selected smoke profile")
     parser.add_argument("--wal", action="store_true", help="Run the Linux live capture bootstrap gate in backend-db")
     args = parser.parse_args()
     if args.rcf and args.profile != "backend-db":
         parser.error("--rcf requires backend-db")
+    if args.detector_only and args.profile not in {"smoke-development", "smoke-production"}:
+        parser.error("--detector-only requires a smoke profile")
     if args.wal and (args.profile != "backend-db" or args.rcf):
         parser.error("--wal requires backend-db without --rcf")
     if args.aggregate_only and args.profile != "end-to-end":
@@ -1737,7 +1740,7 @@ def main() -> None:
                          "python", "scripts/run_tests.py", "--temporary", "--pytest",
                          *(args.pytest or ["tests/ml/rcf_gate.py", "tests/ml/rcf_service.py",
                                           "tests/test_detector_numeric.py", "tests/test_detector_rules.py",
-                                          "tests/ml/rcf_migrations.py"])], env=env, timeout=600)
+                                          "tests/ml/rcf_worker.py", "tests/ml/rcf_migrations.py"])], env=env, timeout=600)
             elif args.pytest:
                 command([sys.executable, "-m", "pytest", "-q", *args.pytest], env=env, cwd=ROOT / "backend")
             else:
@@ -1761,7 +1764,7 @@ def main() -> None:
                 command([sys.executable, "scripts/run_tests.py", "--temporary"], env=env, cwd=ROOT / "backend")
         elif args.profile in {"smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             production = args.profile in {"smoke-production", "external-end-to-end"}
-            services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "aggregate-worker", "proxy"]
+            services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "aggregate-worker", "detector-worker", "proxy"]
             if args.profile == "external-end-to-end":
                 services.append("indexer")
             if args.profile in {"smoke-development", "smoke-production"}:
@@ -1770,6 +1773,14 @@ def main() -> None:
                 services.append("frontend")
             command([*compose, "up", "--build", "-d", *([] if args.profile.startswith("smoke-") else services)], env=env)
             command([*compose, "up", "-d", "--wait", *services], env=env)
+            if args.detector_only:
+                from capture_lifecycle_scenarios import capture_lifecycle
+                from detector_test_scenarios import detector_runtime_smoke
+                detector_runtime_smoke(compose, env, production, command,
+                    lambda: capture_lifecycle(compose, env, production, command, smoke_http,
+                        lambda: record_compose_volumes(project, env, run)))
+                successful = True
+                return
             if args.profile in {"smoke-development", "smoke-production"}:
                 idp_container = command([*compose, "ps", "-q", "oidc-idp"], env=env, capture=True).strip()
                 inspection = json.loads(command(["docker", "inspect", idp_container], env=env, capture=True))[0]
@@ -1793,6 +1804,7 @@ def main() -> None:
             if args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
                 from aggregate_test_scenarios import aggregate_runtime_smoke
                 from capture_lifecycle_scenarios import capture_lifecycle
+                from detector_test_scenarios import detector_runtime_smoke
                 if args.profile.startswith("smoke-"):
                     command([*compose, "run", "--rm", "--no-deps", "wal-bootstrap", "python", "-c",
                              (ROOT / "scripts/wal_bootstrap_scenarios.py").read_text(encoding="utf-8")], env=env, timeout=120)
@@ -1812,11 +1824,17 @@ def main() -> None:
                              "--workers=1", "--output", str(run / "aggregate-browser-results")],
                             env=browser_env, cwd=ROOT / "frontend", timeout=600)
                     return json.loads(result.read_text(encoding="utf-8"))
+                def detector_smoke():
+                    detector_runtime_smoke(compose, env, production, command,
+                        lifecycle=(lambda: capture_lifecycle(compose, env, production, command, smoke_http,
+                            lambda: record_compose_volumes(project, env, run)))
+                        if args.profile.startswith("smoke-") else None)
                 aggregate_runtime_smoke(compose, env, production, command,
                                         browser=aggregate_browser if args.profile == "end-to-end" and args.aggregate_only else None,
-                                        lifecycle=(lambda: capture_lifecycle(compose, env, production, command, smoke_http,
-                                            lambda: record_compose_volumes(project, env, run)))
+                                        lifecycle=detector_smoke
                                         if args.profile.startswith("smoke-") else None)
+                if args.profile == "end-to-end":
+                    detector_smoke()
             if args.profile in {"smoke-development", "smoke-production"}:
                 oidc_administration_smoke(compose, env, production)
             if args.profile == "smoke-development":
@@ -1880,7 +1898,7 @@ def main() -> None:
                     record_compose_volumes(project, env, run)
                     command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
                     remove_recorded_volumes(project, env, run, before)
-                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "aggregate-worker", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp", "ml-verification"):
+                    for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "aggregate-worker", "detector-worker", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp", "ml-verification"):
                         image = f"{project}-{service}"
                         matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()
                         if image in matches:

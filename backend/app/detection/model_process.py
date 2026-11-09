@@ -4,21 +4,34 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from .contracts import DetectionError, ModelConfig, canonical, digest
+from .contracts import DetectionError, ModelConfig, StaleCandidate, canonical, digest
 from .numeric import NumericQualityError
 
 
-def invoke(request):
-    try:
-        result = subprocess.run([sys.executable, "-m", "app.detection.model_process"],
-            input=canonical(request), capture_output=True, text=True, timeout=120, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise DetectionError("resource_budget:model_seconds") from error
-    if result.returncode:
+def invoke(request, cancel=None):
+    deadline = time.monotonic() + 120
+    with subprocess.Popen([sys.executable, "-m", "app.detection.model_process"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        payload = canonical(request)
+        while True:
+            if cancel is not None and cancel.is_set() or time.monotonic() >= deadline:
+                process.kill()
+                process.communicate()
+                if cancel is not None and cancel.is_set():
+                    raise StaleCandidate("ownership_lost")
+                raise DetectionError("resource_budget:model_seconds")
+            try:
+                stdout, _ = process.communicate(input=payload, timeout=.2)
+                break
+            except subprocess.TimeoutExpired:
+                payload = None
+        returncode = process.returncode
+    if returncode:
         raise DetectionError("model_process_failed")
-    response = json.loads(result.stdout)
+    response = json.loads(stdout)
     if "numeric_error" in response:
         raise NumericQualityError(response["numeric_error"], response["coordinate"])
     if "error" in response:
@@ -27,7 +40,7 @@ def invoke(request):
 
 
 class CandidateModel:
-    def __init__(self, checkpoint, config, keys, rule_hash):
+    def __init__(self, checkpoint, config, keys, rule_hash, cancel=None):
         try:
             if len(canonical(checkpoint).encode()) > 64 * 1024**2:
                 raise DetectionError("resource_budget:checkpoint_bytes")
@@ -46,9 +59,10 @@ class CandidateModel:
         self.request = {"action": "advance", "checkpoint": checkpoint, "config": config,
                         "keys": keys, "rule_hash": rule_hash}
         self.candidate = None
+        self.cancel = cancel
 
     def process(self, values):
-        response = invoke({**self.request, "values": values})
+        response = invoke({**self.request, "values": values}, self.cancel)
         self.candidate = response["checkpoint"]
         return response["result"]
 
@@ -63,12 +77,15 @@ class CandidateModel:
 
 
 class BoundedModelFactory:
+    def __init__(self, cancel=None):
+        self.cancel = cancel
+
     def warmup(self, config, keys, rule_hash, rows):
         return invoke({"action": "warmup", "config": config, "keys": keys,
-                       "rule_hash": rule_hash, "rows": rows})["checkpoint"]
+                       "rule_hash": rule_hash, "rows": rows}, self.cancel)["checkpoint"]
 
     def restore(self, checkpoint, config, keys, rule_hash):
-        return CandidateModel(checkpoint, config, keys, rule_hash)
+        return CandidateModel(checkpoint, config, keys, rule_hash, self.cancel)
 
 
 def main():

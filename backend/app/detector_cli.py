@@ -1,35 +1,20 @@
-"""Bounded administrative detector commands. No daemon and no HTTP surface."""
+"""Administrative detector requests; execution belongs to the managed worker."""
 
 import argparse
 import json
 import os
 from uuid import UUID
 
-from .aggregate_composition import build_aggregate_service
 from .db import Database
 from .detection.contracts import DetectionError
-from .detection.model_process import BoundedModelFactory
+from .detection.execution import REASONS, safe_reason
+from .detector_composition import bounded_database_url, build_detector_service
 from .ecs import PackagedEcsCatalog
-from .repositories.sqlalchemy import SqlAlchemyUnitOfWork
-from .repositories.sqlalchemy.aggregates import SqlAlchemyAggregateRepository
-from .repositories.sqlalchemy.detectors import SqlAlchemyDetectorRepository
-from .repositories.sqlalchemy.evidence import SqlAlchemyCoverageEvidenceRepository
-from .services.implementations.detector_history import DetectorHistoryService
-from .services.implementations.detectors import DetectorService
-
-
-def build_detector_service(session, catalog):
-    repository = SqlAlchemyDetectorRepository(session)
-    uow = SqlAlchemyUnitOfWork(session)
-    aggregate = build_aggregate_service(session, catalog)
-    history = DetectorHistoryService(repository, SqlAlchemyAggregateRepository(session),
-        SqlAlchemyCoverageEvidenceRepository(session), uow, catalog, aggregate.budget_limits)
-    return DetectorService(repository, history, aggregate.windows, aggregate.capture, uow, BoundedModelFactory())
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["create", "prepare-warmup", "warmup", "advance-one", "state"])
+    parser.add_argument("action", choices=["create", "start", "stop", "prepare-warmup", "warmup", "advance-one", "state"])
     parser.add_argument("id", type=UUID, help="Aggregate UUID for create, detector UUID otherwise")
     parser.add_argument("--actor", type=UUID)
     parser.add_argument("--name", default="RCF")
@@ -38,9 +23,14 @@ def main():
     args = parser.parse_args()
     if args.action == "create" and args.actor is None:
         parser.error("create requires --actor")
+    if args.action in {"prepare-warmup", "warmup", "advance-one"}:
+        print(json.dumps({"error": "managed_worker_required", "message": "Используйте start и state."}, ensure_ascii=False))
+        return 1
     # Credentials are supplied by the administrator's environment, never CLI argv.
+    from .adapters.wal_bootstrap import read_setting
     from .config import settings
-    database = Database(os.environ.get("DATABASE_URL", settings.database_url))
+    url = read_setting("DATABASE_URL") if os.environ.get("DATABASE_URL_FILE") else os.environ.get("DATABASE_URL", settings.database_url)
+    database = Database(bounded_database_url(url))
     try:
         with database.session_factory() as session:
             service = build_detector_service(session, PackagedEcsCatalog.load())
@@ -52,10 +42,12 @@ def main():
             print(json.dumps(result, default=str, ensure_ascii=False))
         return 0
     except DetectionError as error:
-        print(json.dumps({"error": str(error)}, ensure_ascii=False))
+        code = safe_reason(error)
+        print(json.dumps({"error": code, "message": REASONS[code]}, ensure_ascii=False))
         return 1
     except Exception:  # noqa: BLE001 - CLI boundary must not disclose DB/model internals
-        print(json.dumps({"error": "detector_operation_failed; reread state before retry"}))
+        print(json.dumps({"error": "temporary_unavailable", "outcome": "unknown",
+            "message": "Результат не подтверждён. Прочитайте state перед ручным повтором."}, ensure_ascii=False))
         return 1
     finally:
         database.dispose()

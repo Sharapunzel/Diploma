@@ -13,6 +13,8 @@ from ..db import Base
 class Detector(Base):
     __tablename__ = "detectors"
     __table_args__ = (
+        CheckConstraint("execution_state IN ('created','requested','starting','running','stopped','failed','terminated')", name="execution_valid"),
+        CheckConstraint("execution_generation >= 0", name="generation_valid"),
         CheckConstraint("state IN ('warming','waiting','ready','stopped','error')", name="state_valid"),
         CheckConstraint("revision >= 0", name="revision_valid"),
         CheckConstraint("step_seconds > 0", name="step_valid"),
@@ -44,6 +46,41 @@ class Detector(Base):
     evaluated_index: Mapped[int | None] = mapped_column(BigInteger)
     checkpoint: Mapped[dict | None] = mapped_column(JSONB)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    execution_state: Mapped[str] = mapped_column(Text, default="created", server_default="created")
+    execution_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    start_request_id: Mapped[UUID | None] = mapped_column()
+    start_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str | None] = mapped_column(Text)
+    last_failure: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class DetectorCoordinator(Base):
+    __tablename__ = "detector_coordinator"
+    __table_args__ = (CheckConstraint("id = 1 AND generation >= 0", name="singleton_valid"), {"schema": "logs"})
+    id: Mapped[int] = mapped_column(primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger)
+    owner_id: Mapped[UUID | None] = mapped_column()
+    backend_pid: Mapped[int | None] = mapped_column()
+    acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DetectorRecovery(Base):
+    __tablename__ = "detector_recoveries"
+    __table_args__ = (
+        CheckConstraint("first_index >= 0 AND last_index >= first_index", name="range_valid"),
+        CheckConstraint("reason IN ('crash_recovery','manual_resume')", name="reason_valid"),
+        Index("ix_detector_recovery", "detector_id", "first_index", "last_index"),
+        {"schema": "logs"},
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    detector_id: Mapped[UUID] = mapped_column(ForeignKey("logs.detectors.id", ondelete="RESTRICT"))
+    first_index: Mapped[int] = mapped_column(BigInteger)
+    last_index: Mapped[int] = mapped_column(BigInteger)
+    reason: Mapped[str] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    coordinator_generation: Mapped[int] = mapped_column(BigInteger)
 
 
 class DetectorWarmup(Base):

@@ -15,7 +15,14 @@ from .app import (
     WorkingWindowPoint,
 )
 from .auth import AuthSession
-from .detectors import Detector, DetectorOutcome, DetectorWarmup, Finding
+from .detectors import (
+    Detector,
+    DetectorCoordinator,
+    DetectorOutcome,
+    DetectorRecovery,
+    DetectorWarmup,
+    Finding,
+)
 from .logs import (
     AvailabilityMarker,
     InputAttestation,
@@ -37,7 +44,9 @@ __all__ = [
     "AuthSession",
     "AvailabilityMarker",
     "Detector",
+    "DetectorCoordinator",
     "DetectorOutcome",
+    "DetectorRecovery",
     "DetectorWarmup",
     "ExternalConnection",
     "Finding",

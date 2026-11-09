@@ -14,4 +14,4 @@ RUN python -m pip install '.[test]' && useradd --system --uid 10001 appuser
 COPY tests ./tests
 COPY scripts ./scripts
 USER 10001:10001
-CMD ["python", "scripts/run_tests.py", "--temporary", "--pytest", "tests/ml/rcf_gate.py"]
+CMD ["python", "-m", "app.detector_worker"]
