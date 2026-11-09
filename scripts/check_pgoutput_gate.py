@@ -309,8 +309,8 @@ def main():
             with psycopg.connect(url) as old_writer:
                 old_writer.execute("LOCK TABLE logs.parsed_logs IN ROW EXCLUSIVE MODE")
                 refused_writer = subprocess.run([sys.executable, "-B", "-m", "app.wal_bootstrap"],
-                    env=app_env, cwd=profiles.ROOT / "backend", capture_output=True, text=True, timeout=20)
-                assert refused_writer.returncode != 0 and "writers_not_stopped" in refused_writer.stderr
+                    env=app_env, cwd=profiles.ROOT / "backend", capture_output=True, text=True, timeout=20, check=False)
+                assert refused_writer.returncode == 0, "Ready-state validation must allow running writers"
                 old_writer.rollback()
             profiles.command([sys.executable, "-B", "-m", "app.wal_bootstrap"], env=app_env, cwd=profiles.ROOT / "backend")
             assert db.execute("SELECT legacy_cutover_at,availability_verified_from_at,boundary_origin FROM logs.replication_progress WHERE id=1").fetchone() == first_boundary
@@ -318,6 +318,12 @@ def main():
             # remove only the newly introduced schema, then apply it again.
             profiles.command([sys.executable, "-B", "-m", "alembic", "downgrade", "0015_aggregation_foundation"], env=app_env, cwd=profiles.ROOT / "backend")
             profiles.command([sys.executable, "-B", "-m", "alembic", "upgrade", "head"], env=app_env, cwd=profiles.ROOT / "backend")
+            with psycopg.connect(url) as old_writer:
+                old_writer.execute("LOCK TABLE logs.parsed_logs IN ROW EXCLUSIVE MODE")
+                refused_writer = subprocess.run([sys.executable, "-B", "-m", "app.wal_bootstrap"],
+                    env=app_env, cwd=profiles.ROOT / "backend", capture_output=True, text=True, timeout=20, check=False)
+                assert refused_writer.returncode != 0 and "writers_not_stopped" in refused_writer.stderr
+                old_writer.rollback()
             profiles.command([sys.executable, "-B", "-m", "app.wal_bootstrap"], env=app_env, cwd=profiles.ROOT / "backend")
             upgrade_boundary = db.execute("SELECT legacy_cutover_at,availability_verified_from_at,boundary_barrier_id FROM logs.replication_progress WHERE id=1").fetchone()
             assert upgrade_boundary[:2] == (None, None) and upgrade_boundary[2] is not None

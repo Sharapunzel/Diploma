@@ -196,6 +196,51 @@ def builder_image_ids(builder: str, env: dict[str, str]) -> set[str]:
     return result
 
 
+def record_compose_volumes(project: str, env: dict[str, str], run: Path) -> None:
+    """Retain volume-to-container ownership before ordinary down loses it."""
+    path = run / "compose-volume-mounts.json"
+    records = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    ids = command(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
+                  env=env, capture=True).splitlines()
+    if ids:
+        containers = json.loads(command(["docker", "inspect", "--type", "container", *ids], env=env, capture=True))
+        for container in containers:
+            labels = container["Config"]["Labels"]
+            if labels.get("com.docker.compose.project") != project:
+                raise RuntimeError("Volume inventory encountered a foreign container")
+            for mount in container["Mounts"]:
+                if mount["Type"] == "volume":
+                    record = {"project": project, "container": container["Id"],
+                              "service": labels["com.docker.compose.service"],
+                              "volume": mount["Name"], "destination": mount["Destination"]}
+                    if record not in records:
+                        records.append(record)
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def remove_recorded_volumes(project: str, env: dict[str, str], run: Path, before: dict) -> None:
+    path = run / "compose-volume-mounts.json"
+    records = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    present = set(command(["docker", "volume", "ls", "--format", "{{.Name}}"], env=env, capture=True).splitlines())
+    for record in records:
+        if record["project"] != project:
+            raise RuntimeError("Volume ownership record belongs to another project")
+        name = record["volume"]
+        if name not in present:
+            continue
+        if name in before["volumes"]:
+            raise RuntimeError("Refusing to remove a volume present before the run")
+        if command(["docker", "ps", "-aq", "--filter", f"volume={name}"], env=env, capture=True).strip():
+            raise RuntimeError(f"Recorded volume is still attached: {name}")
+        details = json.loads(command(["docker", "volume", "inspect", name], env=env, capture=True))[0]
+        labels = details.get("Labels") or {}
+        if (details["Name"] != name or (labels.get("com.docker.compose.project") != project
+                and "com.docker.volume.anonymous" not in labels)):
+            raise RuntimeError(f"Recorded volume labels differ: {name}")
+        command(["docker", "volume", "rm", name], env=env)
+        present.remove(name)
+
+
 def compare_inventory(before: dict, after: dict, project: str) -> None:
     for kind in ("containers", "volumes", "images", "builders", "default_cache"):
         added = set(after[kind]) - set(before[kind])
@@ -1597,9 +1642,12 @@ def main() -> None:
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
     parser.add_argument("--aggregate-only", action="store_true", help="Run the aggregate end-to-end scenario without unrelated UI scenarios")
     parser.add_argument("--rcf", action="store_true", help="Run the mandatory Linux/JVM RCF gate in backend-db")
+    parser.add_argument("--wal", action="store_true", help="Run the Linux live capture bootstrap gate in backend-db")
     args = parser.parse_args()
     if args.rcf and args.profile != "backend-db":
         parser.error("--rcf requires backend-db")
+    if args.wal and (args.profile != "backend-db" or args.rcf):
+        parser.error("--wal requires backend-db without --rcf")
     if args.aggregate_only and args.profile != "end-to-end":
         parser.error("--aggregate-only requires end-to-end")
     run = ROOT / ".test_runs" / "runs" / f"task21-{uuid4().hex}"
@@ -1671,7 +1719,7 @@ def main() -> None:
             print("Resolved Compose config passed isolated-resource checks", flush=True)
             successful = True
             return
-        if args.rcf or args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
+        if args.rcf or args.wal or args.profile in {"kafka-integration", "smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             builder = project + "_builder"
             command(["docker", "buildx", "create", "--name", builder, "--driver", "docker-container",
                      "--driver-opt", "network=host", "--bootstrap"], env=env)
@@ -1679,7 +1727,11 @@ def main() -> None:
             env["COMPOSE_DOCKER_CLI_BUILD"] = "1"
         if args.profile == "backend-db":
             command([*compose, "up", "-d", "--wait", "postgres"], env=env)
-            if args.rcf:
+            if args.wal:
+                command([*compose, "up", "-d", "--build", "--wait", "wal-decoder"], env=env)
+                command([*compose, "run", "--rm", "--no-deps", "wal-bootstrap", "python", "-c",
+                         (ROOT / "scripts/wal_bootstrap_scenarios.py").read_text(encoding="utf-8")], env=env, timeout=120)
+            elif args.rcf:
                 command([*compose, "build", "ml-verification"], env=env)
                 command([*compose, "run", "--rm", "--no-deps", "ml-verification",
                          "python", "scripts/run_tests.py", "--temporary", "--pytest",
@@ -1716,7 +1768,8 @@ def main() -> None:
                 services.append("oidc-idp")
             if not production:
                 services.append("frontend")
-            command([*compose, "up", "-d", "--build", "--wait", *services], env=env)
+            command([*compose, "up", "--build", "-d", *([] if args.profile.startswith("smoke-") else services)], env=env)
+            command([*compose, "up", "-d", "--wait", *services], env=env)
             if args.profile in {"smoke-development", "smoke-production"}:
                 idp_container = command([*compose, "ps", "-q", "oidc-idp"], env=env, capture=True).strip()
                 inspection = json.loads(command(["docker", "inspect", idp_container], env=env, capture=True))[0]
@@ -1739,6 +1792,10 @@ def main() -> None:
             smoke_http(env, production)
             if args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
                 from aggregate_test_scenarios import aggregate_runtime_smoke
+                from capture_lifecycle_scenarios import capture_lifecycle
+                if args.profile.startswith("smoke-"):
+                    command([*compose, "run", "--rm", "--no-deps", "wal-bootstrap", "python", "-c",
+                             (ROOT / "scripts/wal_bootstrap_scenarios.py").read_text(encoding="utf-8")], env=env, timeout=120)
                 def aggregate_browser(fixtures):
                     result = run / "aggregate-browser-owned.json"
                     config = run / "aggregate-browser-config.json"
@@ -1756,7 +1813,10 @@ def main() -> None:
                             env=browser_env, cwd=ROOT / "frontend", timeout=600)
                     return json.loads(result.read_text(encoding="utf-8"))
                 aggregate_runtime_smoke(compose, env, production, command,
-                                        browser=aggregate_browser if args.profile == "end-to-end" and args.aggregate_only else None)
+                                        browser=aggregate_browser if args.profile == "end-to-end" and args.aggregate_only else None,
+                                        lifecycle=(lambda: capture_lifecycle(compose, env, production, command, smoke_http,
+                                            lambda: record_compose_volumes(project, env, run)))
+                                        if args.profile.startswith("smoke-") else None)
             if args.profile in {"smoke-development", "smoke-production"}:
                 oidc_administration_smoke(compose, env, production)
             if args.profile == "smoke-development":
@@ -1817,7 +1877,9 @@ def main() -> None:
                             token in line for token in ("ERROR", "Exception", "Caused by", "SSL", "TLS", "certificate", "unhealthy")
                         )]
                         print("\n".join(selected[-25:]).replace(env["POSTGRES_PASSWORD"], "[REDACTED]"), file=sys.stderr)
+                    record_compose_volumes(project, env, run)
                     command([*compose, "down", "--volumes", "--remove-orphans"], env=env)
+                    remove_recorded_volumes(project, env, run, before)
                     for service in ("kafka", "kafka-acls", "migrate", "api", "provisioner", "wal-bootstrap", "wal-decoder", "aggregate-worker", "frontend", "proxy", "browser", "oidc-browser", "oidc-idp", "ml-verification"):
                         image = f"{project}-{service}"
                         matches = command(["docker", "image", "ls", "--filter", f"reference={image}", "--format", "{{.Repository}}"], env=env, capture=True).splitlines()

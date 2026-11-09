@@ -10,7 +10,7 @@ from uuid import uuid4
 import httpx
 
 
-def aggregate_runtime_smoke(compose, env, production, command, browser=None):
+def aggregate_runtime_smoke(compose, env, production, command, browser=None, lifecycle=None):
     """Exercise the real proxy/API/decoder/worker, including restart and history."""
     username, password = "aggregate-" + uuid4().hex, secrets.token_urlsafe(24)
     setup = """
@@ -258,6 +258,8 @@ db.dispose()
             for identity in browser_ids:
                 expect(client.delete(f"/api/v1/aggregates/{identity}", headers=csrf))
             ids.extend(browser_ids)
+        if lifecycle is not None:
+            lifecycle()
         cleanup = """
 import json,os
 from uuid import UUID
