@@ -34,10 +34,14 @@ export const AppLayout = observer(({ children }: { children: ReactNode }) => {
       ? location.pathname === "/aggregates/new"
         ? "Новый агрегат"
         : "Карточка агрегата"
-      : location.pathname === homePage.path
-        ? homePage.label
-        : (pages.find((page) => page.path === location.pathname)?.label ??
-          "Страница не найдена");
+      : location.pathname.startsWith("/detectors/")
+        ? location.pathname === "/detectors/new"
+          ? "Новый детектор"
+          : "Карточка детектора"
+        : location.pathname === homePage.path
+          ? homePage.label
+          : (pages.find((page) => page.path === location.pathname)?.label ??
+            "Страница не найдена");
 
   useEffect(() => {
     layout.setMobileOpen(false);

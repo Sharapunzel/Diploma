@@ -8,14 +8,17 @@ from .input_attestations import verify_attestation
 
 
 def evaluate_saved_coverage(
-    evidence: CoverageEvidenceRepository, source_id: UUID, start: datetime, end: datetime, barrier_at: datetime
+    evidence: CoverageEvidenceRepository, source_id: UUID, start: datetime, end: datetime, barrier_at: datetime,
+    *, reference_at: datetime | None = None, check_budget=lambda: None,
 ) -> tuple[str, str, dict]:
     """Default to unknown unless signed intervals and independently captured Kafka proof agree."""
+    check_budget()
     stopped = evidence.interruptions(source_id, start, end, barrier_at)
     if stopped:
         return "interrupted", "known_source_or_processing_stop", {
             "interruptions": [str(item) for item in stopped],
         }
+    check_budget()
     pairs = evidence.attestations(source_id, start, end, barrier_at)
     valid = []
     for item, probe in pairs:
@@ -54,6 +57,7 @@ def evaluate_saved_coverage(
             break
     if cursor < end:
         return "unknown", "input_coverage_gap", {}
+    check_budget()
     heartbeats = evidence.consumer_heartbeats(source_id, first.topic_identity, start, end)
     candidates = [item for item in heartbeats if item.observed_at <= start]
     if not candidates:
@@ -72,7 +76,9 @@ def evaluate_saved_coverage(
             break
     if previous.observed_at < end:
         return "unknown", "consumer_coverage_gap", {}
-    checkpoint = evidence.checkpoint(source_id, first.topic_identity, end, barrier_at)
+    check_budget()
+    checkpoint = (evidence.checkpoint(source_id, first.topic_identity, end, barrier_at, reference_at)
+                  if reference_at is not None else evidence.checkpoint(source_id, first.topic_identity, end, barrier_at))
     if checkpoint is None:
         return "unknown", "kafka_checkpoint_unavailable", {}
     positions = checkpoint.partitions
@@ -88,8 +94,10 @@ def evaluate_saved_coverage(
                 or sample["committed"] < final):
             return "unknown", "kafka_backlog_or_retention", {}
         part = int(partition)
+        check_budget()
         if evidence.has_gap(source_id, first.topic_identity, part, beginning, final):
             return "unknown", "kafka_gap_detected", {}
+        check_budget()
         total, failures = evidence.processing_counts(
             source_id, first.topic_identity, part, beginning, final,
         )

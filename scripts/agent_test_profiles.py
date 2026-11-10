@@ -418,7 +418,7 @@ def wazuh_compose_overlay(run: Path, env: dict[str, str]) -> Path:
     return path
 
 
-def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
+def prepare(run: Path, profile: str, *, include_oidc=True) -> tuple[dict[str, str], list[str], str]:
     suffix = uuid4().hex[:10]
     project = f"diploma_t21_{suffix}"
     db_port, kafka_port, proxy_port, https_port = (free_port() for _ in range(4))
@@ -518,7 +518,7 @@ def prepare(run: Path, profile: str) -> tuple[dict[str, str], list[str], str]:
     ), encoding="utf-8")
     compose = [*COMPOSE, "-f", str(ROOT / ("docker-compose.prod.yml" if production else "docker-compose.dev.yml")),
                "-f", str(limits), "-p", project]
-    if profile in {"smoke-development", "smoke-production"}:
+    if profile in {"smoke-development", "smoke-production"} and include_oidc:
         compose += ["-f", str(oidc_compose_overlay(run, env, project))]
     return env, compose, project
 
@@ -706,7 +706,8 @@ def smoke_http(env: dict[str, str], production: bool) -> None:
         status, headers, html = response("/login")
         if status != 200 or "text/html" not in headers.get("Content-Type", "") or b"/assets/" not in html:
             raise RuntimeError("Production login route did not serve React HTML")
-        for path in ("/", "/agents", "/events", "/administration", "/normalizers/new"):
+        for path in ("/", "/agents", "/events", "/administration", "/normalizers/new",
+                     "/detectors", "/detectors/new", "/detectors/00000000-0000-4000-8000-000000000001"):
             route_status, route_headers, _ = response(path)
             if route_status != 200 or "text/html" not in route_headers.get("Content-Type", ""):
                 raise RuntimeError(f"Production UI route failed: {path}")
@@ -728,7 +729,7 @@ def smoke_http(env: dict[str, str], production: bool) -> None:
     print(f"Proxy smoke passed: {url} (API and frontend)", flush=True)
 
 
-def oidc_administration_smoke(compose: list[str], env: dict[str, str], production: bool) -> None:
+def oidc_administration_smoke(compose: list[str], env: dict[str, str], production: bool, keep_active=False) -> None:
     """Exercise managed OIDC through the same proxy and database as the smoke profile."""
     port = (env["HTTPS_BIND"] if production else env["PROXY_BIND"]).split(":")[1]
     base = f"{'https' if production else 'http'}://localhost:{port}"
@@ -875,6 +876,8 @@ def oidc_administration_smoke(compose: list[str], env: dict[str, str], productio
         raise RuntimeError("OIDC trial replaced local admin session")
     if call("/api/v1/auth/methods")[1]["oidc_enabled"] is not True:
         raise RuntimeError("OIDC smoke runtime method did not update")
+    if keep_active:
+        return
     call("/api/v1/auth/logout", "POST", {}, csrf)
     status, local = call("/api/v1/auth/local/login", "POST", {
         "username": "task27admin", "password": password,
@@ -1644,7 +1647,14 @@ def main() -> None:
     parser.add_argument("--rcf", action="store_true", help="Run the mandatory Linux/JVM RCF gate in backend-db")
     parser.add_argument("--detector-only", action="store_true", help="Exercise detector worker and Compose lifecycle in the selected smoke profile")
     parser.add_argument("--wal", action="store_true", help="Run the Linux live capture bootstrap gate in backend-db")
+    parser.add_argument("--browser-only", action="store_true", help="Run the standard browser group in the selected smoke mode")
+    parser.add_argument("--browser-spec", nargs="+", help="Select named specs from that smoke mode's browser group")
     args = parser.parse_args()
+    from browser_test_scenarios import validate_browser_arguments
+    try:
+        selected_browsers = validate_browser_arguments(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.rcf and args.profile != "backend-db":
         parser.error("--rcf requires backend-db")
     if args.detector_only and args.profile not in {"smoke-development", "smoke-production"}:
@@ -1709,7 +1719,14 @@ def main() -> None:
             return
         before = inventory(env)
         (run / "docker-before.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
-        env, compose, project = prepare(run, args.profile)
+        env, compose, project = (prepare(run, args.profile, include_oidc="auth.spec.ts" in selected_browsers)
+                                 if args.browser_only else prepare(run, args.profile))
+        if args.browser_only:
+            overlay = run / "browser-consumer.yml"
+            overlay.write_text("services:\n  api:\n    environment:\n      KAFKA_CONSUMERS_ENABLED: 'false'\n"
+                + (f"  frontend:\n    environment:\n      HMR_CLIENT_PORT: '{env['PROXY_BIND'].split(':')[1]}'\n"
+                   if args.profile == "smoke-development" else ""), encoding="utf-8")
+            compose += ["-f", str(overlay)]
         if args.rcf:
             compose += ["--profile", "verification"]
         if args.profile == "external-end-to-end":
@@ -1765,14 +1782,25 @@ def main() -> None:
         elif args.profile in {"smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             production = args.profile in {"smoke-production", "external-end-to-end"}
             services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "aggregate-worker", "detector-worker", "proxy"]
+            if args.browser_only:
+                services.remove("provisioner")
+                if not any(name.startswith(("aggregates.", "detectors.")) for name in selected_browsers):
+                    services.remove("aggregate-worker")
+                    services.remove("detector-worker")
             if args.profile == "external-end-to-end":
                 services.append("indexer")
-            if args.profile in {"smoke-development", "smoke-production"}:
+            if args.profile in {"smoke-development", "smoke-production"} and (not args.browser_only or "auth.spec.ts" in selected_browsers):
                 services.append("oidc-idp")
             if not production:
                 services.append("frontend")
-            command([*compose, "up", "--build", "-d", *([] if args.profile.startswith("smoke-") else services)], env=env)
+            command([*compose, "up", "--build", "-d", *(services if args.browser_only else [] if args.profile.startswith("smoke-") else services)], env=env)
             command([*compose, "up", "-d", "--wait", *services], env=env)
+            if args.browser_only:
+                from browser_test_scenarios import run_browsers
+                smoke_http(env, production)
+                run_browsers(compose, env, project, run, production, selected_browsers, command, oidc_administration_smoke)
+                successful = True
+                return
             if args.detector_only:
                 from capture_lifecycle_scenarios import capture_lifecycle
                 from detector_test_scenarios import detector_runtime_smoke

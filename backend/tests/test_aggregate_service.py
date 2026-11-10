@@ -245,6 +245,64 @@ def test_api_permissions_csrf_and_typed_contract(database, catalog, source):
             assert client.post("/api/v1/auth/logout", headers=csrf).status_code == 200
 
 
+def test_catalog_search_is_server_side_literal_scoped_and_backward_compatible(database, catalog, source):
+    prefix = "Каталог-" + uuid4().hex
+    at = datetime.now(UTC).replace(microsecond=0)
+    identities = [uuid4() for _ in range(60)]
+    active = sorted(identities[:57], reverse=True)
+    target, special = active[-1], active[-2]
+    names = {identity: f"{prefix} запись {index}" for index, identity in enumerate(identities)}
+    names[target] = prefix + " Нужная ЦЕЛЬ"
+    names[special] = prefix + " буквальные %_\\' символы"
+    names[active[0]] = prefix + " одинаковое имя"
+    names[active[1]] = names[active[0]]
+    with database.session_factory.begin() as session:
+        for index, identity in enumerate(identities):
+            schedule = uuid4()
+            session.add(AggregateSchedule(id=schedule, source_identity=source, anchor_utc=at - timedelta(seconds=600), duration_seconds=2, next_index=300))
+            session.flush()
+            session.add(Aggregate(id=identity, schedule_id=schedule, name=names[identity], source_identity=source,
+                source_name="Источник поиска", source_type="kafka", rule={"features": [{"key":"n","name":"Count","op":"count"}]},
+                rule_hash="f" * 64, original_boundary=at.isoformat(), timezone="UTC", created_at=at,
+                created_by=uuid4(), state="active" if index < 57 else "archived" if index < 59 else "deleted",
+                request_key=uuid4().hex, request_hash="e" * 64))
+    app = create_app(Settings(environment="test", database_url=os.environ["TEST_DATABASE_URL"]), database=database, ecs_catalog=catalog, start_consumers=False)
+    names_user = ["search-admin-" + uuid4().hex, "search-guest-" + uuid4().hex]
+    with database.session_factory.begin() as session:
+        for name, role in zip(names_user, [1, 2]):
+            session.add(User(username=name, display_name=name, password_hash=hash_password("synthetic-password"), role_id=UUID(f"00000000-0000-4000-8000-{role:012d}")))
+    with TestClient(app) as client:
+        assert client.post("/api/v1/auth/local/login", json={"username":names_user[0],"password":"synthetic-password"}).status_code == 200
+        def listing(**params):
+            response = client.get("/api/v1/aggregates", params={"q":prefix, **params})
+            assert response.status_code == 200, response.text
+            return response.json()
+        page = listing(state="active", limit=10)
+        assert page["total"] == 57 and [UUID(item["id"]) for item in page["items"]] == active[:10]
+        assert str(target) not in [item["id"] for item in page["items"]]
+        found = listing(q="  " + prefix.upper() + " нужная цель  ", state="active", limit=10)
+        assert found["total"] == 1 and found["items"][0]["id"] == str(target)
+        assert listing(q="%_\\'", state="active")["items"][0]["id"] == str(special)
+        assert listing(q="%_\\'", state="active")["total"] == 1
+        assert listing(q=prefix + " одинаковое имя", state="active")["total"] == 2
+        assert listing(state="archived")["total"] == 2
+        assert listing()["total"] == 59 and len(listing()["items"]) == 50
+        assert len(listing(offset=50)["items"]) == 9
+        assert listing(q="несуществующее имя")["total"] == 0
+        old = client.get("/api/v1/aggregates", params={"limit":50,"offset":0})
+        assert old.status_code == 200 and len(old.json()["items"]) == 50
+        assert client.get("/api/v1/aggregates", params={"q":" "}).json()["total"] == old.json()["total"]
+        for params in ({"q":"x" * 201}, {"state":"deleted"}, {"state":"invalid"}, {"limit":0}, {"limit":101}, {"offset":-1}, {"offset":100001}):
+            assert client.get("/api/v1/aggregates", params=params).status_code == 422
+        csrf = client.get("/api/v1/auth/session").json()["csrf_token"]
+        assert client.post("/api/v1/auth/logout", headers={"X-CSRF-Token":csrf}).status_code == 200
+        assert client.post("/api/v1/auth/local/login", json={"username":names_user[1],"password":"synthetic-password"}).status_code == 200
+        assert client.get("/api/v1/aggregates", params={"q":prefix,"state":"active","limit":10}).status_code == 403
+    with database.session_factory() as session:
+        result = service(session, catalog).list(10, 0, "  " + prefix + "  ", "active")
+        assert [item.id for item in result["items"]] == active[:10] and result["total"] == 57
+
+
 def test_worker_error_isolation_and_interruptible_wait(database, catalog, source):
     stop = Event()
     worker = AggregateWorker(database.session_factory, lambda session, cat: service(session, cat), catalog, stop)

@@ -85,6 +85,21 @@ const AggregateCardPage = lazy(() =>
     default: m.AggregateCardPage,
   })),
 );
+const DetectorsPage = lazy(() =>
+  import("../../pages/detectors/DetectorsPage").then((m) => ({
+    default: m.DetectorsPage,
+  })),
+);
+const DetectorCreatePage = lazy(() =>
+  import("../../pages/detectors/DetectorCreatePage").then((m) => ({
+    default: m.DetectorCreatePage,
+  })),
+);
+const DetectorCardPage = lazy(() =>
+  import("../../pages/detectors/DetectorCardPage").then((m) => ({
+    default: m.DetectorCardPage,
+  })),
+);
 
 function LoadingStatus() {
   return (
@@ -215,6 +230,8 @@ export function AppRoutes() {
                     <DiagnosticsPage />
                   ) : page.path === "/aggregates" ? (
                     <AggregatesPage />
+                  ) : page.path === "/detectors" ? (
+                    <DetectorsPage />
                   ) : page.path === "/administration" ? (
                     <AdministrationPage />
                   ) : (
@@ -229,6 +246,22 @@ export function AppRoutes() {
             element={
               <Protected permission="aggregates.write">
                 <AggregateCreatePage />
+              </Protected>
+            }
+          />
+          <Route
+            path="/detectors/new"
+            element={
+              <Protected permission="detectors.read">
+                <DetectorCreatePage />
+              </Protected>
+            }
+          />
+          <Route
+            path="/detectors/:id"
+            element={
+              <Protected permission="detectors.read">
+                <DetectorCardPage />
               </Protected>
             }
           />

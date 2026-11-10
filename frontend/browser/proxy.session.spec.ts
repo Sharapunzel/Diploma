@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 
 const password = process.env.TASK21_ADMIN_PASSWORD;
 const secureCookie = process.env.TASK21_SECURE_COOKIE === "true";
+if (!password && process.env.BROWSER_FIXTURES_REQUIRED)
+  throw new Error("Required session fixture missing");
 test.skip(!password, "requires the isolated production profile");
 
 test("local session survives reload and ends through the proxy", async ({

@@ -110,6 +110,19 @@ def test_marker_mismatch_rolls_back_and_does_not_acknowledge(sessions):
             AvailabilityMarker.id == marker_id)) is None
 
 
+def test_missing_marker_without_an_active_writer_is_not_acknowledged(sessions):
+    marker_id, source_id = uuid4(), uuid4()
+    commit = DecodedCommit(1, 150, 160, datetime(2026, 1, 1, tzinfo=UTC),
+                           ((str(marker_id), str(source_id), "barrier", None),))
+    feedback = Feedback()
+    with pytest.raises(InvalidReplicationMessage, match="fields=missing") as caught:
+        persist_then_ack(sessions, feedback, commit)
+    assert not feedback.sent
+    assert str(marker_id) in str(caught.value) and "xid=1" in str(caught.value)
+    with sessions() as session:
+        assert session.get(AvailabilityMarker, marker_id) is None
+
+
 def test_working_window_requires_materialized_barrier_and_advances_once(sessions):
     source, connection, schedule = uuid4(), uuid4(), uuid4()
     with sessions.begin() as session:
@@ -227,3 +240,25 @@ def test_saved_signed_coverage_requires_matching_kafka_checkpoint(sessions):
                                        started_at=start, ended_at=end))
     with sessions() as session:
         assert evaluate_saved_coverage(SqlAlchemyCoverageEvidenceRepository(session), source, start, end, barrier_at)[0] == "interrupted"
+
+
+@pytest.mark.parametrize("age,barrier_age,expected", [
+    (0, 1, True), (10, 11, True), (10.001, 11, False),
+    (-.001, 1, False), (2, 1, False),
+])
+def test_checkpoint_freshness_uses_one_explicit_batch_reference(sessions, age, barrier_age, expected):
+    source, worker = uuid4(), uuid4()
+    # This old, fixed reference proves the query doesn't silently substitute
+    # wall clock for the batch's reference or accept future/pre-barrier proof.
+    reference = datetime.now(UTC) - timedelta(seconds=100)
+    with sessions.begin() as session:
+        session.add(KafkaCheckpoint(source_identity=source, topic_identity="reference-topic",
+            worker_instance=worker, observed_at=reference - timedelta(seconds=age),
+            partitions={"0": {"low": 0, "high": 0, "committed": 0}}))
+    with sessions() as session:
+        evidence = SqlAlchemyCoverageEvidenceRepository(session)
+        end = reference - timedelta(seconds=20)
+        barrier = reference - timedelta(seconds=barrier_age)
+        assert (evidence.checkpoint(source, "reference-topic", end, barrier, reference) is not None) is expected
+        assert evidence.checkpoint(source, "another-topic", end, barrier, reference) is None
+        assert evidence.checkpoint(source, "reference-topic", end, barrier) is None

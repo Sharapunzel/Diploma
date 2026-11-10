@@ -9,6 +9,8 @@ const config = process.env.AGGREGATE_BROWSER_CONFIG
       anchor: string;
     })
   : null;
+if (!config && process.env.BROWSER_FIXTURES_REQUIRED)
+  throw new Error("Required aggregate fixture missing");
 test.skip(!config, "Uses synthetic fixtures from end-to-end --aggregate-only.");
 test.setTimeout(90_000);
 async function login(page: Page) {

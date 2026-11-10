@@ -478,20 +478,7 @@ class DetectorService:
         # Already saved working snapshots need no new WAL materialization.
         reason, inputs = None, []
         try:
-            try:
-                inputs, reason = self.history.materialize(context, attempt, deadline)
-            except DetectionError as error:
-                if str(error) != "barrier_pending":
-                    raise
-                while time.monotonic() < deadline:
-                    status = self.capture.status()
-                    barrier = self.windows.barrier(marker_id)
-                    ready = status.ready and barrier and barrier.availability_at is not None
-                    self.uow.rollback()
-                    if ready:
-                        break
-                    time.sleep(.05)
-                inputs, reason = self.history.materialize(context, attempt, deadline)
+            inputs, reason = self.history.materialize(context, attempt, deadline)
         except StaleCandidate:
             raise
         except DetectionError as error:
@@ -502,7 +489,7 @@ class DetectorService:
             reason = (f"resource_budget:{error.path}"
                       if error.code == "resource_budget_exceeded" else "history_quality")
         except DBAPIError as error:
-            if getattr(error.orig, "sqlstate", None) != "57014":
+            if getattr(error.orig, "sqlstate", None) not in {"57014", "55P03"}:
                 raise  # Infrastructure uncertainty is resolved by re-election.
             reason = "resource_budget:preparation_seconds"
         self.uow.rollback()

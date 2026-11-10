@@ -13,6 +13,8 @@ type Config = {
 export const config: Config | null = configPath
   ? JSON.parse(readFileSync(configPath, "utf8"))
   : null;
+if (!config && process.env.BROWSER_FIXTURES_REQUIRED)
+  throw new Error("Required aggregate fixture missing");
 test.skip(
   !config,
   "Run through end-to-end --aggregate-only; fixtures are owned by the profile runner.",

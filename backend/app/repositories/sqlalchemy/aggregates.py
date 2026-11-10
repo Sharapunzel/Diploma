@@ -31,6 +31,19 @@ class SqlAlchemyAggregateRepository:
     def source(self, source_id):
         return self.session.get(Source, source_id)
 
+    def read_budget(self, milliseconds):
+        for setting in ("statement_timeout", "lock_timeout"):
+            self.session.execute(select(func.set_config(setting, str(milliseconds), True)))
+
+    def history_barrier(self, marker_id, source_id, cutoff):
+        return self.session.scalar(select(AvailabilityMarker).where(
+            AvailabilityMarker.id == marker_id,
+            AvailabilityMarker.kind == "barrier",
+            AvailabilityMarker.source_identity == source_id,
+            AvailabilityMarker.created_at >= cutoff,
+            AvailabilityMarker.availability_at >= cutoff,
+        ).execution_options(populate_existing=True))
+
     def limits(self, limits: Limits, preview: bool):
         timeout = limits.preview_timeout_ms if preview else limits.working_timeout_ms
         self.session.execute(select(func.set_config("statement_timeout", str(timeout), True)))
@@ -57,9 +70,13 @@ class SqlAlchemyAggregateRepository:
             query = query.where(clock < end)
         return query
 
-    def estimate_rows(self, source_id, start, end, basis):
+    def estimate_rows(self, source_id, start, end, basis, before_read=None):
         base = self._base(source_id, start, end, basis).subquery()
+        if before_read:
+            before_read()
         rows, size = self.session.execute(select(func.count(), func.max(func.octet_length(base.c.ecs_data.cast(Text)))).select_from(base)).one()
+        if before_read:
+            before_read()
         total = self.session.scalar(select(func.count()).select_from(ParsedLog).where(ParsedLog.source_id == source_id))
         return rows, total, (size or 0) + 64
 
@@ -104,10 +121,15 @@ class SqlAlchemyAggregateRepository:
     def refresh(self, aggregate):
         self.session.refresh(aggregate)
 
-    def list(self, limit, offset):
+    def list(self, limit, offset, q=None, state=None):
         query = select(Aggregate).where(Aggregate.state != "deleted")
+        if state is not None:
+            query = query.where(Aggregate.state == state)
+        if q:
+            literal = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            query = query.where(Aggregate.name.ilike(f"%{literal}%", escape="\\"))
         total = self.session.scalar(select(func.count()).select_from(query.subquery()))
-        return list(self.session.scalars(query.order_by(Aggregate.created_at.desc(), Aggregate.id).limit(limit).offset(offset))), total
+        return list(self.session.scalars(query.order_by(Aggregate.created_at.desc(), Aggregate.id.desc()).limit(limit).offset(offset))), total
 
     def points(self, aggregate, limit, offset):
         # Fetch at most offset+limit from each stream, then merge by the same

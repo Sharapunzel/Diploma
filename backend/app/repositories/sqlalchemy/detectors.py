@@ -290,6 +290,22 @@ class SqlAlchemyDetectorRepository:
         detector = self._row(Detector, detector_id)
         return {**self.aggregate_context(detector.aggregate_id), "detector": snapshot(detector)}
 
+    def history_metadata(self, detector_id, attempt_id):
+        # One bounded statement pins all metadata used by this history batch.
+        row = self.session.execute(select(Detector, Aggregate, AggregateSchedule, DetectorWarmup)
+            .select_from(Detector)
+            .join(Aggregate, Aggregate.id == Detector.aggregate_id)
+            .join(AggregateSchedule, AggregateSchedule.id == Aggregate.schedule_id)
+            .join(DetectorWarmup, DetectorWarmup.id == Detector.active_attempt_id)
+            .where(Detector.id == detector_id, DetectorWarmup.id == attempt_id,
+                   DetectorWarmup.detector_id == detector_id)
+            .execution_options(populate_existing=True)).one_or_none()
+        if row is None:
+            raise StaleCandidate("stale_warmup_plan")
+        detector, aggregate, schedule, attempt = row
+        return ({"detector": snapshot(detector), "aggregate": snapshot(aggregate),
+                 "schedule": snapshot(schedule)}, snapshot(attempt))
+
     def lock_context(self, detector_id):
         detector = self._row(Detector, detector_id)
         context = self.aggregate_context(detector.aggregate_id, True)
@@ -325,16 +341,20 @@ class SqlAlchemyDetectorRepository:
         rows = self._points(query.order_by(WorkingWindowPoint.window_index).limit(1))
         return rows[0] if rows else None
 
-    def working_inputs(self, schedule_id, starts):
+    def working_inputs(self, schedule_id, starts, before_read=None):
         query = select(WorkingWindowPoint).where(
             WorkingWindowPoint.schedule_id == schedule_id,
             WorkingWindowPoint.start_utc.in_(starts))
         from sqlalchemy import Text
+        if before_read:
+            before_read()
         size = self.session.scalar(select(func.sum(func.octet_length(
             WorkingWindowPoint.features.cast(Text)))).where(
                 WorkingWindowPoint.schedule_id == schedule_id, WorkingWindowPoint.start_utc.in_(starts)))
         if (size or 0) > 64 * 1024**2:
             raise DetectionError("resource_budget:warmup_input_bytes")
+        if before_read:
+            before_read()
         return self._points(query.order_by(WorkingWindowPoint.window_index))
 
     def attempt(self, attempt_id):

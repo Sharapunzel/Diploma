@@ -10,7 +10,7 @@ from uuid import uuid4
 import httpx
 
 
-def aggregate_runtime_smoke(compose, env, production, command, browser=None, lifecycle=None):
+def aggregate_runtime_smoke(compose, env, production, command, browser=None, lifecycle=None, prepare_only=False):
     """Exercise the real proxy/API/decoder/worker, including restart and history."""
     username, password = "aggregate-" + uuid4().hex, secrets.token_urlsafe(24)
     setup = """
@@ -118,6 +118,8 @@ db.dispose()
         if response.status_code != code:
             raise AssertionError(f"Aggregate HTTP {response.status_code}: {response.text[:500]}")
         return response.json()
+    if prepare_only:
+        return {"username": username, "password": password, "sources": data["sources"], "anchor": anchor.isoformat()}
     with httpx.Client(base_url=origin, verify=env["KAFKA_CA_FILE"] if production else True, timeout=20) as client:
         expect(client.post("/api/v1/auth/local/login", json={"username": username, "password": password}))
         csrf = {"X-CSRF-Token": expect(client.get("/api/v1/auth/session"))["csrf_token"]}

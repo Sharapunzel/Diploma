@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { runInAction } from "mobx";
-import type { DraftStore } from "./DraftStore";
 
-export function useDraftGuard(store: DraftStore) {
+export function useDraftGuard(store: { dirty: boolean }) {
   const navigate = useNavigate();
   const location = useLocation();
   const [leaving, setLeaving] = useState<(() => void) | null>(null);

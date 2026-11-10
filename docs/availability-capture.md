@@ -2,6 +2,15 @@
 
 Новые нормализованные события получают `availability_at` из времени commit в потоке PostgreSQL `pgoutput`. Событие и его маркер записываются в одной транзакции. Декодер сохраняет фактическое время commit маркеров и долговечную позицию LSN в другой транзакции, а затем подтверждает эту позицию слоту. Повтор после сбоя идемпотентен. Старые события не получают выдуманное `availability_at`. Сохранение ретроспективных точек по `backend_processed_at` разрешено только до доказанной границы первой инициализации; неизвестная область остаётся доступна лишь для явно выбранного read-only preview. Порядок обновления и две долговечные границы описаны в [инструкции агрегатов](aggregates.md#обновление-capture).
 
+Commit в pgoutput может прийти раньше, чем исходный writer закончит ожидание
+SyncRep и его XID исчезнет из активных транзакций. Если строка ещё не видна,
+materializer проверяет transactionid-lock этого XID и ограниченно (до 1 с)
+повторяет чтение в новых READ COMMITTED statement snapshots. После завершения
+writer выполняется последнее новое чтение. Отсутствующий маркер, несовпадение
+source/kind/event или исчерпание ожидания по-прежнему откатывают материализацию
+без feedback; барьеры, время commit и durable LSN не подменяются. Реальная
+pgoutput/SyncRep-регрессия: `backend-db --pytest tests/test_availability_visibility.py`.
+
 ## Запуск и права
 
 Оба Compose режима используют PostgreSQL 18 с `wal_level=logical` и `max_slot_wal_keep_size=1GB`. `wal-bootstrap` создаёт узкую публикацию, постоянный logical slot и отдельную роль `diploma_wal_reader`; затем запускается `wal-decoder`. API начинает принимать новые рабочие события после проверки декодера. Роль декодера не читает таблицу `parsed_logs`.
@@ -23,3 +32,9 @@
 Для непрерывности обработки сохраняется последовательность Kafka-checkpoint одного экземпляра consumer с промежутками не более 10 секунд: она должна охватывать всё окно. Штатная остановка и возобновление сохраняют интервал остановки. После аварии или при пропущенных отметках отсутствие непрерывной цепочки даёт `unknown`, даже если свежий checkpoint больше не показывает отставания.
 
 Проверки: `python -B scripts/check_pgoutput_gate.py` для изолированной PostgreSQL, `python -B scripts/agent_test_profiles.py backend-db`, `python -B scripts/agent_test_profiles.py kafka-integration`, а также `smoke-development --check-only` и `smoke-production --check-only` для resolved Compose. Временные ресурсы профилей находятся в `.test_runs/runs/<run-id>/` и удаляются скриптами после успешного запуска.
+
+В gate перед целевым маркером гарантирован отдельный commit. Диагностический
+reader обрабатывает предыдущие commit настоящим materializer/repository/UoW:
+сначала долговечный commit, затем feedback, затем следующее чтение. Целевой
+commit остаётся без feedback для восстановления настоящим decoder после VACUUM;
+проверяются исходное commit-время, идемпотентность replay и отсутствие отката LSN.

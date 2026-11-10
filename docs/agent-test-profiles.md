@@ -22,9 +22,60 @@
 
 Не повторяйте обычный полный `backend-db` после полного `kafka-integration`: его тесты уже выполнены. Проверки Alembic сохраняются в `backend-db --rcf`. Отдельный `backend-db --wal` не требуется, если прошли оба smoke: они уже выполняют тот же WAL bootstrap-сценарий. Он не заменяет общий `check_pgoutput_gate.py`. Исторический исследовательский `check_commit_timestamp_retention.py` не является обязательной ежедневной регрессией.
 
-Профиль `frontend` не запускает Playwright. Сквозные и smoke-профили подготавливают fixtures и проверяют live-сценарии, но текущий CLI не объединяет все browser specs в один полный запуск: например, `smoke-development` выбирает только один сценарий `auth.spec.ts`, а mock-сценарии `events`, `resources*` и `normalizers*` в профили не включены. `end-to-end --aggregate-only` нужен отдельно: только эта ветка текущего runner запускает `aggregates.live.spec.ts` и `aggregates.ui.spec.ts`. Не называйте весь браузерный набор пройденным по одному `frontend` или smoke.
+Профиль `frontend` не запускает Playwright. Стандартный браузерный набор выбирается веткой существующих smoke-профилей:
 
-Остальные браузерные сценарии выполняются на изолированном стенде тех же development Compose-файлов с подготовкой из существующего контура. Полный `auth.spec.ts` требует `PLAYWRIGHT_USERNAME`, `PLAYWRIGHT_PASSWORD` и `PLAYWRIGHT_OIDC=1`; mock-сценариям нужны доступный frontend и `PLAYWRIGHT_BASE_URL`. Из `frontend` mock-набор выбирается командой `npm run test:browser -- events.spec.ts 'resources.*\.spec\.ts' 'normalizers.*\.spec\.ts' --workers=1 --output <абсолютный-каталог-прогона>/browser-results`. Все временные пути и Chromium соответствуют правилам ниже и [resource-policy.md](../harness/resource-policy.md). `playwright.config.ts` не поднимает web server, а профиль CLI не умеет оставлять smoke-стенд работающим: запуск параллельно к завершающемуся smoke по его порту не является воспроизводимым решением. Если для полного браузерного набора требуется автоматизация, её включают в существующий профиль в рамках активной задачи; до выполнения этих сценариев полный браузерный прогон не подтверждён.
+```powershell
+python -B scripts/agent_test_profiles.py smoke-development --browser-only
+python -B scripts/agent_test_profiles.py smoke-development --browser-only --browser-spec detectors.ui.spec.ts detectors.live.spec.ts
+python -B scripts/agent_test_profiles.py smoke-production --browser-only
+python -B scripts/agent_test_profiles.py smoke-production --browser-only --browser-spec detectors.live.spec.ts
+```
+
+Development содержит **17 specs**: полный `auth.spec.ts`, `events.spec.ts`, `resources.spec.ts`, `resources.confirm.spec.ts`, `resources.policy.spec.ts`, `resources.targets.spec.ts`, `normalizers.spec.ts`, `normalizers.ai.spec.ts`, `normalizers.blocks.spec.ts`, `normalizers.feedback.spec.ts`, `normalizers.fix.spec.ts`, `normalizers.source_debug.spec.ts`, `normalizers.tree.spec.ts`, `aggregates.live.spec.ts`, `aggregates.ui.spec.ts`, `detectors.ui.spec.ts`, `detectors.live.spec.ts`. Семейства `resources.*` и `normalizers.*` включаются автоматически. Production содержит **2 specs**: `detectors.live.spec.ts` и `proxy.session.spec.ts`. Другие специальные live-пути не включаются discovery всего каталога.
+
+`--browser-spec` принимает одно или несколько точных имён только своего набора и только вместе с `--browser-only`. Другой профиль, неизвестное имя, дубликаты и сочетания с `--detector-only`, `--aggregate-only`, `--rcf`, `--wal`, `--pytest` отклоняются до создания каталога и Docker-ресурсов. Обычные smoke-команды сохраняют прежние проверки. Браузерная ветка не выполняет общий aggregate/detector runtime smoke, WAL gate, lifecycle up/down/up, TLS-агента или внешний E2E.
+
+Браузерная ветка использует те же Compose-файлы, изолированные project/порты/тома и отдельный Buildx. API получает `KAFKA_CONSUMERS_ENABLED=false`: независимый синтетический обработчик/probe пишет через `ProcessingRepository.store_event` и подписывает наблюдаемые интервалы; Kafka consumer не конкурирует за тестовые идентичности. WAL decoder и оба worker настоящие. История формируется по реальным часам с двухсекундными окнами и изменчивым count; подготовка ждёт 16 последних подтверждённо полных рабочих окон, а не предполагает готовность по задержке. Ускоренный live-прогрев использует шаг 1 секунду. Готовность и пригодность определяет сервер; complete-векторы и время доступности вручную не назначаются. Trees=20/sample=8 относятся только к синтетическим детекторам теста, defaults продукта не меняются. Source/probe/пользователи/история существуют только в своей `diploma_test`.
+
+Подготовка агрегатов переиспользует начальный writer/WAL-шаг `aggregate_runtime_smoke(prepare_only=True)` и прежний `AGGREGATE_BROWSER_CONFIG`, без полного runtime smoke. Отсутствующая обязательная fixture — ошибка профиля. Development auth подготавливает настоящий управляемый OIDC и оставляет его активным для полного auth-набора. Группы выполняются последовательно с `--workers=1`; HMR восстанавливает исходный CSS в finally, runner дополнительно сверяет точные байты. Production выполняет новые detector-маршруты и session/reload через HTTPS в закреплённом временном Chromium с импортированным тестовым CA, без исключений TLS. HMR/mock-набор в production не запускаются.
+
+Фоновая detector fixture публикует атомарный статус процесса/фазы/последовательности.
+Профиль проверяет её PID, продвижение и подтверждённую материализацию настоящих
+event/barrier-маркеров при подготовке,
+установке browser-зависимостей и выполнении тестов. Завершение/зависание fixture
+или потеря capture прерывают собственную команду с безопасными кодами диагностики.
+Лёгкий status-probe использует только стандартную библиотеку: он не запускает
+новый ORM/пул БД на каждый опрос. Writer обновляет отметку capture только после
+материализации своих маркеров, с прежним двухсекундным пределом ожидания.
+
+Перед очисткой detector browser выполняется ограниченная read-only диагностика
+истории: UUID попытки/cutoff, происхождение входов, барьеры и время закрытия
+непригодных working points, интервалы/sequence/received_at относящихся к ним
+аттестаций. Она показывает до 12 попыток, до трёх проблемных окон каждой и до
+восьми отчётов окна; сырые события, подписи и credentials не выводятся.
+
+Установка зависимостей, свежая готовность и тесты делят общий бюджет 1200 с.
+После установки зависимостей и непосредственно перед тестами профиль повторно
+ждёт 16 последних полных рабочих окон, включая новое окно после завершения
+browser-подготовки; прежняя готовность не заменяет эту проверку. Это не повтор
+неудавшегося start: все команды детектора остаются явными действиями теста.
+
+Селекция, обязательность fixtures, свежая готовность и cleanup браузерного контейнера проверяются `scripts/test_browser_test_scenarios.py`, `scripts/test_browser_profile_health.py` и существующим `scripts/test_agent_test_profiles_cleanup.py`. Все файлы, npm-кэш, вывод Playwright и credentials находятся внутри одного каталога прогона; общий finally удаляет Compose, образы, builder/cache и каталог, затем сверяет Docker inventory. Это стандартный браузерный набор frontend, а не полная регрессия всего приложения.
+
+`browser_detector_fixture.working_closure_gate` ограниченно координирует только
+одноразовое чтение evidence при закрытии рабочей точки: блокировка
+`source_interruptions` освобождается транзакцией после реальных отчётов,
+материализации барьеров и checkpoint, включая исключения. Она не исправляет
+готовность исторического batch: сервисные DB-регрессии проверяют поздний
+checkpoint и закреплённый барьер без этой блокировки. Адресный серверный набор:
+`backend-db --rcf --pytest tests/ml/rcf_service.py` и
+`backend-db --pytest tests/test_availability_materializer.py`.
+
+В production тот же тестовый CA передаётся Node-клиенту `page.request`
+через `NODE_EXTRA_CA_CERTS=/tmp/proxy-ca.pem` внутри временного браузерного
+контейнера. Проверка TLS остаётся включённой и у Chromium, и у API-клиента.
+
+Прямой запуск Playwright требует уже подготовленного изолированного стенда; предпочтительны команды `--browser-only` выше. Конфигурация Playwright сама не запускает web server. Запуск тестов по порту уже завершающегося smoke-профиля не является воспроизводимой проверкой.
 
 ## Проверки затронутых областей
 

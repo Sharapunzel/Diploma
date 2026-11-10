@@ -254,12 +254,18 @@ export class AggregatesApi {
         : {}),
     });
   }
-  list(offset = 0, signal?: AbortSignal) {
-    return this.request(
-      `?limit=50&offset=${offset}`,
-      (v) => page(v, card),
-      signal,
-    );
+  list(
+    offset = 0,
+    signal?: AbortSignal,
+    filters: { limit?: number; q?: string; state?: "active" | "archived" } = {},
+  ) {
+    const query = new URLSearchParams({
+      limit: String(filters.limit ?? 50),
+      offset: String(offset),
+    });
+    if (filters.q?.trim()) query.set("q", filters.q.trim());
+    if (filters.state) query.set("state", filters.state);
+    return this.request(`?${query}`, (v) => page(v, card), signal);
   }
   card(id: string, signal?: AbortSignal) {
     return this.request(`/${encodeURIComponent(id)}`, card, signal);

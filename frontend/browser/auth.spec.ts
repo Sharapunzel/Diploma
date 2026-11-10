@@ -78,6 +78,19 @@ async function capture(page: Page, name: string) {
   });
 }
 
+async function restoreHmrStyle(
+  cssPath: string,
+  original: string,
+  changed: string,
+) {
+  const actual = await readFile(cssPath, "utf8");
+  if (actual === changed) await writeFile(cssPath, original, "utf8");
+  else if (actual !== original)
+    throw new Error(
+      "Stylesheet changed outside the HMR test; user changes preserved",
+    );
+}
+
 test("theme toggle cycles system/light/dark, updates Ant tokens and local fonts", async ({
   page,
 }) => {
@@ -284,7 +297,12 @@ test("local login, server session, protected route and confirmed keyboard logout
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/$/);
   await expect(page.locator("#main")).toBeFocused();
-  await tabTo(page, page.getByRole("link", { name: "События" }));
+  await tabTo(
+    page,
+    page
+      .getByRole("navigation", { name: "Основное меню" })
+      .getByRole("link", { name: "События", exact: true }),
+  );
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/events$/);
   await expect(page.locator("#main")).toBeFocused();
@@ -395,6 +413,7 @@ test("mobile navigation, account layout and viewport bounds", async ({
       "normalizers.read",
       "events.read",
       "aggregates.read",
+      "detectors.read",
       "users.read",
       "settings.read",
     ]),
@@ -408,10 +427,11 @@ test("mobile navigation, account layout and viewport bounds", async ({
     { label: "Диагностика", path: "/diagnostics" },
     { label: "События", path: "/events" },
     { label: "Агрегаты", path: "/aggregates" },
+    { label: "Детекторы", path: "/detectors" },
     { label: "Администрирование", path: "/administration" },
   ];
   const verifyLinks = async (nav: Locator) => {
-    await expect(nav.getByRole("link")).toHaveCount(9);
+    await expect(nav.getByRole("link")).toHaveCount(10);
     expect(
       await nav.getByRole("link").evaluateAll((links) =>
         links.map((link) => ({
@@ -822,7 +842,11 @@ test("CSS changes reach the browser through HMR on the external proxy port", asy
       )
       .toBe("#e4f7e4");
   } finally {
-    await writeFile(cssPath, original, "utf8");
+    await restoreHmrStyle(
+      cssPath,
+      original,
+      original.replace(current, changed),
+    );
   }
   await expect
     .poll(() =>

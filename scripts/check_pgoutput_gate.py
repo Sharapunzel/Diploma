@@ -18,30 +18,47 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import agent_test_profiles as profiles
 import psycopg
 from psycopg import pq
 from psycopg.conninfo import make_conninfo
-from sqlalchemy import create_engine, select as sa_select
+from sqlalchemy import create_engine
+from sqlalchemy import select as sa_select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-import agent_test_profiles as profiles
-
 sys.path.insert(0, str(profiles.ROOT / "backend"))
-from app.adapters.pgoutput import PgOutputDecoder  # noqa: E402
-from app.adapters.pgoutput_stream import ReplicationStream  # noqa: E402
-from app.services.implementations.wal_guard import CaptureGuard  # noqa: E402
-from app.adapters.replication_slot import PostgreSQLReplicationSlotAdapter  # noqa: E402
-from app.repositories.sqlalchemy.capture import SqlAlchemyCaptureStateRepository  # noqa: E402
-from app.repositories.sqlalchemy.availability import SqlAlchemyAvailabilityProgressRepository  # noqa: E402
-from app.repositories.sqlalchemy.windows import SqlAlchemyWorkingWindowRepository  # noqa: E402
-from app.repositories.sqlalchemy.evidence import SqlAlchemyCoverageEvidenceRepository  # noqa: E402
-from app.repositories.sqlalchemy import SqlAlchemyUnitOfWork  # noqa: E402
-from app.models import ParsedLog, ProcessedKafkaRecord, Source  # noqa: E402
-from app.models import AggregateSchedule, AvailabilityMarker  # noqa: E402
-from app.repositories.sqlalchemy import processing as processing_repository  # noqa: E402
-from app.services.implementations import working_windows  # noqa: E402
+from app.adapters.pgoutput import PgOutputDecoder
+from app.adapters.pgoutput_stream import ReplicationStream
+from app.adapters.replication_slot import PostgreSQLReplicationSlotAdapter
+from app.models import (
+    AggregateSchedule,
+    ParsedLog,
+    ProcessedKafkaRecord,
+    Source,
+)
+from app.repositories.sqlalchemy import SqlAlchemyUnitOfWork
+from app.repositories.sqlalchemy import (
+    processing as processing_repository,
+)
+from app.repositories.sqlalchemy.availability import (
+    SqlAlchemyAvailabilityProgressRepository,
+)
+from app.repositories.sqlalchemy.capture import (
+    SqlAlchemyCaptureStateRepository,
+)
+from app.repositories.sqlalchemy.evidence import (
+    SqlAlchemyCoverageEvidenceRepository,
+)
+from app.repositories.sqlalchemy.windows import (
+    SqlAlchemyWorkingWindowRepository,
+)
+from app.services.implementations import working_windows
+from app.services.implementations.availability_materializer import (
+    AvailabilityMaterializer,
+)
+from app.services.implementations.wal_guard import CaptureGuard
 
 SLOT = "task30_gate"
 PUBLICATION = "task30_gate_publication"
@@ -188,7 +205,7 @@ def main():
                         started.set()
                         closure.execute("SELECT pg_advisory_xact_lock(30)")
                         closure.execute("INSERT INTO gate_markers VALUES ('barrier', 'barrier')")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - relay any worker failure to the main thread
                     errors.append(exc)
             thread = threading.Thread(target=barrier)
             thread.start()
@@ -353,6 +370,11 @@ def main():
             worker.terminate()
             worker.wait(timeout=10)
             worker = None
+            # A distinct, durable predecessor is guaranteed to precede the
+            # target. Heartbeat/replay transactions may precede it as well.
+            predecessor = uuid4()
+            db.execute("INSERT INTO logs.availability_markers (id,source_identity,kind) VALUES (%s,%s,'barrier')",
+                       (predecessor, uuid4()))
             marker, source, event = uuid4(), uuid4(), uuid4()
             db.execute("""INSERT INTO logs.availability_markers (id, source_identity, kind, event_id)
                 VALUES (%s,%s,'event',%s)""", (marker, source, event))
@@ -360,15 +382,33 @@ def main():
             db.execute("VACUUM FREEZE logs.availability_markers")
             decoder = PgOutputDecoder("logs", "availability_markers", ("id", "source_identity", "kind", "event_id"))
             reader_url = make_url(app_env["WAL_DATABASE_URL"]).set(drivername="postgresql").render_as_string(hide_password=False)
-            with ReplicationStream(reader_url, "diploma_availability", "diploma_availability", decoder) as stream:
-                deadline = time.monotonic() + 15
-                decoded = None
-                while time.monotonic() < deadline:
-                    commit = stream.read_commit(1)
-                    if commit and any(row[0] == str(marker) for row in commit.rows):
-                        decoded = commit
-                        break
-                assert decoded is not None and decoded.committed_at == expected
+            materialization_engine = create_engine(app_env["WAL_DATABASE_URL"])
+            try:
+                with ReplicationStream(reader_url, "diploma_availability", "diploma_availability", decoder) as stream:
+                    deadline = time.monotonic() + 15
+                    decoded, preceding = None, {}
+                    while time.monotonic() < deadline:
+                        commit = stream.read_commit(min(1, deadline - time.monotonic()))
+                        if commit is None:
+                            continue
+                        if any(row[0] == str(marker) for row in commit.rows):
+                            decoded = commit
+                            break  # Deliberately leave this target unacknowledged.
+                        with Session(materialization_engine) as session:
+                            AvailabilityMaterializer(SqlAlchemyAvailabilityProgressRepository(session),
+                                SqlAlchemyUnitOfWork(session), stream).apply(commit)
+                        # apply() has durably committed before the stream's ack.
+                        assert stream.durable_lsn == commit.end_lsn
+                        preceding.update({row[0]: commit for row in commit.rows})
+                    assert decoded is not None and decoded.committed_at == expected
+                    assert str(predecessor) in preceding
+                    previous = preceding[str(predecessor)]
+                    assert db.execute("SELECT availability_at FROM logs.availability_markers WHERE id=%s", (predecessor,)).fetchone()[0] == previous.committed_at
+                    assert previous.end_lsn <= stream.durable_lsn < decoded.end_lsn
+                    assert db.execute("SELECT availability_at FROM logs.availability_markers WHERE id=%s", (marker,)).fetchone()[0] is None
+                    print("Preceding commits materialized and acknowledged in order; target left pending for recovery", flush=True)
+            finally:
+                materialization_engine.dispose()
             with worker_log.open("a", encoding="utf-8") as log:
                 worker = subprocess.Popen([sys.executable, "-B", "-m", "app.wal_decoder"],
                                           env=app_env, cwd=profiles.ROOT / "backend",
@@ -471,6 +511,7 @@ def main():
                                               anchor_utc=anchor, duration_seconds=5))
             def window_service(session):
                 from types import SimpleNamespace
+
                 from app.dependencies import build_aggregate_service
                 from app.ecs import PackagedEcsCatalog
                 aggregate_service = build_aggregate_service(session, PackagedEcsCatalog.load())
@@ -501,7 +542,7 @@ def main():
                     try:
                         with sessions() as session:
                             barrier_result.append(window_service(session).prepare_barrier(schedule_id))
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - relay any worker failure to the main thread
                         barrier_error.append(exc)
                 waiter = threading.Thread(target=close_barrier)
                 waiter.start()
@@ -560,7 +601,7 @@ def main():
             print("Missing slot is rejected by the capture guard", flush=True)
             lost_bootstrap = subprocess.run([sys.executable, "-B", "-m", "app.wal_bootstrap"],
                                             env=app_env, cwd=profiles.ROOT / "backend",
-                                            capture_output=True, text=True, timeout=20)
+                                            capture_output=True, text=True, timeout=20, check=False)
             assert lost_bootstrap.returncode != 0 and "slot missing after capture began" in lost_bootstrap.stderr
             assert db.execute("SELECT count(*) FROM pg_replication_slots WHERE slot_name='diploma_availability'").fetchone()[0] == 0
             print("Application bootstrap refuses to recreate a lost slot", flush=True)

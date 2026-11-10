@@ -233,8 +233,8 @@ class AggregateService:
         return self._card(aggregate, schedule)
 
     @guarded
-    def list(self, limit, offset):
-        items, total = self.repository.list(limit, offset)
+    def list(self, limit, offset, q=None, state=None):
+        items, total = self.repository.list(limit, offset, q.strip() if q else None, state)
         return {"items": [self._card(a, self.repository.schedule(a.schedule_id)) for a in items], "total": total}
 
     def _point(self, aggregate, point):

@@ -40,6 +40,7 @@ export const navigationGroups = [
     label: "Аномалии",
     pages: [
       { path: "/aggregates", label: "Агрегаты", permission: "aggregates.read" },
+      { path: "/detectors", label: "Детекторы", permission: "detectors.read" },
     ],
   },
   {

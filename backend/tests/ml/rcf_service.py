@@ -281,7 +281,8 @@ def test_snapshot_corruption_never_resets_forest(setup):
     factory = AwsModelFactory()
     for kind in ("checksum", "version", "config"):
         state = copy.deepcopy(detector["checkpoint"])
-        if kind == "checksum": state["body"]["updates"] += 1
+        if kind == "checksum":
+            state["body"]["updates"] += 1
         if kind == "version":
             state["body"]["runtime"]["format"] = 999
             state["sha256"] = digest(state["body"])
@@ -803,11 +804,9 @@ def test_real_aggregate_and_saved_signed_evidence(setup):
     assert result["finding"]["start"] == start.isoformat()
 
 
-@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
-def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup):
+def overlapping_history(setup, accelerated=True):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from sqlalchemy import delete
 
     from app.detection.history import plan_windows, warmup_plan
     from app.models import (
@@ -820,11 +819,12 @@ def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup):
     )
     from app.services.implementations.input_attestations import canonical_payload
 
-    plan = warmup_plan(setup.anchor, 10, setup.cutoff, 32, 1)
+    plan = warmup_plan(setup.anchor, 10, setup.cutoff, 32, 1 if accelerated else 10, accelerated)
     windows = list(plan_windows(plan))
     start, end = windows[0][0], windows[-1][1]
     probe_id, generation, worker, report_id = uuid4(), uuid4(), uuid4(), uuid4()
     private = Ed25519PrivateKey.generate()
+    setup.history_private = private
     count = sum(1 + second % 3 for second in range(int((end-start).total_seconds())))
     report = {"id": str(report_id), "probe_id": str(probe_id), "source_id": str(setup.source_id),
         "input_generation": str(generation), "sequence": 1, "start": start.isoformat(),
@@ -874,18 +874,414 @@ def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup):
             when += timedelta(seconds=5)
         session.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
             worker_instance=worker, partitions={"0": {"low": 0, "high": count, "committed": count}}))
+    return plan, windows, events, worker
+
+
+def publish_attempt_evidence(setup, attempt, worker, count, checkpoint=True):
+    """DB-only fixture: commit the accepted attempt's barrier and independent proof."""
+    from uuid import uuid5
+
+    from app.models import AvailabilityMarker, KafkaCheckpoint
+    with setup.database.session_factory.begin() as proof:
+        marker = proof.get(AvailabilityMarker, uuid5(attempt["id"], "warmup"))
+        assert marker is not None
+        marker.availability_at = proof.scalar(select(func.clock_timestamp()))
+    if checkpoint:
+        with setup.database.session_factory.begin() as proof:
+            proof.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
+                worker_instance=worker, partitions={"0": {"low": 0, "high": count, "committed": count}}))
+
+
+def ready_fixture(service, setup, worker, count):
+    original = service.history._ready
+    published = []
+    def ready(source_id, attempt, deadline):
+        if not published:
+            publish_attempt_evidence(setup, attempt, worker, count)
+            published.append(attempt["id"])
+        return original(source_id, attempt, deadline)
+    service.history._ready = ready
+    return published
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("arrival", ["before_attempt", "after_attempt", "missing"])
+def test_ordinary_history_recomputes_unusable_working_batch_at_its_own_barrier(setup, arrival):
+    """Event commit -> working barrier -> report -> new attempt is deterministic."""
+    from uuid import uuid5
+
+    from app.models import AvailabilityMarker, InputAttestation
+    from app.repositories.sqlalchemy.evidence import SqlAlchemyCoverageEvidenceRepository
+    from app.services.implementations.input_attestations import canonical_payload
+    from app.services.implementations.saved_coverage import evaluate_saved_coverage
+
+    plan, windows, events, worker = overlapping_history(setup, accelerated=False)
+    split = windows[-1][0] + timedelta(seconds=5)
+    position = sum(at < split for at in events)
+    # The real event/processed-record transaction is already committed. The
+    # browser writer releases its SHARE source lock before its report transaction;
+    # a source-locked working barrier can legally commit in that interval.
+    with setup.database.session_factory.begin() as writer:
+        writer.scalar(select(Source).where(Source.id == setup.source_id).with_for_update(read=True))
+        first = writer.scalar(select(InputAttestation).where(InputAttestation.source_identity == setup.source_id))
+        tail = {**first.signed_payload, "id": str(uuid4()), "sequence": 2,
+                "start": split.isoformat(), "start_positions": {"0": position}}
+        first.end_utc, first.end_positions = split, {"0": position}
+        first.signed_payload = {**first.signed_payload, "end": split.isoformat(),
+                                "end_positions": {"0": position}}
+        first.signature = setup.history_private.sign(canonical_payload(first.signed_payload))
+        probe_id, generation = first.probe_id, first.input_generation
+    with setup.database.session_factory.begin() as closer:
+        closer.scalar(select(Source).where(Source.id == setup.source_id).with_for_update())
+        old_barrier_at = closer.scalar(select(func.clock_timestamp()))
+        old_barrier_id = uuid5(setup.card.schedule_id, "working-window:47")
+        closer.add(AvailabilityMarker(id=old_barrier_id, source_identity=setup.source_id,
+            kind="barrier", created_at=old_barrier_at, availability_at=old_barrier_at))
+
+    def report():
+        with setup.database.session_factory.begin() as writer:
+            writer.scalar(select(Source).where(Source.id == setup.source_id).with_for_update())
+            received = writer.scalar(select(func.clock_timestamp()))
+            writer.add(InputAttestation(id=UUID(tail["id"]), probe_id=probe_id,
+                source_identity=setup.source_id, input_generation=generation, sequence=2,
+                start_utc=split, end_utc=windows[-1][1], state="covered", topic_identity="synthetic",
+                start_positions={"0": position}, end_positions={"0": len(events)},
+                signed_payload=tail, signature=setup.history_private.sign(canonical_payload(tail)),
+                received_at=received))
+        assert received > old_barrier_at
+        return received
+
+    if arrival == "before_attempt":
+        received_at = report()
+    with setup.database.session_factory() as session:
+        coverage = evaluate_saved_coverage(SqlAlchemyCoverageEvidenceRepository(session),
+            setup.source_id, *windows[-1], old_barrier_at)
+        assert coverage[:2] == ("unknown", "input_coverage_gap")
+    for left, _ in windows[:-1]:
+        point(setup, int((left - setup.anchor).total_seconds()) // setup.duration, 2)
+    closed_id = point(setup, 47, 2, coverage[0])
+    with setup.database.session_factory.begin() as session:
+        closed = session.get(WorkingWindowPoint, closed_id)
+        closed.completeness_reason, closed.evidence_refs = coverage[1:]
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Ordinary history after working gap",
+            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        freeze_attempt_clock(service, setup.cutoff)
+        original = service.history._ready
+        attempts = []
+
+        def ready(source_id, attempt, deadline):
+            if not attempts:
+                publish_attempt_evidence(setup, attempt, worker, len(events))
+                if arrival == "after_attempt":
+                    report()
+                attempts.append(attempt["id"])
+            return original(source_id, attempt, deadline)
+
+        service.history._ready = ready
+        result = prepare(service, identity)
+        attempt = service.repository.attempt(result["attempt_id"])
+        assert attempt["cutoff"] == setup.cutoff and attempt["plan"] == plan
+        assert attempts == [attempt["id"]], result
+        assert len(attempt["inputs"]) == plan["count"]
+        assert all(item["point_id"] is None for item in attempt["inputs"])
+        if arrival == "before_attempt":
+            assert result["state"] == "prepared", result
+            barrier = session.get(AvailabilityMarker, uuid5(attempt["id"], "warmup"))
+            assert old_barrier_at < received_at < barrier.availability_at
+            assert all(item["completeness"] == "complete" for item in attempt["inputs"])
+            assert service.warmup(identity) == {"state": "ready"}
+        else:
+            assert result["state"] == "waiting", result
+            assert attempt["inputs"][-1]["reason"] == "input_coverage_gap"
+            assert attempt["inputs"][-1]["completeness"] == "unknown"
+    with setup.database.session_factory() as session:
+        closed = session.get(WorkingWindowPoint, closed_id)
+        assert (closed.completeness, closed.completeness_reason, closed.evidence_refs) == coverage
+        assert closed.features[0]["value"] == 2
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("accelerated", [False, True])
+def test_history_readiness_sees_late_checkpoint_and_pins_attempt_barrier(setup, accelerated):
+    from app.models import AvailabilityMarker, KafkaCheckpoint
+    plan, _, events, worker = overlapping_history(setup, accelerated)
+    with setup.database.engine.connect() as reader_connection, setup.database.session_factory(bind=reader_connection) as session:
+        reader_pid = session.scalar(select(func.pg_backend_pid()))
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Late proof",
+            config={"sample_size": 16, "output_after": 16, "trees": 20},
+            accelerated=accelerated, step=1 if accelerated else None)
+        freeze_attempt_clock(service, setup.cutoff)
+        original = service.history._ready
+        attempts = []
+        def delayed(source_id, attempt, deadline):
+            if not attempts:
+                publish_attempt_evidence(setup, attempt, worker, len(events), checkpoint=False)
+                # First real probe has no suitable post-barrier checkpoint.
+                assert not original(source_id, attempt, deadline)
+                assert not session.in_transaction()
+                with setup.database.session_factory.begin() as other:
+                    assert other.scalar(select(func.pg_backend_pid())) != reader_pid
+                    other.add(KafkaCheckpoint(source_identity=source_id, topic_identity="synthetic",
+                        worker_instance=worker, partitions={"0": {"low": 0, "high": len(events), "committed": len(events)}}))
+                # A second actor's newer barrier must not move this requirement.
+                with setup.database.session_factory.begin() as other:
+                    at = other.scalar(select(func.clock_timestamp()))
+                    other.add(AvailabilityMarker(source_identity=source_id, kind="barrier",
+                        created_at=at, availability_at=at))
+            attempts.append((attempt["id"], copy.deepcopy(attempt["plan"])))
+            return original(source_id, attempt, deadline)
+        service.history._ready = delayed
+        result = prepare(service, identity)
+        assert result["state"] == "prepared", result
+        attempt = service.repository.attempt(result["attempt_id"])
+        assert attempts and all(row == (attempt["id"], plan) for row in attempts)
+        assert attempt["cutoff"] == setup.cutoff
+        assert len(attempt["inputs"]) == plan["count"]
+        assert all(i["completeness"] == "complete" for i in attempt["inputs"])
+        assert service.warmup(identity) == {"state": "ready"}
+
+
+def test_history_refreshes_remaining_sql_budget_between_working_reads(setup):
+    from sqlalchemy import event
+
+    history(setup)
+    observed = []
+    def inspect_read(_connection, cursor, statement, _parameters, _context, _many):
+        if "logs.working_window_points" not in statement or not statement.lstrip().upper().startswith("SELECT"):
+            return
+        cursor.execute("SHOW statement_timeout")
+        value = cursor.fetchone()[0]
+        milliseconds = float(value[:-2]) if value.endswith("ms") else float(value[:-1]) * 1000
+        observed.append(milliseconds)
+        if len(observed) == 1:
+            cursor.execute("SELECT pg_sleep(0.08)")
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Per statement budget",
+            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        freeze_attempt_clock(service, setup.cutoff)
+        event.listen(setup.database.engine, "before_cursor_execute", inspect_read)
+        try:
+            assert prepare(service, identity)["state"] == "prepared"
+        finally:
+            event.remove(setup.database.engine, "before_cursor_execute", inspect_read)
+        assert len(observed) == 2
+        assert observed[1] <= observed[0] - 50
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+def test_history_restarts_whole_snapshot_when_proof_disappears_after_preflight(setup):
+    from sqlalchemy import delete
+
+    from app.models import KafkaCheckpoint
+    plan, _, events, worker = overlapping_history(setup)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Snapshot race",
+            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
+        freeze_attempt_clock(service, setup.cutoff)
+        ready_fixture(service, setup, worker, len(events))
+        ready = service.history._ready
+        observed = []
+        def race(source, attempt, deadline):
+            if observed:
+                with setup.database.session_factory.begin() as other:
+                    other.add(KafkaCheckpoint(source_identity=source, topic_identity="synthetic",
+                        worker_instance=worker, partitions={"0": {"low": 0, "high": len(events), "committed": len(events)}}))
+            result = ready(source, attempt, deadline)
+            if not observed:
+                assert result
+                with setup.database.session_factory.begin() as other:
+                    other.execute(delete(KafkaCheckpoint).where(
+                        KafkaCheckpoint.source_identity == source,
+                        KafkaCheckpoint.observed_at > setup.cutoff + timedelta(seconds=10)))
+            observed.append(attempt["id"])
+            return result
+        service.history._ready = race
+        result = prepare(service, identity)
+        assert result["state"] == "prepared", result
+        assert len(observed) == 2 and len(set(observed)) == 1
+        attempt = service.repository.attempt(result["attempt_id"])
+        assert attempt["plan"] == plan and len(attempt["inputs"]) == plan["count"]
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("blocked", [False, True])
+def test_history_readiness_deadline_has_no_partial_inputs_or_automatic_retry(setup, blocked, monkeypatch):
+    import time
+
+    from sqlalchemy import text
+
+    overlapping_history(setup)
+    with setup.database.session_factory() as session, setup.database.session_factory() as other:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "No proof",
+            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
+        freeze_attempt_clock(service, setup.cutoff)
+        materialize = service.history.materialize
+        def limited(context, attempt, deadline):
+            if blocked:
+                other.execute(text("LOCK TABLE logs.availability_markers IN ACCESS EXCLUSIVE MODE"))
+            try:
+                return materialize(context, attempt, time.monotonic() + .15)
+            finally:
+                other.rollback()
+        monkeypatch.setattr(service.history, "materialize", limited)
+        started = time.monotonic()
+        result = prepare(service, identity)
+        assert time.monotonic() - started < 3
+        assert result["reason"] == "resource_budget:preparation_seconds"
+        state = service.state(identity)
+        assert state["detector"]["execution_state"] == "failed"
+        assert state["detector"]["failure_code"] == "resource_limit"
+        assert state["detector"]["checkpoint"] is None
+        assert state["detector"]["consumed_index"] is None
+        assert state["warmup"]["inputs"] == [] and state["warmup"]["status"] == "waiting"
+        service.recover(identity)
+        assert service.state(identity)["detector"] == state["detector"]
+        assert identity not in service.candidates()
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("phase", ["readiness", "snapshot"])
+@pytest.mark.parametrize("action", ["stop", "delete", "owner"])
+def test_history_readiness_and_snapshot_are_fenced_before_write(setup, phase, action, monkeypatch):
+    plan, _, events, worker = overlapping_history(setup)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Read fencing",
+            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
+        freeze_attempt_clock(service, setup.cutoff)
+        ready_fixture(service, setup, worker, len(events))
+        original = service.history._ready if phase == "readiness" else service.history.materialize
+        raced = []
+        def mutation(*args):
+            result = original(*args)
+            if not raced:
+                with setup.database.session_factory() as other:
+                    if action == "stop":
+                        build_detector_service(other, setup.catalog).stop(identity)
+                    elif action == "delete":
+                        build_aggregate_service(other, setup.catalog).lifecycle(setup.card.id, "delete", UUID(int=1))
+                    else:
+                        # An independently committed revision invalidates the
+                        # final owner check without releasing the test's lock.
+                        from app.models import DetectorCoordinator
+                        row = other.get(DetectorCoordinator, 1)
+                        row.generation += 1
+                        other.commit()
+                raced.append(True)
+            return result
+        monkeypatch.setattr(service.history, "_ready" if phase == "readiness" else "materialize", mutation)
+        try:
+            with pytest.raises(DetectionError):
+                prepare(service, identity)
+            state = stored(setup, identity)
+            assert state["checkpoint"] is None and state["consumed_index"] is None
+            with setup.database.session_factory() as read:
+                attempt = read.scalar(select(DetectorWarmup).where(DetectorWarmup.detector_id == identity))
+                assert attempt.plan == plan and attempt.inputs == []
+        finally:
+            if action == "owner":
+                from app.models import DetectorCoordinator
+                with setup.database.session_factory.begin() as restore:
+                    restore.get(DetectorCoordinator, 1).generation = OWNER.generation
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("fault,reason", [
+    ("late_attestation", "input_coverage_unavailable"),
+    ("attestation_gap", "input_coverage_gap"),
+    ("heartbeat", "consumer_coverage_gap"),
+    ("backlog", "kafka_backlog_or_retention"),
+    ("retention", "kafka_backlog_or_retention"),
+    ("interrupted", "known_source_or_processing_stop"),
+])
+def test_history_readiness_does_not_promote_invalid_coverage(setup, fault, reason):
+    from app.models import InputAttestation, KafkaCheckpoint, SourceInterruption
+    from app.services.implementations.input_attestations import canonical_payload
+    _, windows, events, worker = overlapping_history(setup)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Invalid coverage",
+            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
+        freeze_attempt_clock(service, setup.cutoff)
+        ready_fixture(service, setup, worker, len(events))
+        original = service.history._ready
+        changed = []
+        def corrupt(*args):
+            result = original(*args)
+            if result and not changed:
+                with setup.database.session_factory.begin() as other:
+                    if fault in {"late_attestation", "attestation_gap"}:
+                        report = other.scalar(select(InputAttestation).where(InputAttestation.source_identity == setup.source_id))
+                        if fault == "late_attestation":
+                            report.received_at = other.scalar(select(func.clock_timestamp())) + timedelta(seconds=1)
+                        else:
+                            report.start_utc += timedelta(seconds=1)
+                            report.signed_payload = {**report.signed_payload, "start": report.start_utc.isoformat()}
+                            report.signature = setup.history_private.sign(canonical_payload(report.signed_payload))
+                    elif fault == "heartbeat":
+                        heartbeat = other.scalar(select(KafkaCheckpoint).where(
+                            KafkaCheckpoint.source_identity == setup.source_id,
+                            KafkaCheckpoint.observed_at > windows[0][0]).order_by(KafkaCheckpoint.observed_at).limit(1))
+                        heartbeat.worker_instance = uuid4()
+                    elif fault == "interrupted":
+                        other.add(SourceInterruption(source_identity=setup.source_id, kind="processing_stopped",
+                            started_at=windows[0][0], ended_at=windows[-1][1]))
+                    else:
+                        checkpoint = other.scalar(select(KafkaCheckpoint).where(
+                            KafkaCheckpoint.source_identity == setup.source_id).order_by(KafkaCheckpoint.observed_at.desc()).limit(1))
+                        checkpoint.partitions = {"0": {"low": 1 if fault == "retention" else 0,
+                            "high": len(events), "committed": len(events) - 1 if fault == "backlog" else len(events)}}
+                changed.append(True)
+            return result
+        service.history._ready = corrupt
+        result = prepare(service, identity)
+        assert result["state"] == "waiting", result
+        attempt = service.repository.attempt(result["attempt_id"])
+        assert any(i["reason"] == reason for i in attempt["inputs"])
+        assert not any(i.get("ml_input") for i in attempt["inputs"])
+        assert stored(setup, identity)["checkpoint"] is None
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("mutation", ["delete", "add"])
+def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup, mutation):
+    from sqlalchemy import delete
+
+    from app.models import AvailabilityMarker, ParsedLog
+    plan, windows, events, worker = overlapping_history(setup)
     with setup.database.session_factory() as session:
         service = build_detector_service(session, setup.catalog)
         identity = service.create(setup.card.id, UUID(int=1), "Overlap",
             config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
         freeze_attempt_clock(service, setup.cutoff)
+        ready_fixture(service, setup, worker, len(events))
         calculate = service.history.aggregates.calculate
         removed = []
         def delete_during_batch(*args):
             result = calculate(*args)
             if not removed:
                 with setup.database.session_factory.begin() as deleting:
-                    deleting.execute(delete(ParsedLog).where(ParsedLog.source_id == setup.source_id))
+                    if mutation == "delete":
+                        deleting.execute(delete(ParsedLog).where(ParsedLog.source_id == setup.source_id))
+                    else:
+                        when = windows[len(windows) // 2][0]
+                        record_id = processed_record(deleting, setup, len(events), when)
+                        event = ParsedLog(id=uuid4(), source_id=setup.source_id, normalizer_version=1,
+                            processed_record_id=record_id, normalizer_name="ECS", source_name="overlap",
+                            connection_name="Synthetic", kafka_topic=str(setup.source_id), kafka_partition=0,
+                            kafka_offset=len(events), deduplication_key=str(uuid4()), raw="synthetic",
+                            ecs_data={"@timestamp": when.isoformat()}, normalization_status="complete",
+                            normalization_diagnostics=[], fluent_bit_collected_at=when,
+                            backend_received_at=when, backend_processed_at=when)
+                        deleting.add(event)
+                        deleting.add(AvailabilityMarker(source_identity=setup.source_id, kind="event",
+                            event_id=event.id, availability_at=when))
                 removed.append(True)
             return result
         service.history.aggregates.calculate = delete_during_batch

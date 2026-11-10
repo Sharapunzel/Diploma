@@ -1,6 +1,6 @@
 """Aggregate HTTP boundary: typed requests, permissions and service calls."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query
@@ -58,8 +58,10 @@ def create(body: CreateAggregateRequest, service: Service, principal: Write,
 
 @router.get("", response_model=AggregatePage)
 def list_aggregates(service: Service, _: Read, limit: int = Query(50, ge=1, le=100),
-                    offset: int = Query(0, ge=0, le=100000)):
-    return service.list(limit, offset)
+                    offset: int = Query(0, ge=0, le=100000),
+                    q: str | None = Query(None, max_length=200),
+                    state: Literal["active", "archived"] | None = None):
+    return service.list(limit, offset, q, state)
 
 
 @router.get("/{aggregate_id}", response_model=AggregateCard)

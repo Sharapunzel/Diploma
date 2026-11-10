@@ -50,16 +50,21 @@ class SqlAlchemyCoverageEvidenceRepository:
                  ProbeEvidence(probe.id, probe.source_identity, probe.input_generation,
                                probe.public_key, probe.is_active)) for item, probe in pairs]
 
-    def checkpoint(self, source_id: UUID, topic: str, end: datetime,
-                   barrier_at: datetime) -> CheckpointEvidence | None:
-        item = self.session.scalar(select(KafkaCheckpoint).where(
+    def checkpoint(self, source_id: UUID, topic: str | None, end: datetime,
+                   barrier_at: datetime, reference_at: datetime | None = None) -> CheckpointEvidence | None:
+        # None is used only by readiness; completeness always supplies the
+        # signed attestation's exact topic identity in the final snapshot.
+        clock = reference_at if reference_at is not None else func.clock_timestamp()
+        query = select(KafkaCheckpoint).where(
             KafkaCheckpoint.source_identity == source_id,
-            KafkaCheckpoint.topic_identity == topic,
             KafkaCheckpoint.observed_at >= end,
             KafkaCheckpoint.observed_at >= barrier_at,
-            KafkaCheckpoint.observed_at >= func.clock_timestamp() - timedelta(seconds=10),
-            KafkaCheckpoint.observed_at <= func.clock_timestamp(),
-        ).order_by(KafkaCheckpoint.observed_at.desc()).limit(1))
+            KafkaCheckpoint.observed_at >= clock - timedelta(seconds=10),
+            KafkaCheckpoint.observed_at <= clock,
+        )
+        if topic is not None:
+            query = query.where(KafkaCheckpoint.topic_identity == topic)
+        item = self.session.scalar(query.order_by(KafkaCheckpoint.observed_at.desc()).limit(1))
         return CheckpointEvidence(item.id, item.partitions) if item else None
 
     def consumer_heartbeats(self, source_id: UUID, topic: str, start: datetime,

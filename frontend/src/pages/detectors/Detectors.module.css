@@ -1,0 +1,175 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  max-width: 100%;
+}
+.page a {
+  color: var(--color-accent-strong);
+}
+.page a:hover {
+  color: var(--color-accent-hover);
+}
+.toolbar {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.panel {
+  display: grid;
+  gap: 16px;
+  padding: clamp(14px, 2vw, 24px);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: 18px;
+  box-shadow: var(--color-shadow);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 16px;
+}
+.scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+.table th,
+.table td {
+  padding: 10px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--color-border);
+  min-width: 130px;
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+.form {
+  width: 100%;
+  box-sizing: border-box;
+  align-items: start;
+}
+.formFields {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+}
+.inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.cell {
+  display: grid;
+  gap: 6px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.catalogPopup :global(.ant-select-item-option-content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.tablePagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+}
+.modalActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.zoneField {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.infoButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  padding: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: help;
+  border-radius: 6px;
+  font-size: 16px;
+}
+.infoButton:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.detectorsTable {
+  min-width: 0;
+  max-width: 100%;
+}
+.detectorsTable :global(.ant-table-cell) {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  position: relative;
+}
+.detectorsTable :global(.ant-table-cell:not(:last-child)::after) {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  border-right: 1px solid var(--color-border);
+  content: "";
+  pointer-events: none;
+}
+.detectorsTable :global(.ant-table-content) {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.page p {
+  margin: 0;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.field :global(.ant-select) {
+  width: 100%;
+  min-width: 0;
+}
+.page h2,
+.page h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.page dl {
+  margin: 0;
+}
+.page dt {
+  opacity: 0.75;
+  margin-top: 10px;
+}
+.page dd {
+  margin: 3px 0;
+  overflow-wrap: anywhere;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.error {
+  color: var(--color-danger);
+}
+.hint {
+  margin: 4px 0;
+  opacity: 0.85;
+}
