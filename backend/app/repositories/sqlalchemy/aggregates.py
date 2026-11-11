@@ -19,9 +19,10 @@ from ...models import (
     WorkingWindowPoint,
 )
 from .aggregate_compiler import aggregate_statement, read_statistics
+from .aggregate_field_catalog import SqlAlchemyFieldCatalogQueries
 
 
-class SqlAlchemyAggregateRepository:
+class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
     def __init__(self, session: Session):
         self.session = session
 

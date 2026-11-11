@@ -6,16 +6,19 @@ from .rules import CompiledRule, Limits, RuleError
 def estimate(compiled: CompiledRule, rows: int, source_rows: int, duration: int,
              limits: Limits, preview: bool, row_width: int = 256) -> dict:
     width = len(compiled.rule.features)
-    distinct = sum(f.op == "distinct_count" for f in compiled.rule.features)
+    internal = compiled.calculation_features
+    distinct = sum(f.op == "distinct_count" for f in internal)
     materialized = sum(f.op in {"median", "percentile", "mode_count", "mode_share"}
-                       for f in compiled.rule.features)
-    statement_columns = 5 + 3 * sum(f.op != "derive" for f in compiled.rule.features)
+                       for f in internal)
+    statement_columns = 5 + 3 * sum(f.op != "derive" for f in internal)
     # Conservative uncompressed exact-set allowance. PostgreSQL's work_mem is
     # per operation; account separately for concurrent aggregate transition state.
     row_width = max(256, row_width)
     # Include SQL array state, driver values, sort/Counter and serialization;
     # this is deliberately more conservative than the existing distinct weight.
     memory = (distinct + 4 * materialized) * rows * row_width + width * 1024
+    if compiled.plan is not None:
+        memory += len(internal) * 1024
     # New input operations account for full strings/arrays, rather than
     # treating a megabyte record as one scalar. Legacy estimates stay stable.
     input_units = (row_width + 255) // 256 if compiled.extended_input else 1

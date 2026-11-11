@@ -17,6 +17,7 @@ from ....schemas.aggregates import (
     PointCard,
     PointPage,
     PreviewResult,
+    SourceFieldCatalogPage,
     ValidateRequest,
     ValidationResult,
 )
@@ -29,8 +30,15 @@ Write = Annotated[tuple, Depends(require_permission("aggregates.write"))]
 
 
 @router.get("/operators", response_model=list[OperatorCard])
-def operators(service: Service, _: Read):
-    return service.operators()
+def operators(service: Service, _: Read, include_extended: bool = False):
+    return service.operators(include_extended)
+
+
+@router.get("/sources/{source_id}/field-catalog", response_model=SourceFieldCatalogPage)
+def field_catalog(source_id: UUID, service: Service, _: Read,
+                  q: str | None = Query(None, max_length=200),
+                  limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=100000)):
+    return service.field_catalog(source_id, q, limit, offset)
 
 
 @router.get("/sources/{source_id}/fields", response_model=AggregateFieldPage)

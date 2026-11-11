@@ -35,6 +35,116 @@ from app.schemas.aggregates import AggregatePreviewRequest, CreateAggregateReque
 OWNER = None
 
 
+@pytest.mark.parametrize("accelerated", [False, True])
+def test_formula_output_real_capture_history_working_and_checkpoint(catalog, accelerated, monkeypatch):
+    from formula_history import create_formula, real_formula_history, wait_until
+
+    with real_formula_history(catalog) as fixture:
+        card, body, start = create_formula(fixture)
+        # Match the accepted live fixture's model size. The official core can
+        # throw IllegalStateException("out of space") with sample_size=2 on
+        # this repeated stream; changing the model is outside the aggregate task.
+        seconds = 18 if accelerated else 32
+        for second in range(seconds):
+            wait_until(start + timedelta(seconds=second, milliseconds=100))
+            fixture.write(1 + second % 3)
+        end = start + timedelta(seconds=seconds)
+        wait_until(end)
+        fixture.attest(end)
+        with fixture.database.session_factory() as session:
+            service = fixture.detectors(session)
+            identity = service.create(card.id, UUID(int=1), "Formula",
+                config={"sample_size": 8, "output_after": 8, "trees": 20},
+                accelerated=accelerated, step=1 if accelerated else None)
+            service.start(identity)
+            service.begin_start(identity)
+            result = service.prepare_warmup(identity)
+            assert result["state"] == "prepared", result
+            attempt = service.repository.attempt(result["attempt_id"])
+            assert all(item["completeness"] == "complete" for item in attempt["inputs"])
+            assert all([feature["key"] for feature in item["features"]] == ["n"] for item in attempt["inputs"])
+            assert all(item["features"][0]["value"] == 3 * item["event_count"] for item in attempt["inputs"])
+            class DiagnosticPopen(subprocess.Popen):
+                def communicate(self, *args, **kwargs):
+                    result = super().communicate(*args, **kwargs)
+                    if self.returncode:
+                        print("Synthetic formula model process failed:", self.returncode, result[1], flush=True)
+                    return result
+            with monkeypatch.context() as context:
+                context.setattr(subprocess, "Popen", DiagnosticPopen)
+                assert service.warmup(identity) == {"state": "ready"}
+            saved = service.state(identity)["detector"]
+            assert saved["feature_keys"] == ["n"] and saved["config"]["dimensions"] == 1
+            assert saved["accelerated_used"] is accelerated
+            before = saved["checkpoint"]
+
+        # The synthetic input remains observed and idle during Java work.
+        cutoff = datetime.fromisoformat(attempt["plan"]["cutoff"])
+        latest = max(cutoff + timedelta(seconds=2), end + timedelta(seconds=2))
+        wait_until(latest)
+        fixture.attest(latest)
+        at = start
+        snapshots = {item["start"]: item for item in attempt["inputs"]}
+        while at < latest:
+            working = fixture.close_one(card)
+            assert working.completeness == "complete", (working.completeness_reason, working.evidence_refs)
+            with fixture.database.session_factory() as session:
+                api = fixture.aggregates(session)
+                try:
+                    preview = api.preview(body.model_copy(update={"window_start_utc": at, "time_basis": "availability_at"}))
+                except Exception as error:
+                    # Preserve the safe guard reason if a real runtime failure
+                    # remains; never convert an unavailable capture to ready.
+                    print("Synthetic formula preview failed:", getattr(error, "details", None))
+                    raise
+                assert [item.model_dump() for item in preview.features] == working.features
+            matching = snapshots.get(at.isoformat())
+            if matching is not None:
+                assert working.features == matching["features"]
+            at += timedelta(seconds=2)
+        with fixture.database.session_factory() as session:
+            # A fresh service/JVM restores the confirmed checkpoint and consumes
+            # exactly the output projection, with no auxiliary coordinates.
+            service = fixture.detectors(session)
+            result = service.advance_one(identity)
+            assert result["state"] == "evaluated", result
+            after = service.state(identity)["detector"]["checkpoint"]
+            assert after["body"]["updates"] == before["body"]["updates"] + 1
+        with fixture.database.session_factory() as session:
+            service = fixture.detectors(session)
+            assert service.advance_one(identity)["reason"] == "working_point_pending"
+            assert service.state(identity)["detector"]["checkpoint"] == after
+
+        wait_until(latest + timedelta(seconds=2))
+        unknown = fixture.close_one(card)
+        assert unknown.completeness == "unknown" and unknown.features[0]["value"] == 0
+        with fixture.database.session_factory() as session:
+            service = fixture.detectors(session)
+            assert service.advance_one(identity)["state"] == "skipped"
+            assert service.state(identity)["detector"]["checkpoint"] == after
+        from app.models import SourceInterruption
+        stopped_end = latest + timedelta(seconds=4)
+        while stopped_end < datetime.now(UTC) + timedelta(seconds=.5):
+            wait_until(stopped_end)
+            missing_proof = fixture.close_one(card)
+            assert missing_proof.completeness == "unknown"
+            with fixture.database.session_factory() as session:
+                service = fixture.detectors(session)
+                assert service.advance_one(identity)["state"] == "skipped"
+                assert service.state(identity)["detector"]["checkpoint"] == after
+            stopped_end += timedelta(seconds=2)
+        with fixture.database.session_factory.begin() as session:
+            session.get(Source, fixture.source_id).is_enabled = False
+            session.add(SourceInterruption(source_identity=fixture.source_id, kind="source_disabled"))
+        wait_until(stopped_end)
+        interrupted = fixture.close_one(card)
+        assert interrupted.completeness == "interrupted"
+        with fixture.database.session_factory() as session:
+            service = fixture.detectors(session)
+            assert service.advance_one(identity)["state"] == "skipped"
+            assert service.state(identity)["detector"]["checkpoint"] == after
+
+
 @pytest.fixture(scope="module", autouse=True)
 def coordinator(database):
     global OWNER

@@ -10,6 +10,7 @@ from uuid import uuid4, uuid5
 from sqlalchemy.exc import DBAPIError
 
 from ...aggregation.budget import estimate
+from ...aggregation.field_catalog import FieldCatalogLimits
 from ...aggregation.results import interpret_result
 from ...aggregation.rules import (
     OPERATORS,
@@ -33,6 +34,7 @@ from ...schemas.aggregates import (
     ValidateRequest,
     ValidationResult,
 )
+from .aggregate_field_catalog import AggregateFieldCatalogService
 from .saved_coverage import evaluate_saved_coverage
 from .window_schedule import WindowSchedule
 from .working_windows import WorkingWindowService
@@ -73,10 +75,12 @@ def future_index(schedule, now):
 
 class AggregateService:
     def __init__(self, repository: AggregateRepository, windows, evidence, capture,
-                 uow: UnitOfWork, catalog, limits: Limits = Limits(), *, detectors):
+                 uow: UnitOfWork, catalog, limits: Limits = Limits(), *, detectors,
+                 field_catalog_limits: FieldCatalogLimits = FieldCatalogLimits()):
         self.repository, self.windows, self.evidence = repository, windows, evidence
         self.capture, self.uow, self.catalog, self.budget_limits = capture, uow, catalog, limits
         self.detectors = detectors
+        self.field_catalog_limits = field_catalog_limits
 
     def _source(self, source_id):
         source = self.repository.source(source_id)
@@ -181,7 +185,8 @@ class AggregateService:
         request_document = body.model_dump(mode="json")
         # Preserve pre-extension idempotency digests as well as rule hashes.
         # Other legacy nullable fields must retain their original serialization.
-        for feature in request_document["aggregate_rule"]["features"]:
+        for feature in [*request_document["aggregate_rule"]["features"],
+                        *request_document["aggregate_rule"].get("auxiliary", [])]:
             if feature.get("percentile") is None:
                 feature.pop("percentile", None)
         digest = hashlib.sha256(json.dumps(request_document, ensure_ascii=False,
@@ -297,8 +302,12 @@ class AggregateService:
                     if field_support_reason(f, self.catalog) is None and compatible(op, f)]}
                 for f in fields], "total": total}
 
-    def operators(self):
-        return operator_catalog()
+    def operators(self, include_extended=False):
+        return operator_catalog(include_extended)
+
+    def field_catalog(self, source_id, query, limit, offset):
+        return AggregateFieldCatalogService(self.repository, self.uow, self.catalog,
+            self.field_catalog_limits).read(source_id, query, limit, offset)
 
     def _working_calculation(self, aggregate, stored, window):
         from ...aggregation.rules import AggregateRule

@@ -5,7 +5,14 @@ from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AwareDatetime, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    Field,
+    StrictInt,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ..aggregation.rules import AggregateRule, FeatureResult, Node
 
@@ -161,6 +168,8 @@ class PointPage(Node):
 
 
 class OperatorCard(Node):
+    aggregate_operators: list[str] | None = None
+    allowed_in: list[str] | None = None
     weight_formula: str = "weight"
     arity: dict[str, int | None] | None = None
     compatible_fields: list[dict[str, str | bool]] = Field(default_factory=list)
@@ -172,6 +181,14 @@ class OperatorCard(Node):
     result: str
     parameter_types: dict[str, str]
     result_nullable: bool
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        document = handler(self)
+        for key in ("aggregate_operators", "allowed_in"):
+            if getattr(self, key) is None:
+                document.pop(key, None)
+        return document
 
 
 class AggregateField(Node):
@@ -187,3 +204,30 @@ class AggregateField(Node):
 class AggregateFieldPage(Node):
     items: list[AggregateField]
     total: int
+
+
+class SourceCatalogField(AggregateField):
+    provenance: list[Literal["observed", "normalizer"]]
+    normalizer_origin: list[Literal["mapping", "system"]]
+
+
+class CatalogObservation(Node):
+    scope: Literal["all_retained_events"]
+    complete: Literal[True]
+    rows: int
+
+
+class CatalogNormalizer(Node):
+    id: UUID
+    version: int
+
+
+class SourceFieldCatalogPage(UTCResponse):
+    items: list[SourceCatalogField]
+    total: int
+    limit: int
+    offset: int
+    snapshot_at: datetime
+    catalog_hash: str
+    observation: CatalogObservation
+    normalizer: CatalogNormalizer | None

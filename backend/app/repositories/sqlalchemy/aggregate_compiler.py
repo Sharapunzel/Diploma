@@ -191,7 +191,7 @@ def aggregate_statement(base, compiled: CompiledRule):
         columns[1] = func.jsonb_build_array(
             func.max(func.octet_length(data.cast(Text))),
             func.max(func.greatest(*array_sizes, literal(0)))).label("observed_metrics")
-    for i, feature in enumerate(compiled.rule.features):
+    for i, feature in enumerate(compiled.calculation_features):
         if feature.op == "derive":
             continue
         local, local_invalid = compile_condition(feature.where, data, compiled.fields)
@@ -234,7 +234,7 @@ def read_statistics(row, compiled: CompiledRule) -> AggregateStatistics:
         raise RuleError("resource_budget_exceeded", "array_elements",
                         f"Массив превышает {compiled.array_elements} элементов; разделите вход или увеличьте AGGREGATE_ARRAY_ELEMENTS")
     features = {}
-    for i, feature in enumerate(compiled.rule.features):
+    for i, feature in enumerate(compiled.calculation_features):
         if feature.op != "derive":
             value = row[f"v{i}"]
             if feature.op in {"mode_count", "mode_share"} and compiled.fields[feature.field].type == "date" and value is not None:

@@ -7,11 +7,25 @@ import math
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ..ecs import NUMBER_TYPES, EcsCatalog, EcsField
+
+if TYPE_CHECKING:
+    from .plan import CalculationPlan
 
 LiteralValue = StrictStr | StrictBool | StrictInt | StrictFloat
 STRING_TYPES = frozenset({"keyword", "constant_keyword", "wildcard", "text", "match_only_text"})
@@ -45,11 +59,35 @@ class AggregateCondition(Node):
     args: list["AggregateCondition"] | None = None
 
 
+class AggregateOperand(Node):
+    op: str
+    field: str | None = None
+    where: AggregateCondition | None = None
+    percentile: StrictInt | StrictFloat | None = None
+
+
 class Expression(Node):
     op: str | None = None
     args: list["Expression"] | None = None
     ref: str | None = None
     value: StrictInt | StrictFloat | None = None
+    aggregate: AggregateOperand | None = None
+
+    @field_validator("aggregate", mode="before")
+    @classmethod
+    def non_null_aggregate(cls, value):
+        # An omitted extension stays absent in legacy dumps/digests. Explicit
+        # null is invalid input and must fail before a cached create can replay.
+        if value is None:
+            raise ValueError("aggregate_requires_non_null_operand")
+        return value
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        document = handler(self)
+        if self.aggregate is None:
+            document.pop("aggregate", None)
+        return document
 
 
 class Feature(Node):
@@ -65,6 +103,20 @@ class Feature(Node):
 class AggregateRule(Node):
     where: AggregateCondition | None = None
     features: Annotated[list[Feature], Field(min_length=1)]
+    auxiliary: Annotated[list[Feature], Field(min_length=1)] | None = None
+
+    @model_validator(mode="after")
+    def nonempty_auxiliary(self):
+        if "auxiliary" in self.model_fields_set and self.auxiliary is None:
+            raise ValueError("auxiliary_requires_nonempty_array")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        document = handler(self)
+        if self.auxiliary is None:
+            document.pop("auxiliary", None)
+        return document
 
 
 class FeatureResult(Node):
@@ -99,6 +151,7 @@ OPERATORS = {
         *[Operator(n, "feature", ("number",), ("field",), 2, "number")
           for n in ("sum", "avg", "min", "max")],
         Operator("derive", "feature", ("expression",), ("expr",), 0, "number"),
+        Operator("formula", "feature", ("expression",), ("expr",), 0, "number"),
         *[Operator(n, "expression", ("number",), ("args",), 1, "number")
           for n in ("add", "subtract", "multiply", "divide")],
     ]
@@ -170,11 +223,18 @@ class CompiledRule:
     weight: int
     array_elements: int = 4096
     extended_input: bool = False
+    plan: "CalculationPlan | None" = None
+
+    @property
+    def calculation_features(self):
+        return self.plan.steps if self.plan is not None else self.rule.features
 
 
-def operator_catalog() -> list[dict]:
+def operator_catalog(include_extended: bool = False) -> list[dict]:
     result = []
     for op in OPERATORS.values():
+        if op.name == "formula" and not include_extended:
+            continue
         types = {"field": "catalogued_ecs_field", "value": "strict_field_typed_literal",
                  "args": "condition[]" if op.kind == "condition" else "expression[]",
                  "expr": "expression", "percentile": "number[0,1]"}
@@ -194,6 +254,15 @@ def operator_catalog() -> list[dict]:
                            for t in sorted(SCALAR_TYPES) for a in (False, True)
                            if compatible(op, EcsField("", t, "", "", a, "", False, ()))],
                        "result_nullable": op.kind in {"feature", "expression"}})
+    if include_extended:
+        result.append({"name": "aggregate", "kind": "expression_leaf",
+            "inputs": ("window_records",), "parameters": ("aggregate",), "weight": 1,
+            "result": "number", "result_nullable": True,
+            "parameter_types": {"aggregate": "AggregateOperand: op, field?, percentile?, where?; base feature operators only"},
+            "aggregate_operators": [op.name for op in OPERATORS.values()
+                if op.kind == "feature" and op.name not in {"derive", "formula"}],
+            "allowed_in": ["formula.expr"], "weight_formula": "1 + aggregate operator + effective conditions",
+            "arity": None, "compatible_fields": []})
     return result
 
 
@@ -342,18 +411,54 @@ def compile_rule(rule: AggregateRule, catalog: EcsCatalog,
             if len(values) != 2 or ordered[0] > ordered[1]:
                 raise RuleError("invalid_range", path + ".value")
 
-    previous: set[str] = set()
+    extended = bool(rule.auxiliary) or any(f.op == "formula" for f in rule.features)
+    definitions = [(f"features[{i}]", f) for i, f in enumerate(rule.features)]
+    definitions += [(f"auxiliary[{i}]", f) for i, f in enumerate(rule.auxiliary or [])]
+    keys: set[str] = set()
+    for path, feature in definitions:
+        if feature.key in keys:
+            raise RuleError("duplicate_feature_key", path + ".key")
+        keys.add(feature.key)
+    previous: set[str] = keys.copy() if extended else set()
 
-    def expression(node: Expression, depth: int, path: str) -> None:
-        nonlocal weight
+    def aggregate(node: AggregateOperand | Feature, path: str, named: bool):
+        if node.op in {"derive", "formula"}:
+            raise RuleError("invalid_aggregate_operator", path + ".op")
+        operator(node.op, "feature", path + ".op")
+        required = {"op"} | ({"key", "name"} if named else set())
+        needs_field = node.op != "count"
+        _shape(node, required | ({"field"} if needs_field else set()) |
+               ({"percentile"} if node.op == "percentile" else set()), {"where"}, path)
+        if needs_field:
+            field(node.field, node.op, path + ".field")
+        if node.op == "percentile" and not 0 <= node.percentile <= 1:
+            raise RuleError("invalid_percentile", path + ".percentile")
+        if node.where is not None:
+            condition(node.where, 1, path + ".where")
+
+    literal_count = 0
+
+    def expression(node: Expression, depth: int, path: str, formula: bool = False) -> bool:
+        nonlocal weight, literal_count
         if depth > limits.depth:
             raise RuleError("depth_budget_exceeded", path)
         weight += 1 if node.op is None else 0
+        if "aggregate" in node.model_fields_set:
+            if not formula:
+                raise RuleError("aggregate_requires_formula", path + ".aggregate")
+            _shape(node, {"aggregate"}, set(), path)
+            if node.aggregate is None:
+                raise RuleError("invalid_arguments", path + ".aggregate")
+            aggregate(node.aggregate, path + ".aggregate", False)
+            return True
         if node.ref is not None:
             _shape(node, {"ref"}, set(), path)
             if node.ref not in previous:
-                raise RuleError("unknown_or_forward_reference", path + ".ref")
+                raise RuleError("unknown_reference" if extended else "unknown_or_forward_reference", path + ".ref")
         elif node.value is not None:
+            literal_count += 1
+            if extended and literal_count > limits.literals:
+                raise RuleError("literal_budget_exceeded", path + ".value")
             _shape(node, {"value"}, set(), path)
             try:
                 finite = math.isfinite(node.value)
@@ -367,38 +472,41 @@ def compile_rule(rule: AggregateRule, catalog: EcsCatalog,
             low, high = arity(node.op)
             if node.args is None or len(node.args) < low or high is not None and len(node.args) > high:
                 raise RuleError("binary_expression_required" if (low, high) == (2, 2) else "invalid_arity", path)
+            has_aggregate = False
             for i, arg in enumerate(node.args):
-                expression(arg, depth + 1, f"{path}.args[{i}]")
+                has_aggregate |= expression(arg, depth + 1, f"{path}.args[{i}]", formula)
+            return has_aggregate
+        return False
 
     if rule.where is not None:
         condition(rule.where, 1, "where")
-    for i, feature in enumerate(rule.features):
-        path = f"features[{i}]"
-        if feature.key in previous:
-            raise RuleError("duplicate_feature_key", path + ".key")
-        operator(feature.op, "feature", path + ".op")
+    for path, feature in definitions:
         required = {"key", "name", "op"}
-        if feature.op == "derive":
-            _shape(feature, required | {"expr"}, set(), path)
+        if feature.op in {"derive", "formula"}:
+            operator(feature.op, "feature", path + ".op")
+            _shape(feature, required | {"expr"}, {"where"} if feature.op == "formula" else set(), path)
             if feature.expr is None:
                 raise RuleError("expression_required", path)
-            expression(feature.expr, 1, path + ".expr")
-        else:
-            needs_field = feature.op != "count"
-            _shape(feature, required | ({"field"} if needs_field else set()) |
-                   ({"percentile"} if feature.op == "percentile" else set()), {"where"}, path)
-            if needs_field:
-                field(feature.field, feature.op, path + ".field")
-            if feature.op == "percentile" and not 0 <= feature.percentile <= 1:
-                raise RuleError("invalid_percentile", path + ".percentile")
+            own_leaves = expression(feature.expr, 1, path + ".expr", feature.op == "formula")
             if feature.where is not None:
+                if not own_leaves:
+                    raise RuleError("where_without_aggregate", path + ".where")
                 condition(feature.where, 1, path + ".where")
+        else:
+            aggregate(feature, path, True)
         previous.add(feature.key)
+    if extended:
+        from .plan import build_plan, plan_metrics
+        plan = build_plan(rule, definitions)
+        runtime_fields, runtime_weight = plan_metrics(plan, rule.where, fields)
+        return CompiledRule(rule, runtime_fields, canonical, hashlib.sha256(payload).hexdigest(),
+            runtime_weight, limits.array_elements, True, plan)
     return CompiledRule(rule, fields, canonical, hashlib.sha256(payload).hexdigest(), weight,
                         limits.array_elements, extended_input)
 
 
-def evaluate_expression(node: Expression, results: dict[str, FeatureResult], duration: int = 1) -> FeatureResult:
+def evaluate_expression(node: Expression, results: dict[str, FeatureResult], duration: int = 1,
+                        propagate_reason: bool = False) -> FeatureResult:
     def result(value=None, reason=None):
         return FeatureResult(value=value, reason=reason, valid_count=int(reason is None),
                              invalid_count=int(reason is not None))
@@ -415,10 +523,12 @@ def evaluate_expression(node: Expression, results: dict[str, FeatureResult], dur
         return result(value)
     if node.ref is not None:
         referenced = results[node.ref]
+        if propagate_reason and (referenced.reason or referenced.invalid_count):
+            return result(reason=referenced.reason or "invalid_input_type")
         return operand(referenced.value)
     if node.value is not None:
         return operand(node.value)
-    operands = [evaluate_expression(arg, results, duration) for arg in node.args]
+    operands = [evaluate_expression(arg, results, duration, propagate_reason) for arg in node.args]
     if any(arg.value is None for arg in operands):
         return result(reason=next(arg.reason for arg in operands if arg.value is None))
     values = [arg.value for arg in operands]

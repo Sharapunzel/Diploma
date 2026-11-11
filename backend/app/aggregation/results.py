@@ -29,9 +29,9 @@ class AggregateStatistics:
 
 def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, duration: int = 1) -> dict:
     results: dict[str, FeatureResult] = {}
-    for feature in compiled.rule.features:
+    for feature in compiled.calculation_features:
         if feature.op == "derive":
-            result = evaluate_expression(feature.expr, results, duration)
+            result = evaluate_expression(feature.expr, results, duration, compiled.plan is not None)
         else:
             raw = statistics.features[feature.key]
             value = raw.value
@@ -67,4 +67,5 @@ def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, du
     return {"observed_rows": statistics.observed_rows, "event_count": statistics.event_count,
             "observed_width": statistics.observed_width,
             "event_time_min": statistics.event_time_min, "event_time_max": statistics.event_time_max,
-            "features": [{"key": k, **v.model_dump()} for k, v in results.items()]}
+            "features": [{"key": feature.key, **results[feature.key].model_dump()}
+                         for feature in compiled.rule.features]}
