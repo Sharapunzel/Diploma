@@ -46,6 +46,18 @@ export type AggregateField = {
   reason: string | null;
   operators: string[];
 };
+export type SourceField = AggregateField & {
+  provenance: ("observed" | "normalizer")[];
+  normalizer_origin: ("mapping" | "system")[];
+};
+export type FieldCatalog = AggregatePage<SourceField> & {
+  limit: number;
+  offset: number;
+  snapshot_at: string;
+  catalog_hash: string;
+  observation: { scope: "all_retained_events"; complete: true; rows: Json };
+  normalizer: { id: string; version: number } | null;
+};
 export type Validation = {
   rule_hash: string;
   anchor_utc: string;
@@ -270,16 +282,16 @@ export class AggregatesApi {
   card(id: string, signal?: AbortSignal) {
     return this.request(`/${encodeURIComponent(id)}`, card, signal);
   }
-  points(id: string, offset = 0, signal?: AbortSignal) {
+  points(id: string, offset = 0, signal?: AbortSignal, limit = 50) {
     return this.request(
-      `/${encodeURIComponent(id)}/points?limit=50&offset=${offset}`,
+      `/${encodeURIComponent(id)}/points?limit=${limit}&offset=${offset}`,
       (v) => page(v, point),
       signal,
     );
   }
-  operators(signal?: AbortSignal) {
+  operators(signal?: AbortSignal, extended = false) {
     return this.request(
-      "/operators",
+      extended ? "/operators?include_extended=true" : "/operators",
       (v) => {
         if (!Array.isArray(v)) invalid();
         return v.map((item) => {
@@ -306,6 +318,79 @@ export class AggregatesApi {
                   },
           } as unknown as Operator;
         });
+      },
+      signal,
+    );
+  }
+  fieldCatalog(
+    id: string,
+    q = "",
+    offset = 0,
+    signal?: AbortSignal,
+    limit = 50,
+  ) {
+    return this.request(
+      `/sources/${encodeURIComponent(id)}/field-catalog?${new URLSearchParams({ q, offset: String(offset), limit: String(limit) })}`,
+      (value): FieldCatalog => {
+        const v = record(value);
+        const decoded = page(v, (item): SourceField => {
+          const f = record(item);
+          if (
+            typeof f.name !== "string" ||
+            typeof f.type !== "string" ||
+            typeof f.description !== "string" ||
+            typeof f.is_array !== "boolean" ||
+            typeof f.supported !== "boolean" ||
+            !(f.reason === null || typeof f.reason === "string") ||
+            !strings(f.operators) ||
+            !strings(f.provenance) ||
+            !f.provenance.length ||
+            f.provenance.some((p) => !["observed", "normalizer"].includes(p)) ||
+            new Set(f.provenance).size !== f.provenance.length ||
+            !strings(f.normalizer_origin) ||
+            f.normalizer_origin.some(
+              (p) => !["mapping", "system"].includes(p),
+            ) ||
+            new Set(f.normalizer_origin).size !== f.normalizer_origin.length
+          )
+            invalid();
+          return f as unknown as SourceField;
+        });
+        const observation = record(v.observation);
+        const pageLimit = safeInteger(v.limit),
+          pageOffset = safeInteger(v.offset);
+        if (
+          pageLimit < 1 ||
+          pageLimit > 100 ||
+          pageOffset < 0 ||
+          typeof v.snapshot_at !== "string" ||
+          !/(?:Z|\+00:00)$/.test(v.snapshot_at) ||
+          !Number.isFinite(Date.parse(v.snapshot_at)) ||
+          typeof v.catalog_hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(v.catalog_hash) ||
+          observation.scope !== "all_retained_events" ||
+          observation.complete !== true ||
+          !count(observation.rows)
+        )
+          invalid();
+        let normalizer: FieldCatalog["normalizer"] = null;
+        if (v.normalizer !== null) {
+          const n = record(v.normalizer);
+          if (typeof n.id !== "string" || !/^[a-f0-9-]{36}$/i.test(n.id))
+            invalid();
+          const version = safeInteger(n.version);
+          if (version < 1) invalid();
+          normalizer = { id: n.id, version };
+        }
+        return {
+          ...decoded,
+          limit: pageLimit,
+          offset: pageOffset,
+          snapshot_at: v.snapshot_at,
+          catalog_hash: v.catalog_hash,
+          observation: observation as FieldCatalog["observation"],
+          normalizer,
+        };
       },
       signal,
     );

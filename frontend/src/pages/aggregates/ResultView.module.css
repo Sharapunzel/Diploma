@@ -1,0 +1,119 @@
+.result {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+  padding-top: 4px;
+}
+
+.result > h3 {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.5;
+}
+
+.overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  align-items: stretch;
+  gap: 16px;
+  min-width: 0;
+}
+
+.tile {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: clamp(14px, 1.5vw, 20px);
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-surface);
+}
+
+.tile > h4,
+.tile > p {
+  margin: 0;
+}
+
+.tile > h4 {
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+}
+
+.fact {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.fact dt {
+  color: var(--color-text-secondary);
+}
+
+.fact dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.time {
+  display: inline-flex;
+  flex-direction: column;
+  vertical-align: top;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.time code {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.notice {
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+}
+
+.quality {
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table :global(.ant-table table) {
+  width: 100%;
+  table-layout: auto;
+}
+
+.table :global(.ant-table-cell) {
+  position: relative;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.table :global(.ant-table-cell:not(:last-child)::after) {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  border-right: 1px solid var(--color-border);
+  content: "";
+  pointer-events: none;
+}

@@ -5,6 +5,10 @@ export const states: Record<string, string> = {
   preparing: "Подготовка",
   paused: "Приостановлен",
 };
+export const timeBases: Record<string, string> = {
+  availability_at: "По времени доступности сохранённых событий",
+  backend_processed_at_historical: "По времени обработки (ретроспективно)",
+};
 const reasons: Record<string, string> = {
   legacy_coverage_unproven:
     "Полнота прежней ретроспективной истории не доказана",

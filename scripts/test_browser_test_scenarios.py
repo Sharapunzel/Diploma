@@ -19,6 +19,7 @@ def test_mode_selection_is_explicit_and_includes_all_standard_families():
     for family in ("resources", "normalizers"):
         assert {p.name for p in (browser.ROOT / "frontend/browser").glob(f"{family}.*.spec.ts")} <= set(dev)
     assert browser.validate_browser_arguments(arguments(profile="smoke-production")) == list(browser.PRODUCTION)
+    assert "aggregates.live.spec.ts" in browser.PRODUCTION
     assert "external.live.spec.ts" not in dev
     assert "agents.tls.spec.ts" not in dev
 
@@ -94,6 +95,62 @@ def test_production_browser_container_removed_after_failed_run(tmp_path):
         assert "TCP-LISTEN:55443" in test_script
         assert "TCP:127.0.0.1:443" in test_script
         assert "ignoreHTTPSErrors" not in test_script
+
+
+def test_browser_modules_copy_local_dependency_tree_and_reject_escape(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "one.spec.ts").write_text('import { helper } from "./nested/helper";', encoding="utf-8")
+    (source / "nested").mkdir()
+    (source / "nested/helper.ts").write_text('export { value } from "../value";', encoding="utf-8")
+    (source / "value.ts").write_text("export const value = 1;", encoding="utf-8")
+    destination = tmp_path / "dest"
+    browser.copy_browser_modules(source, destination, ["one.spec.ts"])
+    assert (destination / "nested/helper.ts").read_bytes() == (source / "nested/helper.ts").read_bytes()
+    assert (destination / "value.ts").is_file()
+    (source / "bad.spec.ts").write_text('import "../outside";', encoding="utf-8")
+    (tmp_path / "outside.ts").write_text("", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unsafe"):
+        browser.copy_browser_modules(source, destination, ["bad.spec.ts"])
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_production_aggregate_config_paths_ca_export_and_cleanup(tmp_path, monkeypatch, failed):
+    import json
+    source = tmp_path / "frontend"
+    (source / "browser").mkdir(parents=True)
+    for name in ("package.json", "package-lock.json", "playwright.config.ts", "browser/aggregates.live.spec.ts"):
+        (source / name).write_text("{}", encoding="utf-8")
+    detector = tmp_path / "detector.json"
+    detector.write_text("{}", encoding="utf-8")
+    aggregate = tmp_path / "aggregate.json"
+    exported = tmp_path / "owned.json"
+    aggregate.write_text(json.dumps({"username":"test", "password":"synthetic", "sources":["one","two"], "anchor":"2026-01-01T00:00:00Z", "result":str(exported)}), encoding="utf-8")
+    calls = []
+    def command(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["docker", "exec"] and "npx playwright test" in args[-1]:
+            (tmp_path / "browser-results/aggregate-browser-owned.json").write_text('["owned-id"]', encoding="utf-8")
+            if failed:
+                raise RuntimeError("browser failed")
+        return "proxy-id" if "ps" in args else ""
+    cleanup = Mock()
+    monkeypatch.setattr(browser,"ROOT",tmp_path)
+    monkeypatch.setattr(browser.subprocess,"run",cleanup)
+    env = {"DETECTOR_BROWSER_CONFIG":str(detector), "AGGREGATE_BROWSER_CONFIG":str(aggregate), "KAFKA_CA_FILE":str(detector), "TASK21_ADMIN_PASSWORD":"synthetic", "HTTPS_BIND":"127.0.0.1:55443:443", "PUBLIC_ORIGIN":"https://localhost:55443"}
+    if failed:
+        with pytest.raises(RuntimeError, match="browser failed"):
+            browser.production_browsers([],env,"owned",tmp_path,["aggregates.live.spec.ts"],command)
+    else:
+        browser.production_browsers([],env,"owned",tmp_path,["aggregates.live.spec.ts"],command)
+    config = json.loads((tmp_path / "detector-browser-context/aggregate-fixture.json").read_text(encoding="utf-8"))
+    assert config["result"] == "/results/aggregate-browser-owned.json"
+    run = next(args for args in calls if args[:2] == ["docker","run"])
+    assert "AGGREGATE_BROWSER_CONFIG=/test/aggregate-fixture.json" in run
+    assert "DETECTOR_BROWSER_CONFIG=/test/fixture.json" in run
+    assert "NODE_EXTRA_CA_CERTS=/tmp/proxy-ca.pem" in run
+    assert exported.read_text(encoding="utf-8") == '["owned-id"]'
+    assert cleanup.call_args.args[0] == ["docker","rm","-f","owned-detector-browser"]
 
 
 @pytest.mark.parametrize("failed", [False, True])

@@ -1,0 +1,260 @@
+.points {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+.heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.heading > h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.5;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  padding: clamp(14px, 1.5vw, 20px);
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-surface);
+}
+
+.tile > h3,
+.tile > p {
+  margin: 0;
+}
+
+.tile > h3 {
+  font-size: 1rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  width: min(100%, 460px);
+}
+
+.notice {
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+}
+
+.range {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.chartFigure {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  min-width: 0;
+  width: 100%;
+}
+
+.chartLabels {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 220px;
+}
+
+.chartCanvas {
+  min-width: 0;
+  width: 100%;
+  max-width: 1200px;
+  margin-inline: auto;
+}
+
+.timeTick {
+  color: var(--color-border-strong);
+}
+
+.timeAxis {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding-inline: 12px;
+  min-width: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+.axisTick {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.axisTick > span {
+  display: block;
+}
+
+.axisTick:nth-child(2) {
+  text-align: center;
+}
+
+.axisTick:last-child {
+  text-align: right;
+}
+
+@media (max-width: 480px) {
+  .timeAxis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .axisTick:nth-child(2) {
+    display: none;
+  }
+}
+
+.scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: 8px;
+}
+
+.table {
+  width: 100%;
+  min-width: 1100px;
+  border-spacing: 0;
+  border-collapse: separate;
+  background: var(--color-surface-solid);
+  font-size: 14px;
+  line-height: 1.6;
+  text-align: left;
+}
+
+.table > thead > tr > th,
+.table > tbody > tr > td {
+  position: relative;
+  padding: 16px;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.table > thead > tr > th {
+  background: var(--color-surface);
+  font-weight: 600;
+}
+
+.table > tbody > tr > td {
+  padding: 12px;
+}
+
+.table > thead > tr > th:not(:last-child)::after,
+.table > tbody > tr > td:not(:last-child)::after {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  border-right: 1px solid var(--color-border);
+  content: "";
+  pointer-events: none;
+}
+
+.table > thead > tr > th:nth-child(1) {
+  min-width: 180px;
+}
+
+.table > thead > tr > th:nth-child(2) {
+  min-width: 260px;
+}
+
+.table > thead > tr > th:nth-child(3) {
+  min-width: 220px;
+}
+
+.table > thead > tr > th:nth-child(4) {
+  min-width: 100px;
+}
+
+.table > thead > tr > th:nth-child(5) {
+  min-width: 300px;
+}
+
+.valuesSummary {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  min-width: 0;
+  line-height: 1.45;
+}
+
+.valueLine {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.valueLine > code {
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.moreFeatures {
+  padding: 0;
+}
+
+.table > tbody > tr > td > p {
+  margin: 12px 0 0;
+}
+
+.pointIdentity {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.pointIdentity > code {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.pagination {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+
+.points :global(.ant-btn) {
+  max-width: 100%;
+  height: auto;
+  min-height: 32px;
+  white-space: normal;
+}

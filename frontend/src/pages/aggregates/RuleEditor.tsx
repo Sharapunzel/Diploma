@@ -1,340 +1,43 @@
-import { createContext, useContext, useEffect, useId, useState } from "react";
-import { Button, Input, Select, Alert, Pagination, Spin } from "antd";
-import type {
-  AggregatesApi,
-  AggregateField,
-  Operator,
-} from "../../app/api/aggregates";
+import { useCallback, useState } from "react";
+import { Alert, Button, Input, Modal, Radio } from "antd";
+import type { AggregatesApi, Operator } from "../../app/api/aggregates";
 import {
   object,
-  parseAggregate,
   printAggregate,
-  type Json,
   type JsonObject,
 } from "../../app/api/aggregateJson";
-import { AggregateError } from "./AggregateError";
+import {
+  clone,
+  definitions,
+  formula,
+  hasAggregate,
+  referenceErrors,
+  refs,
+  ruleDocument,
+  retainDefinitionOrder,
+  assertVisualReferences,
+} from "../../features/aggregates/rule";
+import {
+  AggregateLeaf,
+  ConditionControl,
+  InvalidContext,
+  NodeEditor,
+  defaultNode,
+} from "./RuleNodes";
 import styles from "./Aggregates.module.css";
+import { FeatureList } from "./FeatureList";
+import { ExpressionInputs } from "./ExpressionInputs";
+import { FieldLabel, OperationSelect, operationLabel } from "./AggregateHelp";
 
-type Context = { operators: Operator[]; api: AggregatesApi; source: string };
-const InvalidContext = createContext<(id: string, invalid: boolean) => void>(
-  () => {},
-);
-function FieldPicker({
-  value,
-  operation,
-  context,
-  onChange,
-}: {
-  value: string;
-  operation: string;
-  context: Context;
-  onChange: (v: string) => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [offset, setOffset] = useState(0);
-  const [items, setItems] = useState<AggregateField[]>([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<unknown>(null);
-  useEffect(() => {
-    const controller = new AbortController();
-    setItems([]);
-    if (!context.source) return;
-    setLoading(true);
-    setError(null);
-    const timer = setTimeout(() => {
-      void context.api
-        .fields(context.source, query, offset, controller.signal)
-        .then((page) => {
-          if (!controller.signal.aborted) {
-            setItems(page.items);
-            setTotal(page.total);
-          }
-        })
-        .catch((e) => {
-          if (!controller.signal.aborted) setError(e);
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setLoading(false);
-        });
-    }, 200);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [context.api, context.source, query, offset]);
-  return (
-    <div className={styles.field}>
-      <label>
-        Поле ECS
-        <Select
-          aria-label="Поле ECS"
-          value={value || undefined}
-          showSearch
-          filterOption={false}
-          onSearch={(q) => {
-            setQuery(q);
-            setOffset(0);
-          }}
-          loading={loading}
-          onChange={onChange}
-          options={[
-            ...(value && !items.some((f) => f.name === value)
-              ? [
-                  {
-                    value,
-                    label: `${value} (проверьте совместимость на сервере)`,
-                  },
-                ]
-              : []),
-            ...items.map((f) => ({
-              value: f.name,
-              label: `${f.name} · ${f.type}${f.is_array ? "[]" : ""}${!f.supported ? ` — ${f.reason || "не поддерживается"}` : !f.operators.includes(operation) ? " — несовместимо" : ""}`,
-              disabled: !f.supported || !f.operators.includes(operation),
-            })),
-          ]}
-        />
-      </label>
-      <Pagination
-        simple
-        size="small"
-        current={offset / 100 + 1}
-        total={total}
-        pageSize={100}
-        showSizeChanger={false}
-        onChange={(p) => setOffset((p - 1) * 100)}
-      />
-      {error !== null && <AggregateError error={error} />}
-      <span className={styles.notice}>
-        Каталог ECS 9.4.0, не перечень наблюдавшихся данных. Поиск и страницы
-        охватывают весь каталог.
-      </span>
-    </div>
-  );
-}
-function Literal({
-  value,
-  label,
-  onChange,
-}: {
-  value: Json;
-  label: string;
-  onChange: (v: Json) => void;
-}) {
-  const serialized = printAggregate(value);
-  const [text, setText] = useState(serialized);
-  const [error, setError] = useState("");
-  const invalid = useContext(InvalidContext);
-  const id = useId();
-  useEffect(() => {
-    invalid(id, !!error);
-    return () => invalid(id, false);
-  }, [invalid, id, error]);
-  useEffect(() => {
-    setText(serialized);
-    setError("");
-  }, [serialized]);
-  return (
-    <label className={styles.field}>
-      {label}
-      <Input
-        aria-label={label}
-        value={text}
-        status={error ? "error" : undefined}
-        onChange={(e) => {
-          setText(e.target.value);
-          try {
-            const v = parseAggregate(e.target.value);
-            if (
-              object(v) ||
-              v === null ||
-              (Array.isArray(v) &&
-                v.some((n) => n === null || object(n) || Array.isArray(n)))
-            )
-              throw new Error();
-            onChange(v);
-            setError("");
-          } catch {
-            setError(
-              "Введите точное JSON-значение: число, строку в кавычках, true/false или однородный список. Незавершённый ввод не применён.",
-            );
-          }
-        }}
-      />
-      {error && <span role="alert">{error}</span>}
-      <span className={styles.notice}>
-        Числа сохраняются точно: 1 и 1.0 различаются. Даты — строки с явным
-        смещением.
-      </span>
-    </label>
-  );
-}
-function defaultNode(op: Operator): JsonObject {
-  const node: JsonObject = { op: op.name };
-  if (op.parameters.includes("field")) node.field = "";
-  if (op.parameters.includes("value"))
-    node.value =
-      op.parameter_types.value?.includes("[]") || op.name === "between"
-        ? []
-        : "";
-  if (op.parameters.includes("args"))
-    node.args = Array.from(
-      { length: op.arity?.min ?? 1 },
-      (): JsonObject =>
-        op.kind === "expression" ? { value: 1 } : { op: "exists", field: "" },
-    );
-  if (op.parameters.includes("expr")) node.expr = { value: 1 };
-  if (op.parameters.includes("percentile"))
-    node.percentile = parseAggregate("0.95");
-  return node;
-}
-function NodeEditor({
-  value,
-  kind,
-  context,
-  previous,
-  path,
-  onChange,
-}: {
-  value: JsonObject;
-  kind: "condition" | "expression";
-  context: Context;
-  previous: string[];
-  path: string;
-  onChange: (v: JsonObject) => void;
-}) {
-  const isExpr = kind === "expression";
-  const selected =
-    value.ref != null
-      ? "$ref"
-      : value.value != null && !value.op
-        ? "$value"
-        : String(value.op);
-  const catalog = context.operators.filter((o) => o.kind === kind);
-  const op = catalog.find((o) => o.name === selected);
-  const args = Array.isArray(value.args) ? value.args : [];
-  return (
-    <fieldset className={styles.node}>
-      <legend>{path}</legend>
-      <label className={styles.field}>
-        Операция
-        <Select
-          aria-label={`${path}: операция`}
-          value={selected}
-          onChange={(name) =>
-            onChange(
-              name === "$ref"
-                ? { ref: previous[0] || "" }
-                : name === "$value"
-                  ? { value: 1 }
-                  : defaultNode(catalog.find((o) => o.name === name)!),
-            )
-          }
-          options={[
-            ...(isExpr
-              ? [
-                  { value: "$ref", label: "Ссылка на предыдущий признак" },
-                  { value: "$value", label: "Числовая константа" },
-                ]
-              : []),
-            ...catalog.map((o) => ({
-              value: o.name,
-              label: `${o.name} (${o.result})`,
-            })),
-          ]}
-        />
-      </label>
-      {selected === "$ref" ? (
-        <label className={styles.field}>
-          Предыдущий признак
-          <Select
-            aria-label={`${path}: ссылка`}
-            value={String(value.ref)}
-            options={previous.map((k) => ({ value: k, label: k }))}
-            onChange={(ref) => onChange({ ref })}
-          />
-        </label>
-      ) : selected === "$value" ? (
-        <Literal
-          value={value.value}
-          label={`${path}: константа`}
-          onChange={(v) => onChange({ value: v })}
-        />
-      ) : (
-        <>
-          {op?.parameters.includes("field") && (
-            <FieldPicker
-              value={String(value.field || "")}
-              operation={op.name}
-              context={context}
-              onChange={(field) => onChange({ ...value, field })}
-            />
-          )}
-          {op?.parameters.includes("value") && (
-            <Literal
-              value={value.value ?? ""}
-              label={`${path}: значение (${op.parameter_types.value})`}
-              onChange={(v) => onChange({ ...value, value: v })}
-            />
-          )}
-          {op?.parameters.includes("args") && (
-            <div className={styles.children}>
-              {args.map(
-                (arg, i) =>
-                  object(arg) && (
-                    <div key={i}>
-                      <NodeEditor
-                        value={arg}
-                        kind={kind}
-                        context={context}
-                        previous={previous}
-                        path={`${path}.args[${i}]`}
-                        onChange={(v) =>
-                          onChange({
-                            ...value,
-                            args: args.map((n, j) => (j === i ? v : n)),
-                          })
-                        }
-                      />
-                      <Button
-                        disabled={args.length <= (op.arity?.min ?? 1)}
-                        onClick={() =>
-                          onChange({
-                            ...value,
-                            args: args.filter((_, j) => j !== i),
-                          })
-                        }
-                      >
-                        Убрать аргумент {i + 1}
-                      </Button>
-                    </div>
-                  ),
-              )}
-              <Button
-                disabled={
-                  op.arity?.max !== null &&
-                  op.arity?.max !== undefined &&
-                  args.length >= op.arity.max
-                }
-                onClick={() =>
-                  onChange({
-                    ...value,
-                    args: [
-                      ...args,
-                      isExpr ? { value: 1 } : { op: "exists", field: "" },
-                    ],
-                  })
-                }
-              >
-                Добавить аргумент
-              </Button>
-            </div>
-          )}
-        </>
-      )}
-    </fieldset>
-  );
-}
+type Props = {
+  rule: JsonObject;
+  operators: Operator[];
+  api: AggregatesApi;
+  source: string;
+  onChange: (rule: JsonObject) => void;
+  onInvalid: (id: string, invalid: boolean) => void;
+  readOnly?: boolean;
+};
 export function RuleEditor({
   rule,
   operators,
@@ -342,235 +45,440 @@ export function RuleEditor({
   source,
   onChange,
   onInvalid,
-}: {
-  rule: JsonObject;
-  operators: Operator[];
-  api: AggregatesApi;
-  source: string;
-  onChange: (rule: JsonObject) => void;
-  onInvalid: (id: string, invalid: boolean) => void;
-}) {
-  const context = { operators, api, source };
-  const features = Array.isArray(rule.features) ? rule.features : [];
-  const change = (index: number, v: JsonObject) =>
-    onChange({
-      ...rule,
-      features: features.map((f, i) => (i === index ? v : f)),
+  readOnly = false,
+}: Props) {
+  const [edit, setEdit] = useState<{
+    group: "features" | "auxiliary";
+    index: number;
+    value: JsonObject;
+    original: string;
+    derived: boolean;
+    alternate: JsonObject | null;
+  } | null>(null);
+  const [invalid, setInvalid] = useState(new Set<string>());
+  const [error, setError] = useState("");
+  const modalInvalid = useCallback(
+    (id: string, bad: boolean) =>
+      setInvalid((old) => {
+        const next = new Set(old);
+        if (bad) next.add(id);
+        else next.delete(id);
+        return next;
+      }),
+    [],
+  );
+  const context = { api, source, operators };
+  const all = definitions(rule);
+  const changeRule = (next: JsonObject) => {
+    assertVisualReferences(rule, next);
+    retainDefinitionOrder(rule, next, true);
+    onChange(next);
+  };
+  const open = (
+    group: "features" | "auxiliary",
+    index: number,
+    value: JsonObject,
+    original: string,
+    derived: boolean,
+  ) => {
+    setInvalid(new Set());
+    setError("");
+    setEdit({
+      group,
+      index,
+      value: clone(value),
+      original,
+      derived,
+      alternate: null,
     });
-  if (!operators.length)
-    return <Spin aria-label="Загрузка каталога операций" />;
+  };
+  const update = (value: JsonObject) =>
+    setEdit((e) => (e ? { ...e, value } : e));
+  const add = (derived: boolean) => {
+    let n = 1;
+    while (all.some((f) => f.key === `feature_${n}`)) n++;
+    open(
+      "features",
+      -1,
+      {
+        key: `feature_${n}`,
+        name: "Новый признак",
+        op: derived ? "formula" : "count",
+        ...(derived ? { expr: { ref: String(all[0]?.key ?? "") } } : {}),
+      },
+      "",
+      derived,
+    );
+  };
+  const changeType = (derived: boolean) => {
+    if (!edit || invalid.size || derived === edit.derived) return;
+    const value =
+      edit.alternate ??
+      (derived
+        ? {
+            op: "formula",
+            expr: {
+              ref: String(all.find((f) => f.key !== edit.value.key)?.key ?? ""),
+            },
+          }
+        : { op: "count" });
+    const next: JsonObject = clone(value);
+    if (edit.value.where != null) next.where = clone(edit.value.where);
+    else delete next.where;
+    setInvalid(new Set());
+    setError("");
+    setEdit({
+      ...edit,
+      derived,
+      alternate: edit.value,
+      value: { ...next, key: edit.value.key, name: edit.value.name },
+    });
+  };
+  const apply = () => {
+    if (!edit || invalid.size) return;
+    const next = clone(rule),
+      current = next[edit.group],
+      list = Array.isArray(current) ? [...current] : [];
+    if (edit.index < 0) list.push(edit.value);
+    else list[edit.index] = edit.value;
+    next[edit.group] = list;
+    try {
+      ruleDocument(printAggregate(next), operators);
+      const errors = referenceErrors(next);
+      if (!String(edit.value.name ?? "").trim())
+        errors.push("Укажите название");
+      if (edit.derived !== refs(edit.value.expr ?? null).length > 0)
+        errors.push(
+          edit.derived
+            ? "Производный признак должен ссылаться на именованный признак"
+            : "Первичный признак не содержит ссылок",
+        );
+      if (errors.length) throw new Error(errors.join("; "));
+      changeRule(next);
+      setEdit(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Проверьте признак");
+    }
+  };
   return (
-    <InvalidContext.Provider value={onInvalid}>
-      <div>
-        <h2>Правило агрегирования</h2>
-        {object(rule.where) ? (
-          <>
-            <NodeEditor
-              kind="condition"
-              value={rule.where}
+    <div className={styles.stack}>
+      <p className={styles.notice}>
+        Вектор содержит{" "}
+        {Array.isArray(rule.features) ? rule.features.length : 0} координат.
+      </p>
+      <FeatureList
+        rule={rule}
+        readOnly={readOnly}
+        onChange={changeRule}
+        onOpen={open}
+      />
+      {!readOnly && (
+        <>
+          <div className={styles.toolbar}>
+            <Button onClick={() => add(false)}>Добавить признак</Button>
+          </div>
+          <InvalidContext.Provider value={onInvalid}>
+            <ConditionControl
+              value={rule.where ?? null}
               context={context}
-              previous={[]}
               path="where"
-              onChange={(where) => onChange({ ...rule, where })}
+              onChange={(where) => changeRule({ ...rule, where })}
             />
-            <Button onClick={() => onChange({ ...rule, where: null })}>
-              Убрать общее условие
-            </Button>
-          </>
-        ) : (
-          <Button
-            onClick={() =>
-              onChange({
-                ...rule,
-                where: { op: "all", args: [{ op: "exists", field: "" }] },
-              })
-            }
-          >
-            Добавить общее условие
-          </Button>
-        )}
-        {features.map((feature, index) => {
-          if (!object(feature)) return null;
-          const op = operators.find(
-            (o) => o.kind === "feature" && o.name === feature.op,
-          );
-          const previous = features
-            .slice(0, index)
-            .filter(object)
-            .map((f) => String(f.key));
-          return (
-            <fieldset key={index} className={styles.node}>
-              <legend>Признак {index + 1}</legend>
-              <div className={styles.grid}>
-                <label className={styles.field}>
-                  Ключ
-                  <Input
-                    aria-label={`features[${index}].key`}
-                    value={String(feature.key)}
-                    onChange={(e) =>
-                      change(index, { ...feature, key: e.target.value })
+          </InvalidContext.Provider>
+        </>
+      )}
+      {readOnly && rule.where != null && (
+        <section className={styles.node}>
+          <h4>Общий отбор событий</h4>
+          <pre className={styles.code}>{printAggregate(rule.where, true)}</pre>
+        </section>
+      )}
+      <Modal
+        open={!!edit}
+        className={styles.featureModal}
+        width="min(1100px, calc(100vw - 24px))"
+        style={{
+          top: 16,
+          margin: "0 auto",
+          height: "calc(100% - 32px)",
+          maxWidth: "calc(100% - 24px)",
+        }}
+        title="Признак"
+        onCancel={() => setEdit(null)}
+        footer={
+          readOnly ? null : (
+            <>
+              <Button onClick={() => setEdit(null)}>Отмена</Button>
+              <Button
+                type="primary"
+                disabled={invalid.size > 0}
+                onClick={apply}
+              >
+                Применить признак
+              </Button>
+            </>
+          )
+        }
+        destroyOnHidden
+      >
+        {edit &&
+          (readOnly ? (
+            <div className={styles.modalBody}>
+              <section className={styles.modalTile}>
+                <h3>1. Настройки признака</h3>
+                <dl>
+                  <dt>Название</dt>
+                  <dd>{String(edit.value.name)}</dd>
+                  <dt>Ключ</dt>
+                  <dd>{String(edit.value.key)}</dd>
+                  <dt>Тип</dt>
+                  <dd>{edit.derived ? "Производный" : "Первичный"}</dd>
+                </dl>
+              </section>
+              <section className={styles.modalTile}>
+                <h3>2. Входы</h3>
+                <p>
+                  {edit.derived
+                    ? `Именованные входы: ${refs(edit.value.expr ?? null).join(", ")}`
+                    : "События выбранного источника за одно окно."}
+                </p>
+              </section>
+              <section className={styles.modalTile}>
+                <h3>3. Операции и условия</h3>
+                <pre className={styles.code}>
+                  {printAggregate(edit.value, true)}
+                </pre>
+              </section>
+              <section className={styles.modalTile}>
+                <h3>4. Итоговая формула</h3>
+                <p className={styles.formula} aria-label="Формула признака">
+                  {formula(edit.value)}
+                </p>
+              </section>
+            </div>
+          ) : (
+            <InvalidContext.Provider value={modalInvalid}>
+              <div className={styles.modalBody}>
+                <section className={styles.modalTile}>
+                  <h3>1. Настройки признака</h3>
+                  <div className={styles.grid}>
+                    <div className={styles.field}>
+                      <FieldLabel
+                        required
+                        help="Понятное название признака. Оно показывается в векторе и результатах расчёта."
+                      >
+                        Название
+                      </FieldLabel>
+                      <Input
+                        aria-label="Название признака"
+                        aria-required
+                        value={String(edit.value.name)}
+                        onChange={(e) =>
+                          update({ ...edit.value, name: e.target.value })
+                        }
+                      />
+                    </div>
+                    <div className={styles.field}>
+                      <FieldLabel
+                        required
+                        help="Уникальный идентификатор для ссылок в формулах: латинская строчная буква, затем буквы, цифры или подчёркивание, до 64 символов. Ключ применённого определения защищён от переименования."
+                      >
+                        Ключ
+                      </FieldLabel>
+                      <Input
+                        aria-label="Ключ признака"
+                        aria-required
+                        disabled={!!edit.original}
+                        value={String(edit.value.key)}
+                        onChange={(e) =>
+                          update({ ...edit.value, key: e.target.value })
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className={styles.field}>
+                    <FieldLabel help="Первичный признак использует события. Производный использует другие именованные признаки и может дополняться собственными ECS-входами.">
+                      Тип признака
+                    </FieldLabel>
+                    <Radio.Group
+                      disabled={invalid.size > 0}
+                      aria-label="Тип признака"
+                      value={edit.derived ? "derived" : "primary"}
+                      onChange={(e) => changeType(e.target.value === "derived")}
+                      options={[
+                        { value: "primary", label: "Первичный" },
+                        { value: "derived", label: "Производный" },
+                      ]}
+                    />
+                  </div>
+                </section>
+                <section className={styles.modalTile}>
+                  <h3>2. Входы</h3>
+                  <p className={styles.notice}>
+                    Входы заменяют формулу черновика либо добавляются к ней с
+                    операцией «+». Арифметика выполняется над итогами одного
+                    окна.
+                  </p>
+                  <ExpressionInputs
+                    key={String(edit.derived)}
+                    context={context}
+                    references={
+                      edit.derived
+                        ? all
+                            .filter((f) => f.key !== edit.value.key)
+                            .map((f) => String(f.key))
+                        : []
                     }
-                  />
-                </label>
-                <label className={styles.field}>
-                  Название
-                  <Input
-                    aria-label={`features[${index}].name`}
-                    value={String(feature.name)}
-                    onChange={(e) =>
-                      change(index, { ...feature, name: e.target.value })
+                    onUse={(expr) =>
+                      update({
+                        key: edit.value.key,
+                        name: edit.value.name,
+                        op: "formula",
+                        expr,
+                        ...(edit.value.where != null
+                          ? { where: edit.value.where }
+                          : {}),
+                      })
                     }
+                    onAppend={(input) => {
+                      const { key, name } = edit.value;
+                      const aggregate = Object.fromEntries(
+                        Object.entries(edit.value).filter(([k]) =>
+                          ["op", "field", "percentile"].includes(k),
+                        ),
+                      );
+                      const previous = object(edit.value.expr)
+                        ? edit.value.expr
+                        : { aggregate };
+                      update({
+                        key,
+                        name,
+                        op: "formula",
+                        expr: { op: "add", args: [previous, input] },
+                        ...(edit.value.where != null
+                          ? { where: edit.value.where }
+                          : {}),
+                      });
+                    }}
                   />
-                </label>
-                <label className={styles.field}>
-                  Агрегация
-                  <Select
-                    aria-label={`features[${index}].op`}
-                    value={String(feature.op)}
+                </section>
+                <section className={styles.modalTile}>
+                  <h3>3. Операции и условия</h3>
+                  <p className={styles.notice}>
+                    Настройте операции, их параметры и порядок вычислений.
+                  </p>
+                  <OperationSelect
+                    label="Способ вычисления"
+                    value={String(edit.value.op)}
                     options={operators
-                      .filter((o) => o.kind === "feature")
-                      .map((o) => ({ value: o.name, label: o.name }))}
-                    onChange={(name) =>
-                      change(index, {
+                      .filter(
+                        (o) =>
+                          o.kind === "feature" &&
+                          (!edit.derived ||
+                            ["formula", "derive"].includes(o.name)),
+                      )
+                      .map((o) => ({
+                        name: o.name,
+                        label: operationLabel(o.name),
+                      }))}
+                    onChange={(op) =>
+                      update({
                         ...defaultNode(
                           operators.find(
-                            (o) => o.kind === "feature" && o.name === name,
+                            (o) => o.kind === "feature" && o.name === op,
                           )!,
                         ),
-                        key: feature.key,
-                        name: feature.name,
+                        key: edit.value.key,
+                        name: edit.value.name,
+                        ...(edit.value.where != null
+                          ? { where: edit.value.where }
+                          : {}),
                       })
                     }
                   />
-                </label>
-              </div>
-              {op?.parameters.includes("field") && (
-                <FieldPicker
-                  context={context}
-                  operation={op.name}
-                  value={String(feature.field || "")}
-                  onChange={(field) => change(index, { ...feature, field })}
-                />
-              )}
-              {op?.parameters.includes("percentile") && (
-                <Literal
-                  label={`features[${index}].percentile (0…1)`}
-                  value={feature.percentile ?? parseAggregate("0.95")}
-                  onChange={(percentile) =>
-                    change(index, { ...feature, percentile })
-                  }
-                />
-              )}
-              {feature.op === "derive" && object(feature.expr) ? (
-                <NodeEditor
-                  kind="expression"
-                  value={feature.expr}
-                  context={context}
-                  previous={previous}
-                  path={`features[${index}].expr`}
-                  onChange={(expr) => change(index, { ...feature, expr })}
-                />
-              ) : (
-                <>
-                  {object(feature.where) ? (
+                  {["formula", "derive"].includes(String(edit.value.op)) &&
+                  object(edit.value.expr) ? (
                     <>
                       <NodeEditor
-                        kind="condition"
-                        value={feature.where}
-                        context={context}
-                        previous={[]}
-                        path={`features[${index}].where`}
-                        onChange={(where) =>
-                          change(index, { ...feature, where })
+                        value={edit.value.expr}
+                        kind="expression"
+                        context={{
+                          ...context,
+                          aggregateLeaves: edit.value.op === "formula",
+                        }}
+                        previous={
+                          edit.derived
+                            ? all
+                                .filter((f) => f.key !== edit.value.key)
+                                .map((f) => String(f.key))
+                            : []
                         }
+                        path="expr"
+                        onChange={(expr) => update({ ...edit.value, expr })}
                       />
-                      <Button
-                        onClick={() =>
-                          change(index, { ...feature, where: null })
-                        }
-                      >
-                        Убрать условие признака
-                      </Button>
+                      {hasAggregate(edit.value.expr) && (
+                        <ConditionControl
+                          value={edit.value.where ?? null}
+                          context={context}
+                          path="feature.where"
+                          onChange={(where) => update({ ...edit.value, where })}
+                        />
+                      )}
+                      {!hasAggregate(edit.value.expr) &&
+                        edit.value.where != null && (
+                          <Alert
+                            type="warning"
+                            message="У формулы нет собственных агрегирующих листьев: это условие недопустимо и не пересчитывает зависимости."
+                            action={
+                              <Button
+                                onClick={() =>
+                                  update({ ...edit.value, where: null })
+                                }
+                              >
+                                Убрать недействующее условие
+                              </Button>
+                            }
+                          />
+                        )}
                     </>
                   ) : (
-                    <Button
-                      onClick={() =>
-                        change(index, {
-                          ...feature,
-                          where: { op: "exists", field: "" },
+                    <AggregateLeaf
+                      value={edit.value}
+                      context={context}
+                      path="feature"
+                      onChange={(v) =>
+                        update({
+                          ...v,
+                          key: edit.value.key,
+                          name: edit.value.name,
                         })
                       }
-                    >
-                      Условие признака
-                    </Button>
+                    />
                   )}
-                </>
-              )}
-              <div className={styles.toolbar}>
-                <Button
-                  disabled={!index}
-                  onClick={() => {
-                    const next = [...features];
-                    [next[index - 1], next[index]] = [
-                      next[index],
-                      next[index - 1],
-                    ];
-                    onChange({ ...rule, features: next });
-                  }}
-                >
-                  Выше
-                </Button>
-                <Button
-                  disabled={index === features.length - 1}
-                  onClick={() => {
-                    const next = [...features];
-                    [next[index], next[index + 1]] = [
-                      next[index + 1],
-                      next[index],
-                    ];
-                    onChange({ ...rule, features: next });
-                  }}
-                >
-                  Ниже
-                </Button>
-                <Button
-                  danger
-                  disabled={features.length === 1}
-                  onClick={() =>
-                    onChange({
-                      ...rule,
-                      features: features.filter((_, i) => i !== index),
-                    })
-                  }
-                >
-                  Удалить признак
-                </Button>
+                </section>
+                <section className={styles.modalTile}>
+                  <h3>4. Итоговая формула</h3>
+                  <p className={styles.formula} aria-label="Формула признака">
+                    {formula(edit.value)}
+                  </p>
+                  <p>
+                    Символическая формула. Численные значения выходов доступны
+                    после предварительного расчёта на сервере.
+                  </p>
+                </section>
+                {error && (
+                  <Alert
+                    type="error"
+                    role="alert"
+                    message={error}
+                    closable
+                    onClose={() => setError("")}
+                  />
+                )}
               </div>
-            </fieldset>
-          );
-        })}
-        <Button
-          onClick={() =>
-            onChange({
-              ...rule,
-              features: [
-                ...features,
-                {
-                  key: `feature_${features.length + 1}`,
-                  name: "Новый признак",
-                  op: "count",
-                },
-              ],
-            })
-          }
-        >
-          Добавить признак
-        </Button>
-        <Alert
-          type="info"
-          message="Порядок задаёт доступные ссылки. Перестановка и удаление не переписывают ссылки; ошибки требуется исправить до отправки."
-        />
-      </div>
-    </InvalidContext.Provider>
+            </InvalidContext.Provider>
+          ))}
+      </Modal>
+    </div>
   );
 }

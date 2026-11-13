@@ -5,9 +5,9 @@
   min-height: 140px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 24px;
   min-width: 0;
-  max-width: 1600px;
+  max-width: 100%;
   margin: 0 auto;
   overflow-wrap: anywhere;
 }
@@ -15,29 +15,107 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
 }
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr));
-  gap: 12px;
+  gap: 20px;
+  align-items: start;
 }
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
 }
 .node {
   border: 1px solid var(--color-border, #8886);
   border-radius: 8px;
   padding: 12px;
-  margin-block: 8px;
+  margin: 0;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.node > legend {
+  padding-inline: 6px;
+}
+.node > p,
+.node > h4,
+.stack > p,
+.stack > h3,
+.block > h3,
+.block > p,
+.modalBody p {
+  margin: 0;
+}
+.block {
+  min-width: 0;
+  margin: 0;
+  padding: clamp(16px, 2vw, 24px);
+  border: 1px solid var(--color-border);
+  border-radius: 18px;
+  background: var(--color-surface-raised);
+  box-shadow: var(--color-shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.block > h3 {
+  font-size: 1.125rem;
+  line-height: 1.5;
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+.processGrid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px;
+}
+.fieldLabel {
+  display: block;
+  line-height: 1.5;
+}
+.field > :global(.ant-select),
+.fullWidth {
+  width: 100%;
+  min-width: 0;
+}
+.inlineField {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 .children {
   border-left: 2px solid var(--color-accent);
   padding-left: 10px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.children > div {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.block > dl {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 3fr;
+  gap: 12px 20px;
+  margin: 0;
+}
+.block > dl > dt {
+  color: var(--color-text-secondary);
+}
+.block > dl > dd {
+  margin: 0;
   min-width: 0;
 }
 .code {
@@ -124,6 +202,285 @@
     padding-left: 4px;
   }
   .page {
-    gap: 10px;
+    gap: 20px;
   }
+}
+@media (max-width: 1000px) {
+  .processGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .processGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .block > dl {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+  .block > dl > dd {
+    margin-bottom: 12px;
+  }
+}
+
+.panel {
+  min-width: 0;
+  padding: clamp(14px, 2vw, 24px);
+  border: 1px solid var(--color-border, #8886);
+  border-radius: 18px;
+  background: var(--color-surface-raised);
+  box-shadow: var(--color-shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.sectionBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.sectionBar h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+.tablePagination {
+  display: flex;
+  justify-content: center;
+}
+.aggregateTable {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.aggregateTable :global(.ant-table table) {
+  width: 100%;
+  table-layout: auto;
+}
+.aggregateTable :global(.ant-table-cell) {
+  position: relative;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.aggregateTable :global(.ant-table-cell:not(:last-child)::after) {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  border-right: 1px solid var(--color-border);
+  content: "";
+  pointer-events: none;
+}
+.aggregateTable :global(.ant-table-cell:last-child) {
+  min-width: max-content;
+  white-space: nowrap;
+}
+.featureName {
+  white-space: normal;
+  text-align: left;
+  height: auto;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.formula {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-family: monospace;
+  line-height: 1.6;
+}
+.modalBody {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.modalTile {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-raised);
+}
+.modalTile > h3,
+.modalTile > p,
+.modalTile dl {
+  margin: 0;
+}
+.modalTile > h3 {
+  font-size: 1rem;
+  line-height: 1.5;
+}
+.modalTile dl {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 3fr;
+  gap: 10px 16px;
+}
+.modalTile dd {
+  margin: 0;
+  min-width: 0;
+}
+.featureList {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  align-items: start;
+  gap: 12px;
+  min-width: 0;
+}
+.featureList > .notice {
+  grid-column: 1 / -1;
+}
+.featureRow {
+  display: grid;
+  gap: 7px;
+  padding: 9px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-raised);
+  min-width: 0;
+}
+.featureHeading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+}
+.featureTitle {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.featureActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 220px;
+}
+.outputSwitch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.disabledBlock {
+  opacity: 0.55;
+}
+.required {
+  color: var(--color-danger, #cf3c3c);
+  font-weight: 700;
+}
+.featureEditIcon {
+  display: none;
+}
+@media (max-width: 480px) {
+  .featureEditLabel {
+    display: none;
+  }
+  .featureEditIcon {
+    display: inline-flex;
+  }
+  .featureEdit {
+    width: 24px;
+    padding-inline: 4px;
+  }
+}
+.featureDetail {
+  margin: 0;
+  color: var(--color-text-secondary);
+  line-height: 1.45;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.errorMessage {
+  position: relative;
+  padding-right: 32px;
+}
+.dismissError {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  z-index: 1;
+}
+.helpContent {
+  display: block;
+  width: min(310px, 80vw);
+  line-height: 1.5;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+/* rc-dialog's focus container sits between the dialog and its content. */
+.featureModal > div:first-child {
+  height: 100%;
+}
+.featureModal :global(.ant-modal-content) {
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+}
+.featureModal :global(.ant-modal-header) {
+  flex: none;
+  margin-bottom: 20px;
+  padding-right: 28px;
+}
+.featureModal :global(.ant-modal-body) {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 6px 12px 6px 6px;
+}
+.featureModal :global(.ant-modal-footer) {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+  padding-top: 16px;
+  margin-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+.featureModal :global(.ant-modal-footer .ant-btn) {
+  margin: 0;
+  max-width: 100%;
+  min-height: 32px;
+  height: auto;
+  white-space: normal;
+}
+.optionPopup :global(.ant-select-item-option-content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.optionDescription {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-block: 4px;
+}
+.optionDescription small {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+.help {
+  color: var(--color-text-secondary);
+  flex: none;
+}
+.help:focus-visible {
+  outline: 2px solid var(--color-accent);
+}
+.toolbar :global(.ant-btn:not(.ant-btn-text)),
+.node :global(.ant-btn:not(.ant-btn-text)) {
+  max-width: 100%;
+  min-height: 32px;
+  height: auto;
+  white-space: normal;
 }

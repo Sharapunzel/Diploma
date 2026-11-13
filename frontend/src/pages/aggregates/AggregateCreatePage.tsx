@@ -1,92 +1,91 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  Alert,
-  Button,
-  Input,
-  Modal,
-  Select,
-  Pagination,
-  Radio,
-  Spin,
-} from "antd";
+import { Button, Input, Radio, Select, Spin } from "antd";
 import { observer } from "mobx-react-lite";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { runInAction } from "mobx";
 import { DraftStore } from "../../features/aggregates/DraftStore";
 import { useAggregateScope } from "../../features/aggregates/useAggregateScope";
-import { PromptStore } from "../../features/aggregates/PromptStore";
 import { useDraftGuard } from "../../features/aggregates/useDraftGuard";
-import { CollectionStore } from "../../features/aggregates/CollectionStore";
+import { browserZone } from "../../features/aggregates/time";
+import {
+  timezoneError,
+  validInstant,
+} from "../../features/aggregates/processValidation";
+import { timeBases } from "../../features/aggregates/labels";
 import { ResourcesApi } from "../../app/api/resources";
 import { useStores } from "../../app/providers/StoresProvider";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
 import { AggregateError } from "./AggregateError";
+import { CalendarTime } from "./CalendarTime";
+import { SourcePicker } from "./SourcePicker";
+import { RuleExchange } from "./RuleExchange";
 import { RuleEditor } from "./RuleEditor";
 import { ResultView, Time } from "./ResultView";
+import { FieldLabel } from "./AggregateHelp";
+import { BudgetView } from "./BudgetView";
+import { AggregateNotice } from "./AggregateNotice";
 import styles from "./Aggregates.module.css";
-
 export const AggregateCreatePage = observer(() => {
-  const [params] = useSearchParams();
-  const from = params.get("copy") || "";
-  const navigate = useNavigate();
-  const { api } = useStores();
+  const [params] = useSearchParams(),
+    from = params.get("copy") || "";
+  const navigate = useNavigate(),
+    { api } = useStores();
   const { store, service, session } = useAggregateScope(
     (service) => new DraftStore(service, from),
     from,
   );
-  // The source list has the same identity lifetime as its draft.
-  const sources = useMemo(() => {
-    void store;
-    const resources = new ResourcesApi(api);
-    return new CollectionStore((offset, signal) =>
-      resources.kafkaSources(offset, undefined, signal),
-    );
-  }, [api, store]);
-  const [promptOpen, setPromptOpen] = useState(false);
-  const [clipboardError, setClipboardError] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const resources = useMemo(() => new ResourcesApi(api), [api]);
   const { leaving, cancelLeave, confirmLeave } = useDraftGuard(store);
-  const { store: promptStore } = useAggregateScope(
-    (api) => new PromptStore(api, store.source),
-    store.source,
-  );
-  const [zone, setZone] = useState("UTC");
-  const [catalogError, setCatalogError] = useState<unknown>(null);
+  const [zone, setZone] = useState(browserZone),
+    [catalogError, setCatalogError] = useState<unknown>(null),
+    [retry, setRetry] = useState(0);
   useEffect(() => {
     const c = new AbortController();
-    void sources.load(0);
+    setCatalogError(null);
     void service
-      .operators(c.signal)
-      .then((operators) => {
-        if (!c.signal.aborted)
-          runInAction(() => {
-            store.setOperators(operators);
-          });
+      .operators(c.signal, true)
+      .then((ops) => {
+        if (!c.signal.aborted) store.setOperators(ops);
       })
       .catch((e) => {
         if (!c.signal.aborted) setCatalogError(e);
       });
     if (from) void store.loadCopy();
-    return () => {
-      c.abort();
-      sources.dispose();
-    };
-  }, [store, sources, service, from]);
-  const available = sources.items.filter((s) => !s.is_archived);
-  const prompt = promptStore.text;
+    return () => c.abort();
+  }, [store, service, from, retry]);
+  const creating = store.lifecycle.isPending("create");
+  const zoneError = timezoneError(zone);
+  const processReady = store.processValid && !zoneError;
+  const processHint = [
+    ...new Set([
+      ...Object.values(store.processErrors),
+      ...(zoneError ? [zoneError] : []),
+    ]),
+  ].join(" ");
+  const budget = store.preview?.budget ?? store.validation?.budget;
+  const create = () =>
+    void store.create().then((aggregate) => {
+      if (aggregate)
+        navigate(`/aggregates/${aggregate.id}`, {
+          state: { aggregateCreated: aggregate.id },
+        });
+    });
   return (
-    <div className={styles.page}>
+    <div
+      className={styles.page}
+      key={`${session.version}|${session.data?.permissions.join("|")}|${from}`}
+    >
       <Link to="/aggregates">← К агрегатам</Link>
-      <h2>{from ? "Копия — новый неизменяемый агрегат" : "Новый агрегат"}</h2>
-      <Alert
-        type="info"
-        message="Сохранённые правило, источник и расписание неизменяемы. Граница в прошлом задаёт фазу UTC-окон; для создания требуется завершённое выровненное окно. Будущая граница не переносится назад автоматически."
-      />
-      {catalogError !== null && <AggregateError error={catalogError} />}
+
+      {catalogError !== null && (
+        <AggregateError
+          error={catalogError}
+          onRetry={() => setRetry((n) => n + 1)}
+        />
+      )}
       {!store.operators.length && catalogError === null && (
         <Spin aria-label="Загрузка каталога операций" />
       )}
-      {!store.editable && (
+      {!store.editable ? (
         <section
           aria-label="Загрузка копии"
           aria-busy={store.copyState === "loading"}
@@ -99,128 +98,177 @@ export const AggregateCreatePage = observer(() => {
               onRetry={() => void store.loadCopy()}
             />
           )}
-          <p>
-            Редактор откроется после загрузки копии. Ввод не будет заменён
-            запоздалым ответом.
-          </p>
         </section>
-      )}
-      {store.editable && (
+      ) : (
         <>
           <fieldset
-            disabled={store.lifecycle.isPending("create")}
-            className={styles.node}
+            disabled={creating}
+            className={styles.block}
+            aria-label="Параметры процесса"
           >
-            <legend>Параметры агрегата</legend>
-            <div className={styles.grid}>
-              <label className={styles.field}>
-                Имя
+            <h3 aria-label="1. Параметры процесса">1. Параметры процесса </h3>
+            <p className={styles.notice}>
+              {from &&
+                "Копия правила: будет создан новый агрегат с отдельным UUID. "}
+              Имя, источник и расписание будущего агрегата. После создания
+              настройки неизменяемы; изменения выполняются через копию. Поля со
+              знаком * обязательны. Заполните их, чтобы перейти к признакам и
+              проверке.
+            </p>
+            <div className={`${styles.grid} ${styles.processGrid}`}>
+              <div className={styles.field}>
+                <FieldLabel
+                  required
+                  help="Название нового неизменяемого агрегата, до 200 символов."
+                >
+                  Имя агрегата
+                </FieldLabel>
                 <Input
                   aria-label="Имя агрегата"
+                  aria-required
+                  aria-invalid={!!store.name && !!store.processErrors.name}
+                  status={
+                    store.name && store.processErrors.name ? "error" : undefined
+                  }
                   maxLength={200}
                   value={store.name}
                   onChange={(e) => store.setField("name", e.target.value)}
                 />
-              </label>
-              <label className={styles.field}>
-                Собственный источник
-                <Select
-                  aria-label="Собственный источник"
-                  value={store.source || undefined}
-                  loading={sources.loading}
-                  options={[
-                    ...(store.source &&
-                    !available.some((s) => s.id === store.source)
-                      ? [
-                          {
-                            value: store.source,
-                            label: `${store.source} — доступность не подтверждена`,
-                          },
-                        ]
-                      : []),
-                    ...available.map((s) => ({ value: s.id, label: s.name })),
-                  ]}
-                  onChange={(v) => store.setField("source", v)}
-                />
-              </label>
-              <Pagination
-                simple
-                pageSize={50}
-                current={sources.offset / 50 + 1}
-                total={sources.total}
-                showSizeChanger={false}
-                onChange={(p) => void sources.load((p - 1) * 50)}
+              </div>
+              <SourcePicker
+                api={resources}
+                value={store.source}
+                disabled={creating}
+                required
+                onChange={(v) => store.setField("source", v)}
               />
-              {sources.error !== null && (
-                <AggregateError
-                  error={sources.error}
-                  onRetry={() => void sources.load()}
-                />
-              )}
-              <label className={styles.field}>
-                Длительность, секунды (1–604800)
+              <div className={styles.field}>
+                <FieldLabel
+                  required
+                  help="Целое число секунд: длина окна и период появления новых точек."
+                >
+                  Длительность, секунды (1–604800)
+                </FieldLabel>
                 <Input
                   aria-label="Длительность, секунды"
+                  aria-required
+                  aria-invalid={!!store.processErrors.duration}
+                  status={store.processErrors.duration ? "error" : undefined}
                   inputMode="numeric"
                   value={store.duration}
                   onChange={(e) => store.setField("duration", e.target.value)}
                 />
-              </label>
-              <label className={styles.field}>
-                Исходная граница с явным смещением
+              </div>
+              <div className={styles.field}>
+                <FieldLabel
+                  required
+                  help="UTC или IANA, например Asia/Yekaterinburg. Смена пояса меняет представление существующих моментов, но не расписание."
+                >
+                  Пояс отображения / ввода новой даты
+                </FieldLabel>
                 <Input
-                  aria-label="Исходная граница"
-                  placeholder="2026-11-01T00:00:00+05:00"
-                  value={store.boundary}
-                  onChange={(e) => store.setField("boundary", e.target.value)}
+                  aria-label="Пояс отображения"
+                  aria-required
+                  aria-invalid={!!zoneError}
+                  status={zoneError ? "error" : undefined}
+                  value={zone}
+                  onChange={(e) => setZone(e.target.value)}
                 />
-              </label>
-              <label className={styles.field}>
-                Исходный IANA-пояс
-                <Input
-                  aria-label="Исходный IANA-пояс"
-                  placeholder="Asia/Yekaterinburg"
-                  value={store.timezone}
-                  onChange={(e) => store.setField("timezone", e.target.value)}
-                />
-              </label>
-            </div>
-            <p>
-              Сервер проверит согласованность смещения с поясом, включая
-              неоднозначное и несуществующее местное время.
-            </p>
-            <div className={styles.toolbar}>
-              <Radio.Group
-                aria-label="Режим правила"
-                value={store.mode}
-                onChange={(e) => store.switchMode(e.target.value)}
-                options={[
-                  { value: "visual", label: "Визуальный" },
-                  { value: "json", label: "JSON" },
-                ]}
-              />
-              <Button
-                disabled={!store.operators.length}
-                onClick={() => {
-                  setClipboardError(false);
-                  setCopied(false);
-                  setPromptOpen(true);
-                  void promptStore.load(store.operators);
+              </div>
+              <CalendarTime
+                label="Исходная граница"
+                zoned
+                required
+                value={store.boundary}
+                zone={zone}
+                disabled={creating}
+                onChange={(v) => {
+                  store.setField("boundary", v);
+                  store.setField("timezone", zone);
                 }}
-              >
-                Промпт для ИИ
-              </Button>
+              />
             </div>
+            <p className={styles.notice}>
+              Исходный пояс расписания: {store.timezone}.
+            </p>
+          </fieldset>
+          {!processReady && (
+            <p className={styles.notice} role="status">
+              Признаки и диагностика станут доступны после заполнения параметров
+              процесса. {processHint}
+            </p>
+          )}
+          {store.unknownCreate && (
+            <div
+              className={styles.block}
+              role="group"
+              aria-label="Неподтверждённое создание"
+            >
+              <AggregateNotice
+                type="warning"
+                message="Результат создания неизвестен. Явный повтор отправит исходные тело и ключ даже после редактирования. Изменённый черновик не считается сохранённым этим повтором."
+              />
+              {store.error !== null && <AggregateError error={store.error} />}
+              <div className={styles.toolbar}>
+                <Button
+                  type="primary"
+                  aria-label="Повторить создание с тем же ключом"
+                  loading={creating}
+                  disabled={
+                    !store.canCreate || !session.has("aggregates.write")
+                  }
+                  onClick={create}
+                >
+                  Повторить создание с тем же ключом
+                </Button>
+              </div>
+            </div>
+          )}
+          <fieldset
+            disabled={creating || !processReady}
+            inert={creating || !processReady}
+            aria-disabled={creating || !processReady}
+            className={`${styles.block} ${!processReady ? styles.disabledBlock : ""}`}
+            aria-label="Выходной вектор и полное правило"
+          >
+            <h3 aria-label="2. Выходной вектор и полное правило">
+              2. Выходной вектор и полное правило{" "}
+            </h3>
+            <p className={styles.notice}>
+              Включённые признаки образуют выходной вектор. Остальные доступны
+              как зависимости формул.
+            </p>
+            <Radio.Group
+              aria-label="Режим правила"
+              value={store.mode}
+              disabled={creating || !processReady}
+              onChange={(e) => store.switchMode(e.target.value)}
+              options={[
+                { value: "visual", label: "Визуальный" },
+                { value: "json", label: "JSON" },
+              ]}
+            />
+            <RuleExchange
+              key={store.source}
+              api={service}
+              source={store.source}
+              operators={store.operators}
+              text={store.text}
+              disabled={creating || !processReady}
+              onImport={store.importText}
+            />
             {store.mode === "json" ? (
-              <label className={styles.field}>
-                aggregate_rule
+              <div className={styles.field}>
+                <FieldLabel help="Полное правило: выходные признаки, внутренние определения и условия отбора. Имя, источник и расписание задаются отдельно.">
+                  Полное правило JSON
+                </FieldLabel>
                 <Input.TextArea
-                  aria-label="aggregate_rule"
+                  aria-label="Полное правило JSON"
                   rows={18}
                   value={store.text}
                   onChange={(e) => store.setText(e.target.value)}
                 />
-              </label>
+              </div>
             ) : (
               <RuleEditor
                 rule={store.rule}
@@ -231,177 +279,152 @@ export const AggregateCreatePage = observer(() => {
                 onInvalid={store.setInvalid}
               />
             )}
+          </fieldset>
+          <fieldset
+            className={`${styles.block} ${!processReady ? styles.disabledBlock : ""}`}
+            disabled={creating || !processReady}
+            inert={creating || !processReady}
+            aria-disabled={creating || !processReady}
+            aria-label="Проверка и диагностика"
+          >
+            <h3 aria-label="3. Проверка и диагностика">
+              3. Проверка и диагностика{" "}
+            </h3>
+            <p>
+              Исходная граница и длительность из параметров процесса задают
+              сетку последовательных окон. Выберите начало одного уже
+              завершённого окна той же длительности: сначала проверьте правило,
+              затем выполните пробный расчёт. Он не создаёт агрегат и не
+              сохраняет точку истории. Корректное правило само по себе не
+              гарантирует полноту данных и пригодность значений для модели.
+            </p>
             <div className={styles.grid}>
-              <label className={styles.field}>
-                Начало preview-окна (ISO)
-                <Input
-                  aria-label="Начало preview-окна"
-                  value={store.window}
-                  onChange={(e) => store.setField("window", e.target.value)}
-                />
-              </label>
-              <label className={styles.field}>
-                Основание preview
+              <CalendarTime
+                label="Начало окна для расчёта"
+                value={store.window}
+                scheduleAnchor={store.validation?.anchor_utc ?? store.boundary}
+                zone={zone}
+                disabled={creating || !processReady}
+                onChange={(v) => store.setField("window", v)}
+              />
+              <div className={styles.field}>
+                <FieldLabel help="В рабочем режиме событие относится к окну по времени, когда запись успешно сохранена и её изменения подтверждены базой данных. Время возникновения события ECS @timestamp может быть раньше. Ретроспективный режим использует время обработки и не подтверждает полноту рабочего окна.">
+                  Отбор событий по времени
+                </FieldLabel>
                 <Select
-                  aria-label="Основание preview"
+                  aria-label="Отбор событий по времени"
                   value={store.timeBasis}
+                  disabled={creating || !processReady}
                   onChange={(v) => store.setField("timeBasis", v)}
                   options={[
                     {
                       value: "availability_at",
-                      label: "Доступность после commit (по умолчанию)",
+                      label: timeBases.availability_at,
                     },
                     {
                       value: "backend_processed_at_historical",
-                      label: "Ретроспективное время обработки (непроверенное)",
+                      label: timeBases.backend_processed_at_historical,
                     },
                   ]}
                 />
-              </label>
+              </div>
             </div>
             {store.timeBasis !== "availability_at" && (
-              <Alert
+              <AggregateNotice
                 type="warning"
-                message="Ретроспективный preview не доказывает полноту и не разрешает сохранение исторической точки."
+                message="Ретроспективный расчёт по времени обработки не доказывает полноту рабочего окна и не разрешает сохранение исторической точки."
               />
             )}
+            {store.localError && (
+              <AggregateNotice
+                type="error"
+                role="alert"
+                message={store.localError}
+              />
+            )}
+            {store.errors.map((e) => (
+              <AggregateNotice type="error" role="alert" key={e} message={e} />
+            ))}
+            {!store.unknownCreate && store.error !== null && (
+              <AggregateError error={store.error} />
+            )}
+            {store.success && (
+              <AggregateNotice
+                type="success"
+                role="status"
+                message={store.success}
+              />
+            )}
+            <div className={styles.toolbar}>
+              <Button
+                aria-label="Проверить правило"
+                loading={store.lifecycle.isPending("validate")}
+                disabled={
+                  store.busy ||
+                  !processReady ||
+                  !store.operators.length ||
+                  !!store.localError ||
+                  !!store.invalidNodes.size ||
+                  !!store.errors.length
+                }
+                onClick={() => void store.validate()}
+              >
+                Проверить правило
+              </Button>
+              <Button
+                aria-label="Предварительный расчёт"
+                loading={store.lifecycle.isPending("preview")}
+                disabled={
+                  !processReady ||
+                  !store.validation ||
+                  !validInstant(store.window) ||
+                  store.busy
+                }
+                onClick={() => void store.runPreview()}
+              >
+                Предварительный расчёт
+              </Button>
+              {!store.unknownCreate && (
+                <Button
+                  type="primary"
+                  aria-label="Создать агрегат"
+                  loading={creating}
+                  disabled={
+                    !processReady ||
+                    !store.canCreate ||
+                    store.busy ||
+                    !session.has("aggregates.write")
+                  }
+                  onClick={create}
+                >
+                  Создать агрегат
+                </Button>
+              )}
+            </div>
+            {store.validation && (
+              <>
+                <p>
+                  Проверенная исходная граница расписания:{" "}
+                  <Time value={store.validation.anchor_utc} zone={zone} />;
+                  длительность {store.validation.duration_seconds} с.
+                </p>
+              </>
+            )}
+            {store.preview && (
+              <ResultView
+                result={store.preview}
+                zone={zone}
+                showBudget={false}
+              />
+            )}
+            {budget && <BudgetView budget={budget} />}
           </fieldset>
-          {store.localError && (
-            <Alert type="error" role="alert" message={store.localError} />
-          )}
-          {store.errors.map((e) => (
-            <Alert type="error" role="alert" key={e} message={e} />
-          ))}
-          {store.error !== null && <AggregateError error={store.error} />}
-          {store.success && (
-            <Alert type="success" role="status" message={store.success} />
-          )}
-          <div className={styles.toolbar}>
-            <Button
-              aria-label="Проверить правило"
-              aria-busy={store.lifecycle.isPending("validate")}
-              loading={store.lifecycle.isPending("validate")}
-              disabled={
-                store.busy ||
-                !store.operators.length ||
-                !!store.localError ||
-                !!store.invalidNodes.size ||
-                !!store.errors.length
-              }
-              onClick={() => void store.validate()}
-            >
-              Проверить правило
-            </Button>
-            <Button
-              aria-label="Предварительный расчёт"
-              aria-busy={store.lifecycle.isPending("preview")}
-              loading={store.lifecycle.isPending("preview")}
-              disabled={!store.validation || store.busy}
-              onClick={() => void store.runPreview()}
-            >
-              Предварительный расчёт
-            </Button>
-            <Button
-              type="primary"
-              aria-label={
-                store.unknownCreate
-                  ? "Повторить создание с тем же ключом"
-                  : "Создать агрегат"
-              }
-              loading={store.lifecycle.isPending("create")}
-              disabled={!store.canCreate || !session.has("aggregates.write")}
-              onClick={() =>
-                void store.create().then((a) => {
-                  if (a)
-                    navigate(`/aggregates/${a.id}`, {
-                      state: { aggregateCreated: a.id },
-                    });
-                })
-              }
-            >
-              {store.unknownCreate
-                ? "Повторить создание с тем же ключом"
-                : "Создать агрегат"}
-            </Button>
-          </div>
-          {store.unknownCreate && (
-            <Alert
-              type="warning"
-              message="Результат создания неизвестен. Явный повтор неизменённого запроса использует тот же ключ и возвращает тот же UUID. Изменение тела создаст новый ключ."
-            />
-          )}
-          <label className={styles.field}>
-            Пояс отображения
-            <Input
-              aria-label="Пояс отображения"
-              value={zone}
-              onChange={(e) => setZone(e.target.value)}
-            />
-          </label>
-          {store.validation && (
-            <p>
-              UTC-якорь:{" "}
-              <Time value={store.validation.anchor_utc} zone={zone} />;
-              длительность {store.validation.duration_seconds} с. Плановый
-              расчёт совпадает с концом окна.
-            </p>
-          )}
-          {store.preview && <ResultView result={store.preview} zone={zone} />}
         </>
       )}
-      <Modal
-        open={promptOpen}
-        title="Промпт для внешнего ИИ"
-        onCancel={() => setPromptOpen(false)}
-        footer={
-          <Button
-            disabled={!prompt || promptStore.lifecycle.isPending("load")}
-            onClick={() => {
-              void (
-                navigator.clipboard?.writeText(prompt) ??
-                Promise.reject(new Error("clipboard unavailable"))
-              )
-                .then(() => setCopied(true))
-                .catch(() => setClipboardError(true));
-            }}
-          >
-            Копировать инструкцию
-          </Button>
-        }
-      >
-        <p>
-          Приложение не обращается к ИИ и не передаёт данные. Прочитайте
-          инструкцию и самостоятельно выберите сведения для передачи. Ответ
-          вставьте в JSON-режим и проверьте.
-        </p>
-        {promptStore.lifecycle.isPending("load") && (
-          <Spin aria-label="Загрузка полного каталога" />
-        )}
-        {promptStore.error !== null && (
-          <AggregateError
-            error={promptStore.error}
-            onRetry={() => void promptStore.load(store.operators)}
-          />
-        )}
-        <Input.TextArea
-          aria-label="Инструкция для ИИ"
-          readOnly
-          rows={14}
-          value={prompt}
-          onFocus={(e) => e.target.select()}
-        />
-        {copied && <p role="status">Инструкция скопирована.</p>}
-        {clipboardError && (
-          <Alert
-            type="warning"
-            message="Буфер обмена недоступен. Выделите инструкцию и скопируйте вручную Ctrl+C."
-          />
-        )}
-      </Modal>
       <ConfirmationDialog
         open={!!leaving}
         title="Покинуть черновик?"
-        message="Несохранённое правило и параметры будут потеряны."
+        message="Несохранённое правило и параметры будут потеряны. Уход не отменяет серверный запрос; при неизвестном исходе создание могло состояться."
         confirmText="Покинуть"
         onCancel={cancelLeave}
         onConfirm={confirmLeave}

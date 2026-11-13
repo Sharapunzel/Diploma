@@ -20,7 +20,7 @@ from uuid import UUID,uuid4
 from app.config import settings
 from app.db import Database
 from app.core.security import hash_password
-from app.models import User,Source,KafkaConnection,ReplicationProgress
+from app.models import User,Source,KafkaConnection,ReplicationProgress,Normalizer
 from sqlalchemy.engine import make_url
 assert make_url(settings.database_url).database=='diploma_test'
 db=Database(settings.database_url)
@@ -32,12 +32,26 @@ with db.session_factory.begin() as s:
  for name in ['authentication','web']:
   source=Source(id=uuid4(),name=name+' '+str(uuid4()),connection_id=connection.id,topic_name=str(uuid4()),is_enabled=False)
   s.add(source);sources.append(str(source.id))
+ empty_source=None
+ normalizer_id=None
+ if os.environ.get('SMOKE_CATALOG')=='1':
+  from app.normalization.compiler import compile_rule
+  rule={'format_version':1,'variants':[{'key':'auth','priority':1,'when':{'kind':'contains','value':'synthetic'},'blocks':[{'key':'user','kind':'map_ecs','target':'user.name','source':{'literal':'Andrew'},'required':False},{'key':'action','kind':'map_ecs','target':'event.action','source':{'literal':'logon'},'required':False}]}]}
+  from app.ecs import PackagedEcsCatalog
+  compile_rule(rule,PackagedEcsCatalog.load())
+  normalizer=Normalizer(id=uuid4(),name='Aggregate browser normalizer',rule=rule)
+  s.add(normalizer);s.flush()
+  normalizer_id=str(normalizer.id)
+  for identity in sources:
+   s.get(Source,UUID(identity)).normalizer_id=normalizer.id
+  empty=Source(id=uuid4(),name='No events '+str(uuid4()),connection_id=connection.id,topic_name=str(uuid4()),is_enabled=False,normalizer_id=normalizer.id)
+  s.add(empty);empty_source=str(empty.id)
  progress=s.get(ReplicationProgress,1)
- print(json.dumps({'sources':sources,'connection':str(connection.id),'verified_from':progress.availability_verified_from_at.isoformat()}))
+ print(json.dumps({'sources':sources,'empty_source':empty_source,'normalizer':normalizer_id,'connection':str(connection.id),'verified_from':progress.availability_verified_from_at.isoformat()}))
 db.dispose()
 """
     # argv contains only synthetic credentials for this disposable profile.
-    output = command([*compose, "exec", "-T", "-e", f"SMOKE_USER={username}",
+    output = command([*compose, "exec", "-T", "-e", f"SMOKE_USER={username}", "-e", f"SMOKE_CATALOG={int(prepare_only or browser is not None)}",
         "-e", f"SMOKE_PASSWORD={password}", "api", "python", "-c", setup], env=env, capture=True)
     data = json.loads(output.strip().splitlines()[-1])
     seed = """
@@ -65,9 +79,10 @@ with db.session_factory.begin() as s:
   source=s.scalar(select(Source).where(Source.id==UUID(source_id)).with_for_update(read=True))
   now=datetime.now(UTC);rid=uuid4()
   record=ProcessedKafkaRecord(id=rid,connection_id=source.connection_id,connection_identity=source.connection_id,kafka_topic_identity=source_id,source_id=source.id,kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=offset,result_status='complete',backend_received_at=now,backend_processed_at=now)
-  ecs={'@timestamp':'2000-01-01T00:00:00Z','source':{'ip':'192.0.2.1'},'cloud':{'entity':{'attributes':{'managed':True}}}}
+  ecs={'@timestamp':'2000-01-01T00:00:00Z','source':{'ip':'192.0.2.1','bytes':120},'destination':{'bytes':60},'cloud':{'entity':{'attributes':{'managed':True}}}}
   ecs.update({'event':{'category':['authentication'],'outcome':'failure'},'user':{'id':'synthetic-user'}} if index==0 else {'event':{'category':['web']},'http':{'request':{'method':'GET'}},'network':{'bytes':100}})
-  ecs['event'].update({'created':created,'dataset':'synthetic_'+str(index)})
+  ecs['event'].update({'created':created,'dataset':'synthetic_'+str(index),'action':'logon' if index==0 else 'request'})
+  ecs.setdefault('user',{})['name']='Andrew'
   ecs['event']['start']=convert_value(catalog.get('event.start'),'0001-01-01T00:00:00Z' if index==0 else '9999-12-31T23:59:59.999999Z')
   ecs['event']['end']=convert_value(catalog.get('event.end'),'0001-01-01T00:00:00+01:00' if index==0 else '9999-12-31T23:59:59-01:00')
   event=ParsedLog(source_id=source.id,connection_id=source.connection_id,normalizer_version=1,normalizer_name='synthetic',source_name=source.name,connection_name='synthetic',kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=offset,deduplication_key=str(rid),fluent_bit_collected_at=now,backend_received_at=now,backend_processed_at=now,raw='synthetic',ecs_data=ecs)
@@ -119,7 +134,7 @@ db.dispose()
             raise AssertionError(f"Aggregate HTTP {response.status_code}: {response.text[:500]}")
         return response.json()
     if prepare_only:
-        return {"username": username, "password": password, "sources": data["sources"], "anchor": anchor.isoformat()}
+        return {"username": username, "password": password, "sources": data["sources"], "empty_source":data["empty_source"], "anchor": anchor.isoformat()}
     with httpx.Client(base_url=origin, verify=env["KAFKA_CA_FILE"] if production else True, timeout=20) as client:
         expect(client.post("/api/v1/auth/local/login", json={"username": username, "password": password}))
         csrf = {"X-CSRF-Token": expect(client.get("/api/v1/auth/session"))["csrf_token"]}
@@ -256,7 +271,7 @@ db.dispose()
         # The enclosing profile owns the database/Compose cleanup even on browser failure.
         if browser is not None:
             browser_ids = browser({"username": username, "password": password,
-                                   "sources": data["sources"], "anchor": anchor.isoformat()})
+                                   "sources": data["sources"], "empty_source":data["empty_source"], "anchor": anchor.isoformat()})
             for identity in browser_ids:
                 expect(client.delete(f"/api/v1/aggregates/{identity}", headers=csrf))
             ids.extend(browser_ids)
@@ -269,7 +284,7 @@ from sqlalchemy import delete
 from sqlalchemy.engine import make_url
 from app.config import settings
 from app.db import Database
-from app.models import Aggregate,AggregateSchedule,HistoricalAggregatePoint,WorkingWindowPoint,AvailabilityMarker,ParsedLog,ProcessedKafkaRecord,Source,SourceInterruption,KafkaConnection,User
+from app.models import Aggregate,AggregateSchedule,HistoricalAggregatePoint,WorkingWindowPoint,AvailabilityMarker,ParsedLog,ProcessedKafkaRecord,Source,SourceInterruption,KafkaConnection,User,Normalizer
 assert make_url(settings.database_url).database=='diploma_test'
 owned=json.loads(os.environ['SMOKE_OWNED']);db=Database(settings.database_url)
 with db.session_factory.begin() as s:
@@ -279,13 +294,15 @@ with db.session_factory.begin() as s:
   s.execute(delete(WorkingWindowPoint).where(WorkingWindowPoint.schedule_id==schedule_id))
   s.delete(aggregate);s.flush()
   s.execute(delete(AggregateSchedule).where(AggregateSchedule.id==schedule_id))
- for identity in owned['sources']:
+ for identity in [*owned['sources'],*([owned['empty_source']] if owned.get('empty_source') else [])]:
   source_id=UUID(identity)
   s.execute(delete(ParsedLog).where(ParsedLog.source_id==source_id))
   s.execute(delete(ProcessedKafkaRecord).where(ProcessedKafkaRecord.source_id==source_id))
   s.execute(delete(AvailabilityMarker).where(AvailabilityMarker.source_identity==source_id))
   s.execute(delete(SourceInterruption).where(SourceInterruption.source_identity==source_id))
   s.execute(delete(Source).where(Source.id==source_id))
+ if owned.get('normalizer'):
+  s.execute(delete(Normalizer).where(Normalizer.id==UUID(owned['normalizer'])))
  s.execute(delete(KafkaConnection).where(KafkaConnection.id==UUID(owned['connection'])))
  s.execute(delete(User).where(User.username==owned['username']))
 db.dispose()

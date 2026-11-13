@@ -30,12 +30,37 @@ export function chartScale(values: number[], top = 30, bottom = 170) {
   };
 }
 
+/** Technical window times, not point indices, define the horizontal domain. */
+export function chartTimeScale(points: Point[], left = 40, right = 860) {
+  if (!points.length) return null;
+  const starts = points.map((point) => Date.parse(point.start_utc));
+  const ends = points.map((point) => Date.parse(point.end_utc));
+  if ([...starts, ...ends].some((value) => !Number.isFinite(value)))
+    return null;
+  const low = Math.min(...starts);
+  const high = Math.max(...ends);
+  if (high <= low) return null;
+  const span = high - low;
+  const position = (value: number) =>
+    left + ((value - low) / span) * (right - left);
+  return {
+    low,
+    high,
+    position,
+    ticks: [low, low + (high - low) / 2, high].map((value) => ({
+      value,
+      iso: new Date(value).toISOString(),
+      x: position(value),
+    })),
+  };
+}
+
 /** Coordinates are approximations only; the original payload is never modified. */
 export function chartSeries(points: Point[], feature: string) {
   return ["working", "historical"].map((kind) => {
     const sorted = points
       .filter((p) => p.kind === kind)
-      .sort((a, b) => a.start_utc.localeCompare(b.start_utc));
+      .sort((a, b) => Date.parse(a.start_utc) - Date.parse(b.start_utc));
     let previous: Point | null = null;
     return {
       kind,

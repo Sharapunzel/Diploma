@@ -1,0 +1,25 @@
+import type { Operator } from "../../app/api/aggregates";
+
+export function aggregatePrompt(operators: Operator[]): string {
+  const functions = operators
+    .filter((o) => o.name !== "aggregate")
+    .map(
+      (o) =>
+        `${o.kind}: ${o.name}(${o.parameters.join(", ")})${o.arity ? `; args ${o.arity.min}…${o.arity.max ?? "N"}` : ""}; ${o.result}${o.result_nullable ? ", nullable" : ""}`,
+    )
+    .join("\n");
+  return `Помоги человеку составить aggregate_rule: числовой вектор поверх событий одного собственного ECS-источника.
+СНАЧАЛА уточни цель (например, статистику сессий), попроси полный доступный каталог полей с ECS-описаниями (кнопка «Скопировать поля источника») и смысловые детали: идентификаторы, категории/значения, показатели и условия. Не выдумывай сессии из названия поля. До уточнения задавай вопросы и не генерируй правило. Уже полученные сведения повторно не спрашивай. Не требуй реальные записи, значения событий или сырые журналы.
+Рабочие окна последовательны, не перекрываются; принадлежность по доступности после commit, не @timestamp. Арифметика над итогами окна, не над полями отдельной строки. Имя, источник, UTC-якорь, пояс и длительность 1–604800 секунд задаются отдельно от правила.
+features — непустой упорядоченный выход, auxiliary — необязательный непустой список внутренних определений (не null/[]). Оба содержат key/name/op/параметры. Ключ уникален [a-z][a-z0-9_]{0,63}, name 1–200. Первичный не содержит refs; производный содержит refs и может иметь свои агрегирующие листья. Выключение переносит определение в auxiliary, не заменяет нулём.
+formula.expr: {"value":число}, {"ref":"key"}, {"op":операция,"args":[...]}, {"aggregate":{"op":базовая_операция,"field":ECS_поле,"where":условие}}. Count без field; percentile с percentile 0…1. Внутри aggregate запрещены refs/формулы/вложенная агрегация. Расширенное правило допускает DAG/forward refs между features и auxiliary, без self/cycles/unknown refs. Legacy derive: constants/refs/math без aggregate; без formula/auxiliary ссылки только на предыдущие выходы.
+Три уровня where: rule AND feature AND собственный aggregate-лист. Ref использует готовую зависимость под её собственными условиями: чужой where её не пересчитывает. У формулы без собственных листьев where запрещён. Условия фильтруют события, не сравнивают результат с порогом.
+all/any/not используют args (not ровно один); остальные field/value. eq/neq — scalar; in/not_in — непустой однородный список; exists/not_exists без value; gt/gte/lt/lte/between — число/date, between две включённые границы; contains/starts_with буквальны; in_cidr — IP/CIDR; has_any/has_all/has_none — typed arrays. neq/not_in требуют присутствующего значения. Ошибки типов сохраняются во всех ветвях. Null/отсутствие не равны нулю. Числа конечны и точны, long — integer int64, 1 отличается от 1.0. Даты сохраняй строками со смещением, микросекундами и секундами смещения; абсолютный UTC-диапазон 0001–9999.
+count — записи; distinct_count — точные scalar значения; present_count/missing_count — правильный тип/отсутствие; true_count/false_count — boolean; sum/avg/min/max/range/variance/stddev/median/percentile — числовое поле. Variance population N, percentile непрерывный 0…1, median 0.5. mode_count/share — частота/доля моды scalar. На пустом наборе счётчики 0, статистики null/no_values. Ошибка типа даёт null/invalid_input_type. Деление на ноль — null/division_by_zero. Полнота окна проверяется отдельно: unknown/interrupted не достоверный ноль и не вход модели.
+add/subtract/multiply/divide/ratio бинарны; percent(x)=100*x, per_second(x)=x/duration, abs(x); clamp(x,lo,hi); min_of/max_of(2+). Нет SQL/Python/eval/joins/построчных формул/сессионного автомата и выдуманных функций. Сервер ограничивает JSON, глубину, литералы, время, стоимость и память; фиксированного лимита пять признаков нет. Сложные статистики могут превысить бюджет.
+Поддержанные функции (параметры и арность):
+${functions}
+Пример первичного отношения: {"features":[{"key":"ratio","name":"Отношение","op":"formula","expr":{"op":"divide","args":[{"aggregate":{"op":"sum","field":"source.bytes"}},{"aggregate":{"op":"sum","field":"destination.bytes"}}]}}]}
+Пример производного с внутренней зависимостью: {"auxiliary":[{"key":"events","name":"События","op":"count"}],"features":[{"key":"rate","name":"Частота","op":"formula","expr":{"op":"per_second","args":[{"ref":"events"}]}}]}
+Только после уточнений выдай полный aggregate_rule JSON без markdown, версии, имени и расписания. Человек вручную импортирует/вставляет его и обязательно выполняет серверные validate и preview. Не объявляй правило корректным/эффективным до проверки приложением. Приложение не вызывает внешнюю модель и ничего ей не отправляет.`;
+}

@@ -1,6 +1,7 @@
 """Browser selection and preparation within the existing smoke Compose lifecycle."""
 import json
 import os
+import re
 import secrets
 import subprocess
 import time
@@ -20,7 +21,7 @@ else:
     )
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCTION = ("detectors.live.spec.ts", "proxy.session.spec.ts")
+PRODUCTION = ("detectors.live.spec.ts", "aggregates.live.spec.ts", "proxy.session.spec.ts")
 
 
 def browser_specs(production, requested=None):
@@ -88,6 +89,8 @@ def run_browsers(compose, env, project, run, production, selected, command, oidc
     aggregate_config = None
     if any(name.startswith("aggregates.") for name in selected):
         aggregate_config = aggregate_runtime_smoke(compose, env, production, command, prepare_only=True)
+        if not isinstance(aggregate_config, dict) or any(not aggregate_config.get(k) for k in ("username", "password", "sources", "anchor")):
+            raise RuntimeError("Required aggregate browser fixture is unavailable")
     need_detectors = any(name.startswith("detectors.") for name in selected)
     if not need_detectors:
         create = "import os,app.cli as cli; cli.getpass.getpass=lambda prompt: os.environ['BROWSER_PASSWORD']; raise SystemExit(cli.create_admin('task21admin','Browser admin'))"
@@ -152,6 +155,31 @@ def run_browsers(compose, env, project, run, production, selected, command, oidc
         verify_hmr_restore(css, original_css)
 
 
+def copy_browser_modules(source, destination, selected):
+    """Copy selected specs and their local TS imports, confined to browser/."""
+    pending = [source / name for name in selected]
+    copied = set()
+    root = source.resolve()
+    while pending:
+        path = pending.pop().resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise RuntimeError("Missing or unsafe browser module")
+        if path in copied:
+            continue
+        copied.add(path)
+        text = path.read_text(encoding="utf-8")
+        target = destination / path.relative_to(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(path.read_bytes())
+        for module in re.findall(r'''(?:from\s*|import\s*\(|import\s*)["'](\.[^"']+)["']''', text):
+            relative = path.parent / module
+            candidates = [relative, Path(str(relative) + ".ts"), relative.with_suffix(".ts"), relative / "index.ts"]
+            dependency = next((p for p in candidates if p.is_file()), None)
+            if dependency is None:
+                raise RuntimeError("Missing browser import")
+            pending.append(dependency)
+
+
 def production_browsers(compose, env, project, run, selected, command, *, check=None, ready=None):
     deadline = time.monotonic() + 1200
     context = run / "detector-browser-context"
@@ -160,9 +188,18 @@ def production_browsers(compose, env, project, run, selected, command, *, check=
     for name in ("package.json", "package-lock.json", "playwright.config.ts"):
         (context / name).write_bytes((source / name).read_bytes())
     (context / "browser").mkdir()
-    for name in selected:
-        (context / "browser" / name).write_bytes((source / "browser" / name).read_bytes())
+    copy_browser_modules(source / "browser", context / "browser", selected)
     (context / "fixture.json").write_bytes(Path(env["DETECTOR_BROWSER_CONFIG"]).read_bytes())
+    aggregate_args = []
+    aggregate_result = None
+    if any(name.startswith("aggregates.") for name in selected):
+        aggregate = require_fixture(Path(env["AGGREGATE_BROWSER_CONFIG"]), ["username", "password", "sources", "anchor", "result"])
+        aggregate_result = Path(aggregate["result"]).resolve()
+        if not aggregate_result.is_relative_to(run.resolve()):
+            raise RuntimeError("Aggregate result must belong to the current run")
+        aggregate["result"] = "/results/aggregate-browser-owned.json"
+        (context / "aggregate-fixture.json").write_text(json.dumps(aggregate), encoding="utf-8")
+        aggregate_args = ["-e", "AGGREGATE_BROWSER_CONFIG=/test/aggregate-fixture.json"]
     results = run / "browser-results"
     results.mkdir()
     proxy = command([*compose,"ps","-q","proxy"], env=env, capture=True).strip()
@@ -173,7 +210,7 @@ def production_browsers(compose, env, project, run, selected, command, *, check=
     prepare = "set -e; apt-get update >/dev/null; apt-get install -y --no-install-recommends libnss3-tools socat >/dev/null; npm ci --ignore-scripts --no-audit --no-fund; mkdir -p /root/.pki/nssdb; certutil -d sql:/root/.pki/nssdb -N --empty-password; certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n proxy-test -i /tmp/proxy-ca.pem; cp /tmp/proxy-ca.pem /usr/local/share/ca-certificates/proxy-test.crt; update-ca-certificates >/dev/null"
     script = f"socat TCP-LISTEN:{public_port},bind=127.0.0.1,reuseaddr,fork TCP:127.0.0.1:443 & npx playwright test " + " ".join("browser/"+name for name in selected) + " --workers=1 --output /results"
     try:
-        command(["docker","run","-d","--rm","--name",container,"--user","0:0","--memory","2g","--cpus","2","--network",f"container:{proxy}","--label",f"com.docker.compose.project={project}","-w","/test","-v",f"{context.resolve()}:/test","-v",f"{results.resolve()}:/results","-v",f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/proxy-ca.pem:ro","-e","NODE_EXTRA_CA_CERTS=/tmp/proxy-ca.pem","-e","DETECTOR_BROWSER_CONFIG=/test/fixture.json","-e","BROWSER_FIXTURES_REQUIRED=1","-e",f"PLAYWRIGHT_BASE_URL={env['PUBLIC_ORIGIN']}","-e","TASK21_SECURE_COOKIE=true","-e",f"TASK21_ADMIN_PASSWORD={env['TASK21_ADMIN_PASSWORD']}","mcr.microsoft.com/playwright:v1.63.0-noble","sleep","1800"], env=env, timeout=30)
+        command(["docker","run","-d","--rm","--name",container,"--user","0:0","--memory","2g","--cpus","2","--network",f"container:{proxy}","--label",f"com.docker.compose.project={project}","-w","/test","-v",f"{context.resolve()}:/test","-v",f"{results.resolve()}:/results","-v",f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/proxy-ca.pem:ro","-e","NODE_EXTRA_CA_CERTS=/tmp/proxy-ca.pem","-e","DETECTOR_BROWSER_CONFIG=/test/fixture.json",*aggregate_args,"-e","BROWSER_FIXTURES_REQUIRED=1","-e",f"PLAYWRIGHT_BASE_URL={env['PUBLIC_ORIGIN']}","-e","TASK21_SECURE_COOKIE=true","-e",f"TASK21_ADMIN_PASSWORD={env['TASK21_ADMIN_PASSWORD']}","mcr.microsoft.com/playwright:v1.63.0-noble","sleep","1800"], env=env, timeout=30)
         def execute(script):
             args = ["docker", "exec", container, "sh", "-c", script]
             remaining = deadline - time.monotonic()
@@ -192,3 +229,6 @@ def production_browsers(compose, env, project, run, selected, command, *, check=
         execute(script)
     finally:
         subprocess.run(["docker","rm","-f",container],env=env,check=False,capture_output=True)
+        exported = results / "aggregate-browser-owned.json"
+        if aggregate_result is not None and exported.is_file():
+            aggregate_result.write_bytes(exported.read_bytes())

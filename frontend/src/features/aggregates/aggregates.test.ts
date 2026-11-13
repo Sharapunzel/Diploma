@@ -18,7 +18,6 @@ import { DraftStore } from "./DraftStore";
 import { referenceErrors, ruleDocument, aggregatePrompt } from "./rule";
 import { chartSeries } from "./chart";
 import { displayTime } from "./time";
-import { PromptStore } from "./PromptStore";
 import { CollectionStore } from "./CollectionStore";
 import { CardStore } from "./CardStore";
 
@@ -103,21 +102,10 @@ describe("aggregate transport and draft", () => {
       vi.unstubAllGlobals();
     }
   });
-  it("loads every catalogue page for the prompt and cancels a source transition", async () => {
-    const api = {
-      fields: vi.fn().mockImplementation(async (_source, _query, offset) => ({
-        total: 3,
-        items:
-          offset === 0
-            ? [{ name: "first" }, { name: "second" }]
-            : [{ name: "last" }],
-      })),
-    } as unknown as AggregatesApi;
-    const prompt = new PromptStore(api, "source");
-    await prompt.load(operators);
-    expect(prompt.text).toContain('"last"');
-    expect(vi.mocked(api.fields).mock.calls.map((c) => c[2])).toEqual([0, 2]);
-    prompt.dispose();
+  it("prepares a standalone prompt without fetching source data", () => {
+    const prompt = aggregatePrompt(operators);
+    expect(prompt).toContain("полный доступный каталог полей с ECS-описаниями");
+    expect(prompt).toContain("До уточнения задавай вопросы");
   });
   it("keeps page loading visible and ignores an old page after a newer request", async () => {
     const old = deferred<{ items: string[]; total: number }>();
@@ -259,7 +247,7 @@ describe("aggregate transport and draft", () => {
     expect(last.aborted).toBe(true);
     expect(d.validation).toBeNull();
   });
-  it("locks double submit, preserves idempotent retry after unknown success, and renews the key for changed bodies", async () => {
+  it("locks double submit and preserves the original intent after editing an unknown create", async () => {
     const first = deferred<Aggregate>();
     const api = {
       validate: vi.fn().mockResolvedValue(validation),
@@ -286,7 +274,17 @@ describe("aggregate transport and draft", () => {
     await d.validate();
     await d.runPreview();
     await d.create();
-    expect(vi.mocked(api.create).mock.calls[2][1]).not.toBe(calls[0][1]);
+    expect(vi.mocked(api.create).mock.calls[2][1]).toBe(calls[0][1]);
+    expect(printAggregate(vi.mocked(api.create).mock.calls[2][0])).toBe(
+      printAggregate(calls[0][0]),
+    );
+    vi.mocked(api.create).mockResolvedValue({ id: "old" } as Aggregate);
+    expect(await d.create()).toBeUndefined();
+    expect(d.dirty).toBe(true);
+    expect(d.name).toBe("Другое имя");
+    expect(d.unknownCreate).toBe(false);
+    await d.create();
+    expect(vi.mocked(api.create).mock.calls[4][1]).not.toBe(calls[0][1]);
     d.dispose();
   });
   it("blocks incomplete literals, permits correction and leaves display time outside calculation context", async () => {
@@ -311,8 +309,11 @@ describe("aggregate transport and draft", () => {
     expect(displayTime("2026-10-25T01:30:00Z", "Europe/Berlin")).toContain(
       "GMT+01:00",
     );
-    expect(displayTime("1900-01-01T00:00:00.123456+05:21:10", "UTC")).toBe(
+    expect(displayTime("1900-01-01T00:00:00.123456+05:21:10", "UTC")).toContain(
       "1900-01-01T00:00:00.123456+05:21:10",
+    );
+    expect(displayTime("1900-01-01T00:00:00.123456+05:21:10", "UTC")).toContain(
+      "18:38:50",
     );
     expect(d.context).toBe(before);
     d.dispose();

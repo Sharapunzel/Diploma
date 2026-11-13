@@ -229,9 +229,14 @@ export class ResourcesApi {
       { signal },
     );
   }
-  kafkaSources(offset = 0, connectionId?: string, signal?: AbortSignal) {
+  kafkaSources(
+    offset = 0,
+    connectionId?: string,
+    signal?: AbortSignal,
+    search: { q?: string; limit?: number } = {},
+  ) {
     return this.api.request<Page<KafkaSource>>(
-      `/sources?limit=50&offset=${offset}${connectionId ? `&connection_id=${encodeURIComponent(connectionId)}` : ""}`,
+      `/sources?limit=${search.limit ?? 50}&offset=${offset}${connectionId ? `&connection_id=${encodeURIComponent(connectionId)}` : ""}${search.q !== undefined ? `&q=${encodeURIComponent(search.q)}` : ""}`,
       { signal },
     );
   }

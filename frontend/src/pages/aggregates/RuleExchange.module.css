@@ -1,0 +1,28 @@
+.exchange {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+}
+
+.row :global(.ant-btn:not(.ant-btn-text)) {
+  max-width: 100%;
+  min-height: 32px;
+  height: auto;
+  white-space: normal;
+}
+
+.helpSlot {
+  display: inline-flex;
+  flex: none;
+  margin-left: auto;
+  order: 99;
+}

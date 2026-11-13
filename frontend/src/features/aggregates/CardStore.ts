@@ -1,21 +1,42 @@
 import { makeAutoObservable, observable, runInAction } from "mobx";
-import { AggregatesApi, type Aggregate } from "../../app/api/aggregates";
+import {
+  AggregatesApi,
+  type Aggregate,
+  type Point,
+  type Operator,
+} from "../../app/api/aggregates";
 import { RequestLifecycle } from "../resources/RequestLifecycle";
 import { ApiError } from "../../app/api/client";
+
+const historicalSuccess =
+  "Расчёт выбранного окна сохранён. Автоматическое расписание не изменено.";
 
 export class CardStore {
   card: Aggregate | null = null;
   error: unknown = null;
   success = "";
+  historicalResult: Point | null = null;
+  historyError: unknown = null;
+  operators: Operator[] = [];
+  operatorsError: unknown = null;
+  private historyRevision = 0;
   mutationOutcome: "unknown" | "refused" | null = null;
   lifecycle = new RequestLifecycle();
   constructor(
     private api: AggregatesApi,
     public id: string,
   ) {
-    makeAutoObservable(this, { api: false, card: observable.ref } as never, {
-      autoBind: true,
-    });
+    makeAutoObservable(
+      this,
+      {
+        api: false,
+        card: observable.ref,
+        historicalResult: observable.ref,
+      } as never,
+      {
+        autoBind: true,
+      },
+    );
   }
   async load() {
     if (this.lifecycle.isPending("action")) return;
@@ -33,6 +54,25 @@ export class CardStore {
         if (r.current())
           runInAction(() => {
             this.error = e;
+          });
+      }
+    });
+  }
+  async loadOperators() {
+    return this.lifecycle.once("operators", async () => {
+      const request = this.lifecycle.begin("operators-request");
+      this.operatorsError = null;
+      try {
+        const operators = await this.api.operators(request.signal, true);
+        if (!operators.length) throw new Error("empty_operator_catalog");
+        if (request.current())
+          runInAction(() => {
+            this.operators = operators;
+          });
+      } catch (error) {
+        if (request.current())
+          runInAction(() => {
+            this.operatorsError = error;
           });
       }
     });
@@ -70,24 +110,32 @@ export class CardStore {
       }
     });
   }
+  clearHistoricalResult() {
+    this.historyRevision++;
+    this.historicalResult = null;
+    this.historyError = null;
+    if (this.success === historicalSuccess) this.success = "";
+  }
   async history(start: string) {
     if (!this.canMutate) return;
     return this.lifecycle.once("history", async () => {
       const r = this.lifecycle.begin("history-request");
-      this.error = null;
+      const revision = this.historyRevision;
+      this.historyError = null;
       this.success = "";
+      this.historicalResult = null;
       try {
-        await this.api.historical(this.id, start, r.signal);
-        if (r.current())
+        const point = await this.api.historical(this.id, start, r.signal);
+        if (r.current() && revision === this.historyRevision)
           runInAction(() => {
-            this.success =
-              "Историческое окно сохранено. Рабочий курсор не изменён.";
+            this.historicalResult = point ?? null;
+            this.success = historicalSuccess;
           });
         return r.current();
       } catch (e) {
-        if (r.current())
+        if (r.current() && revision === this.historyRevision)
           runInAction(() => {
-            this.error = e;
+            this.historyError = e;
           });
         return false;
       }
@@ -101,6 +149,9 @@ export class CardStore {
   dispose() {
     this.lifecycle.dispose();
     this.card = null;
+    this.operators = [];
+    this.operatorsError = null;
+    this.clearHistoricalResult();
     this.error = null;
     this.success = "";
     this.mutationOutcome = null;

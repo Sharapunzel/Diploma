@@ -11,7 +11,16 @@ import {
 } from "../../app/api/aggregates";
 import { printAggregate, type JsonObject } from "../../app/api/aggregateJson";
 import { RequestLifecycle } from "../resources/RequestLifecycle";
-import { initialRule, referenceErrors, ruleDocument } from "./rule";
+import {
+  clone,
+  initialRule,
+  referenceErrors,
+  ruleDocument,
+  retainDefinitionOrder,
+  assertVisualReferences,
+  resetDefinitionOrder,
+} from "./rule";
+import { processIssues, validInstant } from "./processValidation";
 
 export class DraftStore {
   name = "";
@@ -97,17 +106,24 @@ export class DraftStore {
   get errors() {
     return referenceErrors(this.rule);
   }
+  get processErrors() {
+    return processIssues(this);
+  }
+  get processValid() {
+    return !Object.keys(this.processErrors).length;
+  }
   get canCreate() {
+    if (this.unknownCreate) return !!this.retry && this.editable && !this.busy;
     return (
       !!this.validation &&
       this.editable &&
+      this.processValid &&
       !!this.preview &&
+      !this.unknownCreate &&
       !this.localError &&
       !this.invalidNodes.size &&
       !this.errors.length &&
-      !this.busy &&
-      this.name.trim().length > 0 &&
-      this.name.length <= 200
+      !this.busy
     );
   }
   invalidate() {
@@ -117,7 +133,6 @@ export class DraftStore {
     this.error = null;
     this.success = "";
     this.lifecycle.cancel("check");
-    this.unknownCreate = false;
   }
   setField(
     key:
@@ -159,11 +174,13 @@ export class DraftStore {
   }
   setText(text: string) {
     if (!this.editable || this.lifecycle.isPending("create")) return;
+    const previous = this.rule;
     this.invalidate();
     this.text = text;
     this.localError = "";
     try {
       this.rule = ruleDocument(text, this.operators);
+      retainDefinitionOrder(previous, this.rule);
     } catch (e) {
       this.localError = e instanceof Error ? e.message : "Некорректный JSON";
     }
@@ -171,14 +188,26 @@ export class DraftStore {
   setOperators(operators: Operator[]) {
     this.operators = operators;
     try {
+      const previous = this.rule;
       this.rule = ruleDocument(this.text, operators);
+      retainDefinitionOrder(previous, this.rule);
       this.localError = "";
     } catch (e) {
       this.localError = e instanceof Error ? e.message : "Проверьте JSON";
     }
   }
   setRule(rule: JsonObject) {
+    assertVisualReferences(this.rule, rule);
+    retainDefinitionOrder(this.rule, rule, true);
     this.setText(printAggregate(rule, true));
+    retainDefinitionOrder(rule, this.rule);
+  }
+  importText(text: string) {
+    if (!this.editable || this.lifecycle.isPending("create")) return;
+    this.invalidNodes.clear();
+    this.mode = "json";
+    this.setText(text);
+    if (!this.localError) resetDefinitionOrder(this.rule);
   }
   switchMode(mode: "visual" | "json") {
     if (!this.editable) return;
@@ -189,7 +218,9 @@ export class DraftStore {
     }
     if (mode === "visual") {
       try {
+        const previous = this.rule;
         this.rule = ruleDocument(this.text, this.operators);
+        retainDefinitionOrder(previous, this.rule);
         this.localError = "";
       } catch (e) {
         this.localError = e instanceof Error ? e.message : "Некорректный JSON";
@@ -204,21 +235,12 @@ export class DraftStore {
     this.boundary = input.schedule.boundary;
     this.timezone = input.schedule.timezone;
     this.duration = String(input.schedule.duration_seconds);
-    this.setRule(input.aggregate_rule);
+    this.rule = clone(input.aggregate_rule);
+    this.setRule(clone(input.aggregate_rule));
   }
   input(): AggregateInput {
-    if (!this.source)
-      throw new Error("Выберите доступный собственный источник.");
-    if (
-      !/^[0-9]+$/.test(this.duration) ||
-      Number(this.duration) < 1 ||
-      Number(this.duration) > 604800
-    )
-      throw new Error("Длительность: целое число секунд 1–604800.");
-    if (!this.boundary || !this.window)
-      throw new Error(
-        "Укажите исходную границу и начало завершённого окна с явным смещением.",
-      );
+    const processError = Object.values(this.processErrors)[0];
+    if (processError) throw new Error(processError);
     if (this.invalidNodes.size)
       throw new Error(
         "Исправьте незавершённые значения в визуальном редакторе.",
@@ -267,6 +289,11 @@ export class DraftStore {
   }
   async runPreview() {
     if (!this.validation || this.busy) return;
+    if (!validInstant(this.window)) {
+      this.localError =
+        "Выберите начало завершённого окна для предварительного расчёта.";
+      return;
+    }
     const context = this.context;
     const body = {
       ...this.input(),
@@ -299,18 +326,24 @@ export class DraftStore {
     });
   }
   async create(): Promise<Aggregate | undefined> {
-    if (!this.canCreate) return;
-    const body: CreateInput = {
-      ...this.input(),
-      name: this.name,
-      window_start_utc: this.window,
-      time_basis: this.timeBasis,
-      rule_hash: this.validation!.rule_hash,
-    };
+    if (this.busy || !this.editable || (!this.unknownCreate && !this.canCreate))
+      return;
+    const body: CreateInput =
+      this.unknownCreate && this.retry
+        ? this.retry.body
+        : {
+            ...this.input(),
+            name: this.name,
+            window_start_utc: this.window,
+            time_basis: this.timeBasis,
+            rule_hash: this.validation!.rule_hash,
+          };
     const signature = printAggregate(body);
-    if (this.retry?.signature !== signature)
-      this.retry = { body, signature, key: crypto.randomUUID() };
+    if (!this.unknownCreate && this.retry?.signature !== signature)
+      this.retry = { body: clone(body), signature, key: crypto.randomUUID() };
     const retry = this.retry!;
+    const submittedContext = this.context;
+    const submittedName = this.name;
     this.error = null;
     return this.lifecycle.once("create", async () => {
       const r = this.lifecycle.begin("mutation");
@@ -318,10 +351,32 @@ export class DraftStore {
         const result = await this.api.create(retry.body, retry.key, r.signal);
         if (!r.current()) return;
         runInAction(() => {
-          this.dirty = false;
+          // A replay can confirm an older intent after the user edited the draft.
+          const currentBody = (() => {
+            try {
+              return printAggregate({
+                ...this.input(),
+                name: this.name,
+                window_start_utc: this.window,
+                time_basis: this.timeBasis,
+                rule_hash: this.validation?.rule_hash ?? retry.body.rule_hash,
+              });
+            } catch {
+              return "";
+            }
+          })();
+          this.dirty = currentBody !== retry.signature;
           this.unknownCreate = false;
           this.retry = null;
+          if (this.dirty)
+            this.success = `Прежний запрос подтверждён: ${result.id}. Изменённый черновик сохранён на экране.`;
         });
+        if (
+          this.dirty ||
+          submittedContext !== this.context ||
+          submittedName !== this.name
+        )
+          return;
         return result;
       } catch (e) {
         if (r.current())
@@ -329,7 +384,9 @@ export class DraftStore {
             this.error = e;
             this.unknownCreate =
               e instanceof ApiError &&
-              (e.status === 0 || e.code === "invalid_response");
+              (e.status === 0 ||
+                e.status >= 500 ||
+                e.code === "invalid_response");
           });
       }
     });
