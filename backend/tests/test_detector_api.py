@@ -7,11 +7,6 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi import Depends
-from fastapi.testclient import TestClient
-from psycopg.errors import UniqueViolation
-from sqlalchemy import event, func, select, text
-
 from app.adapters.detector_lock import DetectorSessionLock
 from app.aggregate_composition import build_aggregate_service
 from app.config import Settings
@@ -24,6 +19,7 @@ from app.ecs import PackagedEcsCatalog
 from app.main import create_app
 from app.models import (
     Aggregate,
+    AggregateClosure,
     AggregateSchedule,
     AuthSession,
     Detector,
@@ -35,6 +31,11 @@ from app.models import (
     User,
     WorkingWindowPoint,
 )
+from event_time_fixtures import delete_aggregate
+from fastapi import Depends
+from fastapi.testclient import TestClient
+from psycopg.errors import UniqueViolation
+from sqlalchemy import event, func, select, text
 
 ADMIN = UUID("00000000-0000-4000-8000-000000000001")
 GUEST = UUID("00000000-0000-4000-8000-000000000002")
@@ -63,13 +64,19 @@ def aggregate(database):
     now = datetime.now(UTC)
     with database.session_factory.begin() as session:
         session.add(AggregateSchedule(id=schedule_id, source_identity=source_id,
-            anchor_utc=now - timedelta(seconds=600), duration_seconds=10, next_index=60))
+            anchor_utc=now - timedelta(seconds=600), duration_seconds=10, next_index=60,
+            semantic_basis="event_time", bootstrap_at=now - timedelta(seconds=600), online_start_index=0))
         session.flush()
         session.add(Aggregate(id=identity, schedule_id=schedule_id, name="Aggregate", source_identity=source_id,
             source_name="Synthetic source", source_type="kafka", rule={"features": [{"key": "n", "name": "Count", "op": "count"}]},
             rule_hash="f" * 64, original_boundary=now.isoformat(), timezone="UTC", created_at=now,
-            created_by=uuid4(), state="active", request_key=uuid4().hex, request_hash="e" * 64))
-    return identity
+            created_by=uuid4(), state="active", request_key=uuid4().hex, request_hash="e" * 64,
+            semantic_basis="event_time", execution_mode="current"))
+    try:
+        yield identity
+    finally:
+        with database.session_factory.begin() as session:
+            delete_aggregate(session, identity)
 
 
 def body(aggregate, **changes):
@@ -314,14 +321,17 @@ def test_read_projection_excludes_vectors_and_preserves_revision(database, catal
     assert card.revision == 1
 
 
-def test_command_migration_preserves_old_data_and_roles(database):
+def test_command_migration_preserves_old_data_and_roles(database, aggregate):
     url = os.environ["TEST_DATABASE_URL"]
     env = {**os.environ, "DATABASE_URL": url}
     env.pop("DATABASE_URL_FILE", None)
     with database.session_factory() as session:
         before = session.execute(text("SELECT id,checkpoint,execution_state,execution_generation FROM logs.detectors ORDER BY id")).all()
         roles = {row.id: list(row.permissions) for row in session.scalars(select(Role))}
-    for args in (["downgrade", "0019_detector_worker"], ["upgrade", "head"], ["check"]):
+    refused = subprocess.run([sys.executable, "-B", "-m", "alembic", "downgrade", "0019_detector_worker"],
+        env=env, capture_output=True, text=True, check=False)
+    assert refused.returncode != 0 and "explicit data-preserving migration" in refused.stderr
+    for args in (["upgrade", "head"], ["check"]):
         subprocess.run([sys.executable, "-m", "alembic", *args], env=env, check=True)
     with database.session_factory() as session:
         assert session.execute(text("SELECT id,checkpoint,execution_state,execution_generation FROM logs.detectors ORDER BY id")).all() == before
@@ -369,10 +379,16 @@ def test_diagnostics_warmup_windows_recovery_and_timezone(database, catalog, agg
             left = anchor + timedelta(seconds=index * 10)
             right = left + timedelta(seconds=10)
             point_id = uuid4()
+            session.add(AggregateClosure(origin_point_id=point_id, aggregate_id=aggregate,
+                schedule_id=schedule_id, source_identity=uuid4(), window_index=index,
+                start_utc=left, end_utc=right, time_basis="event_time", origin="online",
+                snapshot_reference_at=right, closed_at=right + timedelta(seconds=1),
+                close_not_before_at=right + timedelta(seconds=10), payload_state="present", point_kind="working"))
+            session.flush()
             session.add(WorkingWindowPoint(id=point_id, schedule_id=schedule_id, window_index=index,
                 start_utc=left, end_utc=right, scheduled_at=right, actual_started_at=right,
                 actual_completed_at=right + timedelta(seconds=1), event_count=0, completeness="unknown",
-                completeness_reason="unknown", evidence_refs={}, features=[{"private-vector": 1}]))
+                completeness_reason="unknown", evidence_refs={}, features=[{"private-vector": 1}], time_basis="event_time"))
             session.flush()
             session.add(DetectorOutcome(id=uuid4(), detector_id=identity, working_point_id=point_id,
                 window_index=index, revision=2, kind=kind, reason="coverage:unknown" if kind == "skipped" else None,
@@ -404,7 +420,8 @@ def test_diagnostics_warmup_windows_recovery_and_timezone(database, catalog, agg
     assert card.last_consumed.evaluation_completed_at is None
     assert card.last_evaluated.index == 1 and card.last_evaluated.evaluation_completed_at is not None
     assert card.next_scheduled_at == anchor + timedelta(seconds=80)
-    assert card.backlog == 23 and card.lag_seconds == 220
+    assert card.next_close_not_before_at == anchor + timedelta(seconds=90)
+    assert card.backlog == 22 and card.lag_seconds == 210
     assert card.recovery.first_index == 29 and card.recovery.reason == "manual_resume"
     assert card.reason is None or card.reason.code == "working_point_pending"
     assert card.last_failure.reason.factor == "model_seconds"
@@ -466,10 +483,11 @@ def test_delete_competes_with_command_and_replay(database, catalog, aggregate):
 
 
 def test_http_does_not_invoke_model_and_expired_session_is_unauthorized(database, aggregate, client, monkeypatch):
+    from app.adapters.model_runtime import ModelRuntime
     from app.detection import model_process
     def forbidden(*args, **kwargs):
         pytest.fail("HTTP attempted a model subprocess")
-    monkeypatch.setattr(model_process, "invoke", forbidden)
+    monkeypatch.setattr(ModelRuntime, "invoke", forbidden)
     monkeypatch.setattr(model_process.BoundedModelFactory, "restore", forbidden)
     monkeypatch.setattr(model_process.BoundedModelFactory, "warmup", forbidden)
     actor, headers = login(database, client)

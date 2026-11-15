@@ -4,10 +4,11 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from functools import wraps
-from uuid import uuid4, uuid5
+from uuid import uuid4
 
 from sqlalchemy.exc import DBAPIError
 
+from ...aggregation.event_time import EventTimeBudgetError, close_deadline
 from ...aggregation.rules import RuleError
 from ...core.errors import DomainError
 from ...detection.contracts import (
@@ -19,7 +20,7 @@ from ...detection.contracts import (
     feature_vector,
 )
 from ...detection.execution import REASONS, reason_details, require_owner, safe_reason
-from ...detection.history import warmup_plan, warmup_summary
+from ...detection.history import warmup_summary
 from ...repositories.protocols import UnitOfWork
 from ...repositories.protocols.detectors import DetectorRepository
 from ...schemas.detectors import CreateDetectorRequest, DetectorCard, DetectorPage, DetectorSummary
@@ -38,6 +39,12 @@ def transaction(method):
 
 
 def active(context):
+    if context["aggregate"].get("execution_mode") == "retired":
+        raise DetectionError("aggregate_time_semantics_retired")
+    if context["schedule"].get("active_cleanup_id"):
+        raise DetectionError("cleanup_in_progress")
+    if context["schedule"].get("paused"):
+        raise StaleCandidate("aggregate_paused")
     if context["aggregate"]["state"] != "active":
         raise DetectionError("aggregate_inactive")
 
@@ -52,7 +59,7 @@ def public_transaction(method):
             code = str(error)
             if code == "detector_context_not_found":
                 raise DomainError("detector_not_found", "Детектор или агрегат не найден.", 404) from None
-            if code in {"aggregate_inactive", "aggregate_deleted"}:
+            if code in {"aggregate_inactive", "aggregate_deleted", "aggregate_time_semantics_retired", "cleanup_in_progress"}:
                 raise DomainError(code, REASONS[code], 409) from None
             if isinstance(error, StaleCandidate):
                 raise DomainError("detector_conflict", "Состояние детектора изменилось. Прочитайте карточку перед новым действием.", 409) from None
@@ -96,6 +103,7 @@ class DetectorService:
         self.repository, self.history, self.windows = repository, history, windows
         self.capture, self.uow, self.models = capture, uow, models
         self.owner = owner
+        self.transition_timings = None
 
     @public_transaction
     def command(self, action, actor, key, target=None, payload=None):
@@ -164,15 +172,22 @@ class DetectorService:
         d, a, s = context["detector"], context["aggregate"], context["schedule"]
         index = d["consumed_index"] + 1 if d["consumed_index"] is not None else d["evaluation_start_index"]
         scheduled = (context["next_start"] + timedelta(seconds=s["duration_seconds"])) if index is not None else None
+        nominal = scheduled
+        if scheduled is not None and a["execution_mode"] == "current":
+            scheduled = close_deadline(scheduled, s["duration_seconds"])
         point = self.repository.public_next_point(s["id"], index) if index is not None else None
         code = (d["failure_code"] if d["execution_state"] == "failed" else
             "manual_stop" if d["execution_state"] == "stopped" else
+            "aggregate_time_semantics_retired" if a["execution_mode"] == "retired" else
             "aggregate_deleted" if d["execution_state"] == "terminated" else
             "warmup_required" if d["execution_state"] == "created" else
-            "aggregate_inactive" if a["state"] != "active" else None)
+            "aggregate_inactive" if a["state"] != "active" else
+            "cleanup_in_progress" if s["active_cleanup_id"] else
+            "aggregate_paused" if s["paused"] else None)
         if code is None and d["execution_state"] == "running":
-            code = ("working_point_pending" if point is None else
-                "working_point_gap" if scheduled - timedelta(seconds=s["duration_seconds"]) < point["start_utc"] else
+            code = ("waiting_close_deadline" if scheduled is not None and context["now"] < scheduled else
+                "working_point_pending" if point is None else
+                "working_point_gap" if context["next_start"] < point["start_utc"] else
                 "working_point_not_completed" if point["end_utc"] > context["now"] else None)
         if code is None and d["execution_state"] in {"requested", "starting"}:
             code = "warmup_required" if d["evaluation_start_index"] is None else None
@@ -186,6 +201,8 @@ class DetectorService:
 
         result = {"id": d["id"], "name": d["name"][:200], "aggregate_id": d["aggregate_id"],
             "aggregate_name": a["name"][:200], "aggregate_state": a["state"],
+            "aggregate_semantic_basis": a["semantic_basis"], "aggregate_execution_mode": a["execution_mode"],
+            "aggregate_paused": s["paused"],
             "source_id": a["source_identity"], "source_name": a["source_name"][:200],
             "created_at": d["created_at"], "execution_state": d["execution_state"], "model_state": d["state"],
             "accelerated": d["accelerated"], "accelerated_used": d["accelerated_used"],
@@ -214,7 +231,8 @@ class DetectorService:
             "last_failure": {"reason": public_reason(failure.get("code"), failure.get("details")),
                 "at": failure["at"], "start_request_id": failure.get("start_request_id")} if failure else None,
             "warmup": warmup, "recovery": self.repository.public_recovery(d["id"]),
-            "next_scheduled_at": scheduled, "waiting_for_point": point is None if index is not None else None}
+            "next_scheduled_at": nominal, "next_close_not_before_at": scheduled,
+            "waiting_for_point": point is None if index is not None else None}
 
     def _execution(self, context):
         require_owner(self.owner)
@@ -228,6 +246,9 @@ class DetectorService:
     def _lock(self, context, attempt_id=None, *, failure=False):
         self.repository.check_owner(self.owner)
         current = self.repository.lock_context(context["detector"]["id"])
+        if (current["schedule"]["execution_generation"] != context["schedule"]["execution_generation"]
+                or current["schedule"]["paused"] or current["schedule"]["active_cleanup_id"]):
+            raise StaleCandidate("aggregate_execution_fenced")
         if (not failure and context["detector"]["execution_state"] == "running"
                 and current["aggregate"]["state"] == "archived"):
             # Archive invalidates this candidate, not the existing permission.
@@ -261,6 +282,8 @@ class DetectorService:
 
     def _start(self, detector_id):
         context = self.repository.lock_context(detector_id)
+        if context["aggregate"]["execution_mode"] == "retired":
+            raise DetectionError("aggregate_time_semantics_retired")
         if (context["aggregate"]["state"] == "deleted" or context["detector"]["state"] == "stopped"
                 or context["detector"]["execution_state"] == "terminated"):
             raise DetectionError("aggregate_deleted")
@@ -293,7 +316,7 @@ class DetectorService:
         self.repository.check_owner(self.owner)
         context = self.repository.lock_context(detector_id)
         state = context["detector"]["execution_state"]
-        if state == "starting":
+        if state == "starting" and not context["schedule"]["paused"]:
             self.repository.control(context, "failed", "start_interrupted")
         elif state == "running":
             self.repository.record_recovery(context, "crash_recovery", self.owner.generation)
@@ -404,6 +427,9 @@ class DetectorService:
                      else detector["evaluation_start_index"])
             scheduled = (unarchived_start(context, index) + timedelta(seconds=schedule["duration_seconds"])
                          if index is not None else None)
+            nominal = scheduled
+            if scheduled is not None and context["aggregate"]["execution_mode"] == "current":
+                scheduled = close_deadline(scheduled, schedule["duration_seconds"])
             code = detector["failure_code"] or ("manual_stop" if detector["execution_state"] == "stopped" else
                 "aggregate_deleted" if detector["execution_state"] == "terminated" else
                 "warmup_required" if detector["execution_state"] == "created" else None)
@@ -420,7 +446,7 @@ class DetectorService:
                     code = "working_point_not_completed"
             context["diagnostics"] = {"code": code, "message": REASONS.get(code),
                 "last_failure": detector["last_failure"],
-                "next_scheduled_at": scheduled,
+                "next_scheduled_at": nominal, "next_close_not_before_at": scheduled,
                 "backlog": max(0, int((context["now"] - scheduled).total_seconds()) // schedule["duration_seconds"] + 1)
                            if scheduled is not None and context["now"] >= scheduled else 0,
                 "lag_seconds": max(0, (context["now"] - scheduled).total_seconds()) if scheduled else None,
@@ -435,21 +461,22 @@ class DetectorService:
         deadline = time.monotonic() + 30
         context = self._execution(self.repository.read_context(detector_id))
         active(context)
-        detector, schedule = context["detector"], context["schedule"]
+        detector = context["detector"]
         if detector["checkpoint"] is not None or detector["state"] == "stopped":
             raise DetectionError("warmup_already_completed_or_stopped")
         attempt = self.repository.attempt(detector["active_attempt_id"]) if detector["active_attempt_id"] else None
-        # A new explicit request gets a new attempt; a pending barrier within the
-        # same accepted request keeps its immutable cutoff and batch identity.
+        if attempt is not None and attempt["status"] == "prepared" and digest(attempt["inputs"]) == attempt["inputs_hash"]:
+            self.uow.rollback()
+            return {"attempt_id": attempt["id"], "state": "prepared", "inputs": len(attempt["inputs"]), "plan": attempt["plan"]}
+        # An interrupted preparation within the same accepted request keeps its
+        # immutable cutoff and batch identity.
         reuse = (attempt is not None and attempt["status"] == "preparing"
                  and attempt["created_at"] >= detector["start_requested_at"])
         if reuse:
             plan, attempt_id = attempt["plan"], attempt["id"]
         else:
             try:
-                plan = warmup_plan(schedule["anchor_utc"], schedule["duration_seconds"], context["now"],
-                                   ModelConfig(**detector["config"]).minimum_inputs, detector["step_seconds"],
-                                   detector["accelerated"])
+                plan = self.history.plan(context, deadline)
             except DetectionError as error:
                 current = self._lock(context)
                 self.repository.diagnose(current, "waiting", str(error))
@@ -464,14 +491,9 @@ class DetectorService:
         self.repository.check_owner(self.owner)
         owner = self.repository.aggregate_context(context["aggregate"]["id"], True)
         active(owner)
-        # Barrier phase: schedule -> Source -> Detector, all in the same UoW.
-        if not self.windows.lock_source(owner["aggregate"]["source_identity"]):
-            raise DetectionError("source_unavailable")
         current = self._lock(context)
         if not reuse:
             self.repository.select_attempt(current, attempt)
-        marker_id = uuid5(attempt_id, "warmup")
-        self.windows.ensure_barrier(marker_id, owner["aggregate"]["source_identity"], current["now"])
         self._commit_candidate()
         context = self.repository.read_context(detector_id)
         self.uow.rollback()
@@ -483,6 +505,10 @@ class DetectorService:
             raise
         except DetectionError as error:
             reason = str(error)
+        except EventTimeBudgetError as error:
+            factor = {"operation_seconds": "preparation_seconds", "overlap_input_bytes": "warmup_input_bytes",
+                "candidate_windows": "warmup_windows"}.get(error.factor, error.factor)
+            reason = "resource_budget:" + factor
         except RuleError as error:
             # This attempt was already committed before materialization. Record
             # confirmed input/budget failures against that refreshed revision.
@@ -493,9 +519,6 @@ class DetectorService:
                 raise  # Infrastructure uncertainty is resolved by re-election.
             reason = "resource_budget:preparation_seconds"
         self.uow.rollback()
-        if reason == "barrier_pending":
-            self.uow.rollback()
-            return {"attempt_id": attempt_id, "state": "waiting", "reason": reason}
         current = self._lock(context, attempt_id)
         self.repository.save_warmup_inputs(current, attempt_id, inputs,
                                            "waiting" if reason else "prepared", reason)
@@ -536,11 +559,14 @@ class DetectorService:
 
     @transaction
     def advance_one(self, detector_id):
+        started = time.monotonic()
+        self.transition_timings = None
         context = self._execution(self.repository.read_context(detector_id))
         detector, schedule, aggregate = context["detector"], context["schedule"], context["aggregate"]
         if detector["execution_state"] != "running":
             raise DetectionError("execution_not_authorized")
-        if aggregate["state"] != "active" or detector["state"] != "ready":
+        if (aggregate["state"] != "active" or detector["state"] != "ready" or schedule["paused"]
+                or schedule["active_cleanup_id"] or aggregate["execution_mode"] == "retired"):
             self.uow.rollback()
             return {"state": "waiting", "reason": "inactive_or_not_ready"}
         point = self.repository.next_working_point(schedule["id"], detector["consumed_index"],
@@ -559,6 +585,7 @@ class DetectorService:
             return {"state": "waiting", "reason": "working_point_gap"}
         reason, result, finding = None, None, None
         checkpoint = detector["checkpoint"]
+        model_started = time.monotonic()
         try:
             model = self.models.restore(checkpoint, detector["config"], detector["feature_keys"], detector["rule_hash"])
         except DetectionError as error:
@@ -580,7 +607,14 @@ class DetectorService:
                     "event_count": point["event_count"],
                     "event_range_reason": ("empty_window" if point["event_count"] == 0 else
                         "unavailable" if point["event_time_min"] is None or point["event_time_max"] is None else None),
-                    "accelerated_used": detector["accelerated_used"], "origin": "working_point"}
+                    "accelerated_used": detector["accelerated_used"], "origin": point["evidence_refs"].get("origin", "online"),
+                    "origin_point_id": str(point["id"]), "window_index": point["window_index"],
+                    "time_basis": point["time_basis"], "model_config": detector["config"],
+                    "aggregate_rule": aggregate["rule"],
+                    "quality": {"completeness": point["completeness"], "reason": point["completeness_reason"],
+                        "snapshot": point["evidence_refs"]},
+                    "aggregation_started_at": point["actual_started_at"].isoformat(),
+                    "aggregation_completed_at": point["actual_completed_at"].isoformat()}
         except ValueError as error:
             from ...detection.numeric import NumericQualityError
             if isinstance(error, NumericQualityError) or str(error).startswith(("coverage:", "feature_")):
@@ -588,7 +622,9 @@ class DetectorService:
             else:
                 self._model_error(context, error)
                 raise
+        model_completed = time.monotonic()
         current = self._lock(context)
+        lock_completed = time.monotonic()
         self.repository.save_transition(current, point, checkpoint,
             {"kind": "skipped" if reason else "evaluated", "reason": reason,
              "data": {"start": point["start_utc"].isoformat(), "end": point["end_utc"].isoformat(),
@@ -596,5 +632,12 @@ class DetectorService:
                       "actual_completed_at": current["now"].isoformat(),
                       "features": point["features"], "result": result}}, finding)
         self._commit_candidate()
+        self.transition_timings = {"read_seconds": model_started - started,
+            "model_seconds": model_completed - model_started,
+            "final_lock_seconds": lock_completed - model_completed,
+            "commit_seconds": time.monotonic() - lock_completed}
+        transport = getattr(self.models, "transport", None)
+        if reason is None and transport is not None:
+            self.transition_timings["runtime"] = transport.last_timings
         return {"state": "skipped" if reason else "evaluated", "reason": reason,
                 "point_id": point["id"], "finding": finding}

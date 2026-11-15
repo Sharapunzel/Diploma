@@ -15,18 +15,14 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import psycopg
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from psycopg import sql
-from sqlalchemy import func, select
-from sqlalchemy.engine import make_url
-
 from app.adapters.detector_lock import DetectorSessionLock
+from app.adapters.model_runtime import ModelRuntime
 from app.adapters.pgoutput import PgOutputDecoder
 from app.adapters.pgoutput_stream import ReplicationStream
 from app.adapters.wal_bootstrap import PUBLICATION, ROLE, SLOT, bootstrap
 from app.aggregate_composition import build_aggregate_service
 from app.db import Database
+from app.detection.model_process import BoundedModelFactory
 from app.detector_composition import build_detector_service
 from app.models import (
     InputProbe,
@@ -44,7 +40,11 @@ from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepositor
 from app.schemas.aggregates import AggregatePreviewRequest, CreateAggregateRequest
 from app.services.implementations.availability_materializer import AvailabilityMaterializer
 from app.services.implementations.input_attestations import canonical_payload, ingest_attestation
-from app.services.implementations.working_windows import WorkingWindowService
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from psycopg import sql
+from sqlalchemy import func, select
+from sqlalchemy.engine import make_url
 
 
 def wait_until(moment):
@@ -61,6 +61,7 @@ def real_formula_history(catalog):
     admin_url = base.set(drivername="postgresql", database="postgres").render_as_string(hide_password=False)
     dsn = make_url(url).set(drivername="postgresql").render_as_string(hide_password=False)
     db, lock = None, None
+    runtime = ModelRuntime()
     threads = []
     stop = threading.Event()
     capture_read = threading.Lock()
@@ -163,25 +164,16 @@ def real_formula_history(catalog):
                 return api
 
             def close_one(card):
-                deadline = time.monotonic() + 5
-                with db.session_factory() as session:
-                    api = aggregates(session)
-                    barrier_id = WorkingWindowService(api.windows, api.evidence, api.capture, api.uow).prepare_barrier(card.schedule_id)
-                # A closed point is immutable. Observe the accepted barrier and
-                # independently published post-barrier checkpoint BEFORE asking
-                # the real service to close it; do not repair an unknown point.
+                deadline = time.monotonic() + 10
                 while True:
                     assert not errors, errors
                     with db.session_factory() as session:
-                        api = aggregates(session)
-                        barrier = api.windows.barrier(barrier_id)
-                        if (barrier is not None and barrier.availability_at is not None
-                                and api.evidence.checkpoint(source_id, None, barrier.created_at, barrier.availability_at) is not None):
-                            break
-                    assert time.monotonic() < deadline
+                        result = aggregates(session).advance(card.id)
+                        if result["state"] == "closed" and result["origin"] == "online":
+                            from app.models import WorkingWindowPoint
+                            return session.get(WorkingWindowPoint, result["point_id"])
+                    assert time.monotonic() < deadline, result
                     time.sleep(.02)
-                with db.session_factory() as session:
-                    return aggregates(session).advance(card.id)
 
             fixture.write, fixture.attest, fixture.close_one = write, attest, close_one
             fixture.aggregates = aggregates
@@ -190,10 +182,12 @@ def real_formula_history(catalog):
             assert pid is not None
             with db.session_factory.begin() as session:
                 owner = SqlAlchemyDetectorRepository(session).acquire_owner(uuid4(), pid)
-            fixture.detectors = lambda session: build_detector_service(session, catalog, owner)
+            fixture.detectors = lambda session: build_detector_service(session, catalog, owner,
+                models=BoundedModelFactory(transport=runtime))
             yield fixture
             assert not errors, errors
         finally:
+            runtime.close()
             stop.set()
             for thread in threads:
                 thread.join(5)
@@ -222,7 +216,7 @@ def create_formula(fixture):
             "op": "add", "args": [{"ref": "twice"}, {"aggregate": {"op": "count"}}]}}]}
     body = AggregatePreviewRequest(source_id=fixture.source_id, aggregate_rule=rule,
         schedule={"boundary": anchor, "timezone": "UTC", "duration_seconds": 2},
-        window_start_utc=anchor, time_basis="backend_processed_at_historical")
+        window_start_utc=anchor, time_basis="event_time")
     with fixture.database.session_factory() as session:
         api = fixture.aggregates(session)
         checked = api.validate(body)

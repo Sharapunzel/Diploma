@@ -9,18 +9,18 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
-from sqlalchemy.engine import make_url
-
 from app.adapters.detector_lock import DetectorSessionLock
+from app.adapters.model_runtime import ModelRuntime
 from app.aggregate_composition import build_aggregate_service
 from app.db import Database
 from app.detection.aws_rcf import AwsModelFactory
 from app.detection.contracts import DetectionError, StaleCandidate, digest
+from app.detection.model_process import BoundedModelFactory
 from app.detector_composition import build_detector_service as compose_detector_service
 from app.detector_composition import build_worker_detector_service
 from app.ecs import PackagedEcsCatalog
 from app.models import (
+    AggregateClosure,
     Detector,
     DetectorOutcome,
     DetectorWarmup,
@@ -31,26 +31,33 @@ from app.models import (
 )
 from app.repositories.sqlalchemy.detectors import SqlAlchemyDetectorRepository
 from app.schemas.aggregates import AggregatePreviewRequest, CreateAggregateRequest
+from sqlalchemy import func, select
+from sqlalchemy.engine import make_url
 
 OWNER = None
+RUNTIME = None
 
 
 @pytest.mark.parametrize("accelerated", [False, True])
-def test_formula_output_real_capture_history_working_and_checkpoint(catalog, accelerated, monkeypatch):
+def test_formula_output_real_capture_history_working_and_checkpoint(catalog, accelerated):
+    from app.models import SourceInterruption
     from formula_history import create_formula, real_formula_history, wait_until
 
     with real_formula_history(catalog) as fixture:
         card, body, start = create_formula(fixture)
-        # Match the accepted live fixture's model size. The official core can
-        # throw IllegalStateException("out of space") with sample_size=2 on
-        # this repeated stream; changing the model is outside the aggregate task.
         seconds = 18 if accelerated else 32
         for second in range(seconds):
             wait_until(start + timedelta(seconds=second, milliseconds=100))
             fixture.write(1 + second % 3)
         end = start + timedelta(seconds=seconds)
-        wait_until(end)
-        fixture.attest(end)
+        wait_until(end + timedelta(seconds=2))
+        for index in range(seconds // 2):
+            working = fixture.close_one(card)
+            assert working.completeness == "complete", (working.completeness_reason, working.evidence_refs)
+            with fixture.database.session_factory() as session:
+                preview = fixture.aggregates(session).preview(body.model_copy(update={
+                    "window_start_utc": start + timedelta(seconds=index*2), "time_basis": "event_time"}))
+                assert [item.model_dump() for item in preview.features] == working.features
         with fixture.database.session_factory() as session:
             service = fixture.detectors(session)
             identity = service.create(card.id, UUID(int=1), "Formula",
@@ -61,82 +68,23 @@ def test_formula_output_real_capture_history_working_and_checkpoint(catalog, acc
             result = service.prepare_warmup(identity)
             assert result["state"] == "prepared", result
             attempt = service.repository.attempt(result["attempt_id"])
-            assert all(item["completeness"] == "complete" for item in attempt["inputs"])
-            assert all([feature["key"] for feature in item["features"]] == ["n"] for item in attempt["inputs"])
-            assert all(item["features"][0]["value"] == 3 * item["event_count"] for item in attempt["inputs"])
-            class DiagnosticPopen(subprocess.Popen):
-                def communicate(self, *args, **kwargs):
-                    result = super().communicate(*args, **kwargs)
-                    if self.returncode:
-                        print("Synthetic formula model process failed:", self.returncode, result[1], flush=True)
-                    return result
-            with monkeypatch.context() as context:
-                context.setattr(subprocess, "Popen", DiagnosticPopen)
-                assert service.warmup(identity) == {"state": "ready"}
-            saved = service.state(identity)["detector"]
-            assert saved["feature_keys"] == ["n"] and saved["config"]["dimensions"] == 1
-            assert saved["accelerated_used"] is accelerated
-            before = saved["checkpoint"]
-
-        # The synthetic input remains observed and idle during Java work.
-        cutoff = datetime.fromisoformat(attempt["plan"]["cutoff"])
-        latest = max(cutoff + timedelta(seconds=2), end + timedelta(seconds=2))
-        wait_until(latest)
-        fixture.attest(latest)
-        at = start
-        snapshots = {item["start"]: item for item in attempt["inputs"]}
-        while at < latest:
-            working = fixture.close_one(card)
-            assert working.completeness == "complete", (working.completeness_reason, working.evidence_refs)
-            with fixture.database.session_factory() as session:
-                api = fixture.aggregates(session)
-                try:
-                    preview = api.preview(body.model_copy(update={"window_start_utc": at, "time_basis": "availability_at"}))
-                except Exception as error:
-                    # Preserve the safe guard reason if a real runtime failure
-                    # remains; never convert an unavailable capture to ready.
-                    print("Synthetic formula preview failed:", getattr(error, "details", None))
-                    raise
-                assert [item.model_dump() for item in preview.features] == working.features
-            matching = snapshots.get(at.isoformat())
-            if matching is not None:
-                assert working.features == matching["features"]
-            at += timedelta(seconds=2)
+            assert all(item["basis"] == "event_time" and item["completeness"] == "complete" for item in attempt["inputs"])
+            assert all([f["key"] for f in item["features"]] == ["n"] for item in attempt["inputs"])
+            assert all(item["features"][0]["value"] == 3*item["event_count"] for item in attempt["inputs"])
+            assert service.warmup(identity) == {"state": "ready"}
+            before = service.state(identity)["detector"]["checkpoint"]
+            assert before["body"]["keys"] == ["n"]
+        fixture.close_one(card)
         with fixture.database.session_factory() as session:
-            # A fresh service/JVM restores the confirmed checkpoint and consumes
-            # exactly the output projection, with no auxiliary coordinates.
             service = fixture.detectors(session)
-            result = service.advance_one(identity)
-            assert result["state"] == "evaluated", result
+            assert service.advance_one(identity)["state"] == "evaluated"
             after = service.state(identity)["detector"]["checkpoint"]
             assert after["body"]["updates"] == before["body"]["updates"] + 1
-        with fixture.database.session_factory() as session:
-            service = fixture.detectors(session)
-            assert service.advance_one(identity)["reason"] == "working_point_pending"
-            assert service.state(identity)["detector"]["checkpoint"] == after
-
-        wait_until(latest + timedelta(seconds=2))
-        unknown = fixture.close_one(card)
-        assert unknown.completeness == "unknown" and unknown.features[0]["value"] == 0
-        with fixture.database.session_factory() as session:
-            service = fixture.detectors(session)
-            assert service.advance_one(identity)["state"] == "skipped"
-            assert service.state(identity)["detector"]["checkpoint"] == after
-        from app.models import SourceInterruption
-        stopped_end = latest + timedelta(seconds=4)
-        while stopped_end < datetime.now(UTC) + timedelta(seconds=.5):
-            wait_until(stopped_end)
-            missing_proof = fixture.close_one(card)
-            assert missing_proof.completeness == "unknown"
-            with fixture.database.session_factory() as session:
-                service = fixture.detectors(session)
-                assert service.advance_one(identity)["state"] == "skipped"
-                assert service.state(identity)["detector"]["checkpoint"] == after
-            stopped_end += timedelta(seconds=2)
+        # Absence of an optional signed probe is not a ban on received-snapshot
+        # evaluation. A positive stop fact is; it must not reset the forest.
         with fixture.database.session_factory.begin() as session:
-            session.get(Source, fixture.source_id).is_enabled = False
-            session.add(SourceInterruption(source_identity=fixture.source_id, kind="source_disabled"))
-        wait_until(stopped_end)
+            session.add(SourceInterruption(source_identity=fixture.source_id, kind="source_disabled",
+                started_at=end + timedelta(seconds=2)))
         interrupted = fixture.close_one(card)
         assert interrupted.completeness == "interrupted"
         with fixture.database.session_factory() as session:
@@ -147,19 +95,25 @@ def test_formula_output_real_capture_history_working_and_checkpoint(catalog, acc
 
 @pytest.fixture(scope="module", autouse=True)
 def coordinator(database):
-    global OWNER
+    global OWNER, RUNTIME
     lock = DetectorSessionLock(os.environ["TEST_DATABASE_URL"])
     pid = lock.acquire()
     assert pid is not None
     with database.session_factory.begin() as session:
         OWNER = SqlAlchemyDetectorRepository(session).acquire_owner(uuid4(), pid)
-    yield lock
-    lock.close()
-    OWNER = None
+    RUNTIME = ModelRuntime()
+    try:
+        yield lock
+    finally:
+        RUNTIME.close()
+        RUNTIME = None
+        lock.close()
+        OWNER = None
 
 
 def build_detector_service(session, catalog):
-    return compose_detector_service(session, catalog, OWNER)
+    return compose_detector_service(session, catalog, OWNER,
+        models=BoundedModelFactory(transport=RUNTIME))
 
 
 def prepare(service, identity):
@@ -210,9 +164,10 @@ def setup(database, catalog, request):
     body = AggregatePreviewRequest(source_id=source_id,
         aggregate_rule={"features": [feature]},
         schedule={"boundary": anchor, "timezone": "UTC", "duration_seconds": duration},
-        window_start_utc=anchor, time_basis="backend_processed_at_historical")
+        window_start_utc=anchor, time_basis="event_time")
     with database.session_factory() as session:
         aggregate = build_aggregate_service(session, catalog)
+        aggregate.repository.now = lambda: now - timedelta(seconds=120)
         checked = aggregate.validate(body)
         card = aggregate.create(CreateAggregateRequest(**body.model_dump(), name="Synthetic count",
             rule_hash=checked.rule_hash), UUID(int=1), str(uuid4()))
@@ -241,8 +196,15 @@ def point(setup, index, value, completeness="complete"):
             scheduled_at=start + timedelta(seconds=setup.duration), actual_started_at=start + timedelta(seconds=setup.duration),
             actual_completed_at=start + timedelta(seconds=setup.duration), event_count=0,
             event_time_min=None, event_time_max=None, completeness=completeness,
-            completeness_reason="synthetic_fixture", evidence_refs={},
+            completeness_reason="synthetic_fixture", evidence_refs={}, time_basis="event_time",
             features=[{"key": "n", "value": value, "reason": None, "valid_count": 1, "invalid_count": 0}])
+        end = start + timedelta(seconds=setup.duration)
+        session.add(AggregateClosure(origin_point_id=row.id, aggregate_id=setup.card.id,
+            schedule_id=setup.card.schedule_id, source_identity=setup.source_id, window_index=index,
+            start_utc=start, end_utc=end, time_basis="event_time", origin="online" if index >= setup.card.online_start_index else "initial_history",
+            snapshot_reference_at=end, closed_at=end, close_not_before_at=end + timedelta(seconds=min(setup.duration,300)),
+            payload_state="present", point_kind="working"))
+        session.flush()
         session.add(row)
     return row.id
 
@@ -319,6 +281,10 @@ def test_skip_moves_only_consumed_cursor(setup, coverage, value):
     after = stored(setup, identity)
     assert after["consumed_index"] == 480 and after["evaluated_index"] is None
     assert after["checkpoint"] == before
+    with setup.database.session_factory() as session:
+        build_detector_service(session, setup.catalog).stop(identity)
+        protection = build_aggregate_service(session, setup.catalog).cleanup_preview(setup.card.id, 0)
+        assert protection.minimum_keep == 0 and protection.can_cleanup
 
 
 @pytest.mark.parametrize("fault", ["before_commit", "lost_commit_ack"])
@@ -373,7 +339,7 @@ def test_delete_rejects_stale_candidate_and_preserves_history(setup):
             model.process = race
             return model
         service.models.restore = restore
-        with pytest.raises(DetectionError, match="aggregate_inactive"):
+        with pytest.raises(StaleCandidate, match="aggregate_execution_fenced"):
             service.advance_one(identity)
     assert stored(setup, identity)["state"] == "stopped"
     assert stored(setup, identity)["consumed_index"] is None
@@ -499,7 +465,7 @@ def test_archive_gap_resume_and_final_delete(setup):
     assert stored(setup, identity)["state"] == "stopped"
 
 
-def test_worker_discards_candidate_archived_during_real_model_and_resumes(setup):
+def test_worker_discards_candidate_archived_during_real_model_and_resumes(setup, request):
     from threading import Event
 
     from app.models import AggregateSchedule
@@ -512,8 +478,11 @@ def test_worker_discards_candidate_archived_during_real_model_and_resumes(setup)
         session.get(AggregateSchedule, setup.card.schedule_id).next_index = 481
     before = stored(setup, identity)
     raced = []
+    from app.adapters.model_runtime import ModelRuntime
+    transport = ModelRuntime()
+    request.addfinalizer(transport.close)
     def build(session, catalog, owner, cancel):
-        service = build_worker_detector_service(session, catalog, owner, cancel)
+        service = build_worker_detector_service(session, catalog, owner, cancel, transport)
         original = service.models.restore
         def restore(*args):
             model = original(*args)
@@ -644,7 +613,7 @@ def test_database_timezone_preserves_warmup_and_decisions(setup, monkeypatch):
             with setup.database.session_factory() as session:
                 session.execute(select(func.set_config("TimeZone", timezone, False)))
                 service = build_detector_service(session, setup.catalog)
-                freeze_attempt_clock(service, setup.cutoff + timedelta(seconds=1.1))
+                freeze_attempt_clock(service, setup.cutoff + timedelta(seconds=2.1))
                 service.recover(identity)
                 results.append(service.advance_one(identity))
                 assert session.scalar(select(Finding.late).where(Finding.detector_id == identity))
@@ -679,7 +648,7 @@ def test_delete_cancels_unconfirmed_warmup(setup, phase):
             service.models.warmup = delete_before_final_save
         else:
             service.history.materialize = delete_before_final_save
-        with pytest.raises(DetectionError, match="aggregate_inactive"):
+        with pytest.raises(StaleCandidate, match="aggregate_execution_fenced"):
             (service.warmup(identity) if phase == "warmup" else prepare(service, identity))
     state = stored(setup, identity)
     assert state["state"] == "stopped" and state["checkpoint"] is None
@@ -703,71 +672,53 @@ def test_delete_mutex_prevents_concurrent_create(setup):
             pending.result(timeout=10)
 
 
-def test_legacy_or_unknown_history_waits_without_training(setup):
+def test_missing_canonical_history_waits_without_training(setup):
     with setup.database.session_factory() as session:
         service = build_detector_service(session, setup.catalog)
         identity = service.create(setup.card.id, UUID(int=1), "Unknown history",
-            config={"sample_size": 16, "output_after": 16, "trees": 20})
-        freeze_attempt_clock(service, setup.cutoff)
-        service.history.aggregates.progress = lambda: SimpleNamespace(
-            availability_verified_from_at=None, legacy_cutover_at=setup.cutoff)
-        result = prepare(service, identity)
-        assert result["state"] == "waiting" and result["reason"] == "legacy_coverage_unproven"
-        assert stored(setup, identity)["checkpoint"] is None
+            config={"sample_size":16,"output_after":16,"trees":20})
+        result = prepare(service,identity)
+        assert result["state"] == "waiting" and result["reason"] == "insufficient_history"
+        assert stored(setup,identity)["checkpoint"] is None
 
 
-def test_preparation_locks_source_before_detector(setup):
+def test_preparation_locks_schedule_before_detector_without_source_barrier(setup):
     history(setup)
     with setup.database.session_factory() as session:
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "Lock order",
-            config={"sample_size": 16, "output_after": 16, "trees": 20})
-        freeze_attempt_clock(service, setup.cutoff)
-        service.start(identity)
-        service.begin_start(identity)
-        trace = []
-        aggregate_context = service.repository.aggregate_context
-        lock_source = service.windows.lock_source
-        row = service.repository._row
-        def aggregate(*args, **kwargs):
-            result = aggregate_context(*args, **kwargs)
-            if kwargs.get("lock", args[1] if len(args) > 1 else False):
-                trace.append("schedule")
+        service=build_detector_service(session, setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"Lock order",config={"sample_size":16,"output_after":16,"trees":20})
+        service.start(identity);service.begin_start(identity)
+        trace=[]
+        row=service.repository._row
+        def traced(model, identity, lock=False):
+            result=row(model,identity,lock)
+            if lock: trace.append(model.__tablename__)
             return result
-        def source(identity):
-            result = lock_source(identity)
-            trace.append("source")
-            return result
-        def detector(model, identity, lock=False):
-            result = row(model, identity, lock)
-            if model is Detector and lock:
-                trace.append("detector")
-            return result
-        service.repository.aggregate_context = aggregate
-        service.windows.lock_source = source
-        service.repository._row = detector
-        assert prepare(service, identity)["state"] == "prepared"
-        assert trace[0] == "schedule" and trace.index("source") < trace.index("detector")
+        service.repository._row=traced
+        service.windows.lock_source=lambda *_:pytest.fail("canonical warmup requested a source barrier")
+        assert prepare(service,identity)["state"] == "prepared"
+        assert trace.index("aggregate_schedules") < trace.index("detectors")
 
 
-def test_source_lock_wait_is_bounded_and_does_not_commit_attempt(setup):
+def test_schedule_lock_wait_is_bounded_and_does_not_commit_attempt(setup):
     import time
 
+    from app.models import AggregateSchedule
     from sqlalchemy.exc import DBAPIError
+    history(setup)
     with setup.database.session_factory() as session:
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "Bounded lock",
-            config={"sample_size": 16, "output_after": 16, "trees": 20})
+        service=build_detector_service(session,setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"Bounded lock",config={"sample_size":16,"output_after":16,"trees":20})
+        service.start(identity);service.begin_start(identity)
+        before=service.state(identity)["detector"]
     with setup.database.session_factory() as blocking, setup.database.session_factory() as session:
-        blocking.scalar(select(Source).where(Source.id == setup.source_id).with_for_update())
-        service = build_detector_service(session, setup.catalog)
-        freeze_attempt_clock(service, setup.cutoff)
-        started = time.monotonic()
-        with pytest.raises(DBAPIError):
-            prepare(service, identity)
-        assert 4 <= time.monotonic() - started < 12
-    state = stored(setup, identity)
-    assert state["revision"] == 2 and state["active_attempt_id"] is None
+        blocking.scalar(select(AggregateSchedule).where(AggregateSchedule.id==setup.card.schedule_id).with_for_update())
+        service=build_detector_service(session,setup.catalog)
+        started=time.monotonic()
+        with pytest.raises(DBAPIError): service.prepare_warmup(identity)
+        assert 4 <= time.monotonic()-started <12
+    state=stored(setup,identity)
+    assert state["revision"]==before["revision"] and state["active_attempt_id"] is None
 
 
 @pytest.mark.parametrize("phase", ["fit", "collision", "convert"])
@@ -776,17 +727,8 @@ def test_preparation_deadline_stops_numeric_work_without_committing_batch(setup,
     from app.services.implementations import detector_history
 
     originals = [[2**60 + i] for i in range(512)]
-    with setup.database.session_factory.begin() as session:
-        for i, values in enumerate(originals, start=48):
-            start = setup.anchor + timedelta(seconds=i)
-            end = start + timedelta(seconds=1)
-            session.add(WorkingWindowPoint(id=uuid4(), schedule_id=setup.card.schedule_id,
-                window_index=i, start_utc=start, end_utc=end, scheduled_at=end,
-                actual_started_at=end, actual_completed_at=end, event_count=0,
-                event_time_min=None, event_time_max=None, completeness="complete",
-                completeness_reason="synthetic_fixture", evidence_refs={},
-                features=[{"key": "n", "value": values[0], "reason": None,
-                           "valid_count": 1, "invalid_count": 0}]))
+    for i, values in enumerate(originals,start=48):
+        point(setup,i,values[0])
     clock = {"now": 0, "exact": 0, "convert": 0, "expired_at": None}
     exact = numeric.exact
     convert = numeric.Affine.convert
@@ -830,328 +772,136 @@ def test_preparation_deadline_stops_numeric_work_without_committing_batch(setup,
 
 
 @pytest.mark.parametrize("setup", ["count", "bytes", "empty"], indirect=True)
-def test_real_aggregate_and_saved_signed_evidence(setup):
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    from app.models import (
-        AggregateSchedule,
-        AvailabilityMarker,
-        InputProbe,
-        KafkaCheckpoint,
-        ParsedLog,
-    )
-    from app.repositories.sqlalchemy.input_attestations import SqlAlchemyInputAttestationRepository
-    from app.services.implementations.input_attestations import (
-        canonical_payload,
-        ingest_attestation,
-    )
-    from app.services.implementations.working_windows import WindowNotReady
-
+def test_real_event_time_aggregate_preserves_finding_facts(setup):
+    from app.models import AggregateSchedule, ParsedLog, ProcessedKafkaRecord
+    from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
     history(setup)
-    identity = prepared(setup)
-    start, end = setup.cutoff, setup.cutoff + timedelta(seconds=1)
-    probe_id, generation, worker = uuid4(), uuid4(), uuid4()
-    private = Ed25519PrivateKey.generate()
-    count = 0 if setup.kind == "empty" else 1 if setup.kind == "bytes" else 100
-    payload = {"id": str(uuid4()), "probe_id": str(probe_id), "source_id": str(setup.source_id),
-        "input_generation": str(generation), "sequence": 1, "start": start.isoformat(),
-        "end": end.isoformat(), "state": "covered", "topic_identity": "synthetic",
-        "start_positions": {"0": 0}, "end_positions": {"0": count}}
-    occurred = start - timedelta(days=20)
+    identity=prepared(setup)
+    start=setup.anchor+timedelta(seconds=480)
+    occurred=start+timedelta(microseconds=100000)
+    count=0 if setup.kind=="empty" else 1 if setup.kind=="bytes" else 100
     with setup.database.session_factory.begin() as session:
-        session.get(AggregateSchedule, setup.card.schedule_id).next_index = 480
-        session.add(InputProbe(id=probe_id, source_identity=setup.source_id, input_generation=generation,
-            public_key=private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)))
+        session.get(AggregateSchedule,setup.card.schedule_id).next_index=480
+        writer=SqlAlchemyProcessingRepository(session)
         for i in range(count):
-            record_id = processed_record(session, setup, i, start)
-            event = ParsedLog(id=uuid4(), source_id=setup.source_id, normalizer_version=1,
-                processed_record_id=record_id,
-                normalizer_name="Synthetic ECS", source_name=setup.kind, connection_name="Synthetic",
-                kafka_topic=str(setup.source_id), kafka_partition=0, kafka_offset=i, deduplication_key=str(uuid4()),
-                raw="synthetic", ecs_data=({"@timestamp": occurred.isoformat(),
-                    "network": {"bytes": 1000}, "source": {"ip": "192.0.2.1"},
-                    "event": {"category": ["network"]}} if setup.kind == "bytes" else
-                    {"@timestamp": occurred.isoformat(), "user": {"name": "alice"},
-                     "event": {"category": ["authentication"], "outcome": "failure"}}),
-                normalization_status="complete", normalization_diagnostics=[],
-                fluent_bit_collected_at=start, backend_received_at=start, backend_processed_at=start)
-            session.add(event)
-            session.add(AvailabilityMarker(source_identity=setup.source_id, kind="event",
-                                           event_id=event.id, availability_at=start))
-    with setup.database.session_factory.begin() as session:
-        ingest_attestation(SqlAlchemyInputAttestationRepository(session), payload,
-                           private.sign(canonical_payload(payload)))
-        for at in [start - timedelta(seconds=1), end + timedelta(seconds=1)]:
-            position = 0 if at < start else count
-            session.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
-                worker_instance=worker, observed_at=at, partitions={"0": {"low": 0, "high": position, "committed": position}}))
-    def aggregate(session):
-        result = build_aggregate_service(session, setup.catalog)
-        result.capture = SimpleNamespace(status=lambda: SimpleNamespace(ready=True))
-        return result
-    with setup.database.session_factory() as session, pytest.raises(WindowNotReady, match="barrier_not_materialized"):
-        aggregate(session).advance(setup.card.id)
-    with setup.database.session_factory.begin() as session:
-        for marker in session.scalars(select(AvailabilityMarker).where(
-                AvailabilityMarker.source_identity == setup.source_id, AvailabilityMarker.kind == "barrier")):
-            marker.availability_at = datetime.now(UTC)
-    with setup.database.session_factory.begin() as session:
-        session.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
-            worker_instance=worker, partitions={"0": {"low": 0, "high": count, "committed": count}}))
+            record=ProcessedKafkaRecord(id=uuid4(),connection_id=setup.connection_id,connection_identity=setup.connection_id,
+                source_id=setup.source_id,kafka_topic_identity="synthetic",kafka_topic=str(setup.source_id),kafka_partition=0,
+                kafka_offset=i,result_status="complete",backend_received_at=start,backend_processed_at=start)
+            event=ParsedLog(id=uuid4(),source_id=setup.source_id,connection_id=setup.connection_id,normalizer_version=1,
+                normalizer_name="Synthetic",source_name=setup.kind,connection_name="Synthetic",kafka_topic=str(setup.source_id),
+                kafka_partition=0,kafka_offset=i,deduplication_key=str(uuid4()),raw="synthetic",
+                ecs_data={"@timestamp":occurred.isoformat(),"network":{"bytes":1000}},
+                normalization_status="complete",normalization_diagnostics=[],fluent_bit_collected_at=start,
+                backend_received_at=start,backend_processed_at=start)
+            assert writer.store_event(record,event)
     with setup.database.session_factory() as session:
-        working = aggregate(session).advance(setup.card.id)
-        assert working.completeness == "complete" and working.evidence_refs["attestations"]
-        assert working.features[0]["value"] == (0 if setup.kind == "empty" else 1000 if setup.kind == "bytes" else 100)
-    result = advance(setup, identity)
-    assert result["state"] == "evaluated"
-    if setup.kind == "empty":
-        assert stored(setup, identity)["checkpoint"]["body"]["updates"] == 33
-        return
-    assert result["finding"]
-    assert result["finding"]["source_id"] == str(setup.source_id)
-    assert result["finding"]["event_time_min"] == occurred.isoformat()
-    assert result["finding"]["start"] == start.isoformat()
+        service=build_aggregate_service(session,setup.catalog)
+        for _ in range(3): result=service.advance(setup.card.id)
+        assert result["state"]=="closed"
+        working=service.point_at(setup.card.id,480)
+        assert working.completeness=="complete"
+        assert working.features[0].value==(0 if setup.kind=="empty" else 1000 if setup.kind=="bytes" else 100)
+    result=advance(setup,identity)
+    assert result["state"]=="evaluated"
+    if setup.kind!="empty":
+        assert result["finding"]
+        assert result["finding"]["source_id"]==str(setup.source_id)
+        assert result["finding"]["event_time_min"]==occurred.isoformat()
+        assert result["finding"]["time_basis"]=="event_time" and result["finding"]["start"]==start.isoformat()
 
 
-def overlapping_history(setup, accelerated=True):
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    from app.detection.history import plan_windows, warmup_plan
-    from app.models import (
-        AvailabilityMarker,
-        InputAttestation,
-        InputProbe,
-        KafkaCheckpoint,
-        ParsedLog,
-        ReplicationProgress,
-    )
-    from app.services.implementations.input_attestations import canonical_payload
-
-    plan = warmup_plan(setup.anchor, 10, setup.cutoff, 32, 1 if accelerated else 10, accelerated)
-    windows = list(plan_windows(plan))
-    start, end = windows[0][0], windows[-1][1]
-    probe_id, generation, worker, report_id = uuid4(), uuid4(), uuid4(), uuid4()
-    private = Ed25519PrivateKey.generate()
-    setup.history_private = private
-    count = sum(1 + second % 3 for second in range(int((end-start).total_seconds())))
-    report = {"id": str(report_id), "probe_id": str(probe_id), "source_id": str(setup.source_id),
-        "input_generation": str(generation), "sequence": 1, "start": start.isoformat(),
-        "end": end.isoformat(), "state": "covered", "topic_identity": "synthetic",
-        "start_positions": {"0": 0}, "end_positions": {"0": count}}
-    at = datetime.now(UTC)
+def overlapping_history(setup, accelerated=True, fault=None):
+    from app.aggregation.event_time import warmup_indices
+    from app.models import KafkaCheckpoint, ParsedLog, ProcessedKafkaRecord, SourceInterruption
+    from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
+    indices = warmup_indices(47, 10, 1 if accelerated else 10, 16, 16, accelerated)
+    start = setup.anchor + timedelta(seconds=indices["base_first"]*10)
+    end = setup.cutoff
     events = []
     with setup.database.session_factory.begin() as session:
-        progress = session.get(ReplicationProgress, 1)
-        if progress is None:
-            session.add(ReplicationProgress(id=1, durable_lsn=0,
-                availability_verified_from_at=setup.anchor))
-        else:
-            progress.availability_verified_from_at = min(progress.availability_verified_from_at or setup.anchor, setup.anchor)
-        session.add(AvailabilityMarker(source_identity=setup.source_id, kind="barrier",
-            created_at=at - timedelta(seconds=1), availability_at=at - timedelta(seconds=1)))
-        session.add(InputProbe(id=probe_id, source_identity=setup.source_id, input_generation=generation,
-            public_key=private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)))
-        session.flush()
-        session.add(InputAttestation(id=report_id, probe_id=probe_id, source_identity=setup.source_id,
-            input_generation=generation, sequence=1, start_utc=start, end_utc=end, state="covered",
-            topic_identity="synthetic", start_positions={"0": 0}, end_positions={"0": count},
-            signed_payload=report, signature=private.sign(canonical_payload(report)),
-            received_at=at - timedelta(seconds=2)))
+        session.execute(select(func.set_config("TimeZone", "America/New_York", False)))
+        writer = SqlAlchemyProcessingRepository(session)
         for second in range(int((end-start).total_seconds())):
             when = start + timedelta(seconds=second)
             for _ in range(1 + second % 3):
                 index = len(events)
-                record_id = processed_record(session, setup, index, when)
-                event = ParsedLog(id=uuid4(), source_id=setup.source_id, normalizer_version=1,
-                    processed_record_id=record_id,
-                    normalizer_name="ECS", source_name="overlap", connection_name="Synthetic",
+                record = ProcessedKafkaRecord(id=uuid4(), connection_id=setup.connection_id,
+                    connection_identity=setup.connection_id, source_id=setup.source_id,
+                    kafka_topic_identity="synthetic", kafka_topic=str(setup.source_id), kafka_partition=0,
+                    kafka_offset=index, result_status="complete", backend_received_at=when, backend_processed_at=when)
+                event = ParsedLog(id=uuid4(), source_id=setup.source_id, connection_id=setup.connection_id,
+                    normalizer_version=1, normalizer_name="ECS", source_name="overlap", connection_name="Synthetic",
                     kafka_topic=str(setup.source_id), kafka_partition=0, kafka_offset=index,
-                    deduplication_key=str(uuid4()), raw="synthetic",
-                    ecs_data={"@timestamp": when.isoformat()}, normalization_status="complete",
-                    normalization_diagnostics=[], fluent_bit_collected_at=when,
+                    deduplication_key=str(uuid4()), raw="synthetic", ecs_data={"@timestamp": when.isoformat()},
+                    normalization_status="complete", normalization_diagnostics=[], fluent_bit_collected_at=when,
                     backend_received_at=when, backend_processed_at=when)
+                assert writer.store_event(record, event)
                 events.append(when)
-                session.add(event)
-                session.add(AvailabilityMarker(source_identity=setup.source_id, kind="event",
-                    event_id=event.id, availability_at=when))
-        when = start - timedelta(seconds=1)
-        while when <= end + timedelta(seconds=5):
-            position = sum(event_time <= when for event_time in events)
-            session.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
-                worker_instance=worker, observed_at=when, partitions={"0": {"low": 0, "high": position, "committed": position}}))
-            when += timedelta(seconds=5)
-        session.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
-            worker_instance=worker, partitions={"0": {"low": 0, "high": count, "committed": count}}))
-    return plan, windows, events, worker
+        if fault in {"backlog","retention"}:
+            session.add(KafkaCheckpoint(source_identity=setup.source_id,topic_identity="synthetic",worker_instance=uuid4(),
+                observed_at=end-timedelta(seconds=1),partitions={"0":{"low":len(events)+1 if fault=="retention" else 0,
+                    "high":len(events),"committed":len(events)-1 if fault=="backlog" else len(events)}}))
+        elif fault:
+            session.add(SourceInterruption(source_identity=setup.source_id, kind="processing_stopped",
+                started_at=start-timedelta(seconds=1), ended_at=end+timedelta(seconds=1)))
+    for _ in range(3*(48-indices["base_first"])+9):
+        with setup.database.session_factory() as session:
+            aggregate = build_aggregate_service(session, setup.catalog)
+            aggregate.repository.now = lambda: setup.cutoff
+            aggregate.advance(setup.card.id)
+    first = setup.anchor + timedelta(seconds=indices["starts"][0])
+    plan = {"cutoff": end.isoformat(), "first_start": first.isoformat(), "count": indices["count"],
+        "step": 1 if accelerated else 10, "duration": 10,
+        "coverage_seconds": 10+(indices["count"]-1)*(1 if accelerated else 10), "evaluation_start_index":48}
+    windows = [(first+timedelta(seconds=i*plan["step"]),first+timedelta(seconds=i*plan["step"]+10)) for i in range(plan["count"])]
+    return plan, windows, events, uuid4()
 
 
-def publish_attempt_evidence(setup, attempt, worker, count, checkpoint=True):
-    """DB-only fixture: commit the accepted attempt's barrier and independent proof."""
-    from uuid import uuid5
-
-    from app.models import AvailabilityMarker, KafkaCheckpoint
-    with setup.database.session_factory.begin() as proof:
-        marker = proof.get(AvailabilityMarker, uuid5(attempt["id"], "warmup"))
-        assert marker is not None
-        marker.availability_at = proof.scalar(select(func.clock_timestamp()))
-    if checkpoint:
-        with setup.database.session_factory.begin() as proof:
-            proof.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",
-                worker_instance=worker, partitions={"0": {"low": 0, "high": count, "committed": count}}))
 
 
-def ready_fixture(service, setup, worker, count):
-    original = service.history._ready
-    published = []
-    def ready(source_id, attempt, deadline):
-        if not published:
-            publish_attempt_evidence(setup, attempt, worker, count)
-            published.append(attempt["id"])
-        return original(source_id, attempt, deadline)
-    service.history._ready = ready
-    return published
 
 
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
 @pytest.mark.parametrize("arrival", ["before_attempt", "after_attempt", "missing"])
-def test_ordinary_history_recomputes_unusable_working_batch_at_its_own_barrier(setup, arrival):
-    """Event commit -> working barrier -> report -> new attempt is deterministic."""
-    from uuid import uuid5
-
-    from app.models import AvailabilityMarker, InputAttestation
-    from app.repositories.sqlalchemy.evidence import SqlAlchemyCoverageEvidenceRepository
-    from app.services.implementations.input_attestations import canonical_payload
-    from app.services.implementations.saved_coverage import evaluate_saved_coverage
-
-    plan, windows, events, worker = overlapping_history(setup, accelerated=False)
-    split = windows[-1][0] + timedelta(seconds=5)
-    position = sum(at < split for at in events)
-    # The real event/processed-record transaction is already committed. The
-    # browser writer releases its SHARE source lock before its report transaction;
-    # a source-locked working barrier can legally commit in that interval.
-    with setup.database.session_factory.begin() as writer:
-        writer.scalar(select(Source).where(Source.id == setup.source_id).with_for_update(read=True))
-        first = writer.scalar(select(InputAttestation).where(InputAttestation.source_identity == setup.source_id))
-        tail = {**first.signed_payload, "id": str(uuid4()), "sequence": 2,
-                "start": split.isoformat(), "start_positions": {"0": position}}
-        first.end_utc, first.end_positions = split, {"0": position}
-        first.signed_payload = {**first.signed_payload, "end": split.isoformat(),
-                                "end_positions": {"0": position}}
-        first.signature = setup.history_private.sign(canonical_payload(first.signed_payload))
-        probe_id, generation = first.probe_id, first.input_generation
-    with setup.database.session_factory.begin() as closer:
-        closer.scalar(select(Source).where(Source.id == setup.source_id).with_for_update())
-        old_barrier_at = closer.scalar(select(func.clock_timestamp()))
-        old_barrier_id = uuid5(setup.card.schedule_id, "working-window:47")
-        closer.add(AvailabilityMarker(id=old_barrier_id, source_identity=setup.source_id,
-            kind="barrier", created_at=old_barrier_at, availability_at=old_barrier_at))
-
-    def report():
-        with setup.database.session_factory.begin() as writer:
-            writer.scalar(select(Source).where(Source.id == setup.source_id).with_for_update())
-            received = writer.scalar(select(func.clock_timestamp()))
-            writer.add(InputAttestation(id=UUID(tail["id"]), probe_id=probe_id,
-                source_identity=setup.source_id, input_generation=generation, sequence=2,
-                start_utc=split, end_utc=windows[-1][1], state="covered", topic_identity="synthetic",
-                start_positions={"0": position}, end_positions={"0": len(events)},
-                signed_payload=tail, signature=setup.history_private.sign(canonical_payload(tail)),
-                received_at=received))
-        assert received > old_barrier_at
-        return received
-
-    if arrival == "before_attempt":
-        received_at = report()
+def test_ordinary_history_never_repairs_unknown_canonical_batch_with_new_evidence(setup, arrival):
+    from app.models import KafkaCheckpoint
+    plan, _, _, worker = overlapping_history(setup, accelerated=False, fault="stop")
     with setup.database.session_factory() as session:
-        coverage = evaluate_saved_coverage(SqlAlchemyCoverageEvidenceRepository(session),
-            setup.source_id, *windows[-1], old_barrier_at)
-        assert coverage[:2] == ("unknown", "input_coverage_gap")
-    for left, _ in windows[:-1]:
-        point(setup, int((left - setup.anchor).total_seconds()) // setup.duration, 2)
-    closed_id = point(setup, 47, 2, coverage[0])
-    with setup.database.session_factory.begin() as session:
-        closed = session.get(WorkingWindowPoint, closed_id)
-        closed.completeness_reason, closed.evidence_refs = coverage[1:]
+        service=build_detector_service(session,setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"No fresh fallback",config={"sample_size":16,"output_after":16,"trees":20})
+        service.history.aggregates.event_statistics=lambda *_:pytest.fail("ordinary history recalculated raw")
+        result=prepare(service,identity)
+        assert result["state"]=="waiting" and result["reason"]=="coverage:interrupted"
+        attempt=service.repository.attempt(result["attempt_id"])
+        assert attempt["plan"]==plan and all(i["completeness"]=="interrupted" for i in attempt["inputs"])
+        before=copy.deepcopy(attempt["inputs"])
+    if arrival!="missing":
+        with setup.database.session_factory.begin() as session:
+            session.add(KafkaCheckpoint(source_identity=setup.source_id, topic_identity="synthetic",worker_instance=worker,
+                partitions={"0":{"low":0,"high":0,"committed":0}}))
     with setup.database.session_factory() as session:
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "Ordinary history after working gap",
-            config={"sample_size": 16, "output_after": 16, "trees": 20})
-        freeze_attempt_clock(service, setup.cutoff)
-        original = service.history._ready
-        attempts = []
-
-        def ready(source_id, attempt, deadline):
-            if not attempts:
-                publish_attempt_evidence(setup, attempt, worker, len(events))
-                if arrival == "after_attempt":
-                    report()
-                attempts.append(attempt["id"])
-            return original(source_id, attempt, deadline)
-
-        service.history._ready = ready
-        result = prepare(service, identity)
-        attempt = service.repository.attempt(result["attempt_id"])
-        assert attempt["cutoff"] == setup.cutoff and attempt["plan"] == plan
-        assert attempts == [attempt["id"]], result
-        assert len(attempt["inputs"]) == plan["count"]
-        assert all(item["point_id"] is None for item in attempt["inputs"])
-        if arrival == "before_attempt":
-            assert result["state"] == "prepared", result
-            barrier = session.get(AvailabilityMarker, uuid5(attempt["id"], "warmup"))
-            assert old_barrier_at < received_at < barrier.availability_at
-            assert all(item["completeness"] == "complete" for item in attempt["inputs"])
-            assert service.warmup(identity) == {"state": "ready"}
-        else:
-            assert result["state"] == "waiting", result
-            assert attempt["inputs"][-1]["reason"] == "input_coverage_gap"
-            assert attempt["inputs"][-1]["completeness"] == "unknown"
-    with setup.database.session_factory() as session:
-        closed = session.get(WorkingWindowPoint, closed_id)
-        assert (closed.completeness, closed.completeness_reason, closed.evidence_refs) == coverage
-        assert closed.features[0]["value"] == 2
+        assert build_detector_service(session,setup.catalog).repository.attempt(attempt["id"])["inputs"]==before
+    assert stored(setup,identity)["checkpoint"] is None
 
 
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
 @pytest.mark.parametrize("accelerated", [False, True])
-def test_history_readiness_sees_late_checkpoint_and_pins_attempt_barrier(setup, accelerated):
+def test_history_optional_checkpoint_does_not_replace_canonical_cutoff(setup, accelerated):
     from app.models import AvailabilityMarker, KafkaCheckpoint
-    plan, _, events, worker = overlapping_history(setup, accelerated)
-    with setup.database.engine.connect() as reader_connection, setup.database.session_factory(bind=reader_connection) as session:
-        reader_pid = session.scalar(select(func.pg_backend_pid()))
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "Late proof",
-            config={"sample_size": 16, "output_after": 16, "trees": 20},
-            accelerated=accelerated, step=1 if accelerated else None)
-        freeze_attempt_clock(service, setup.cutoff)
-        original = service.history._ready
-        attempts = []
-        def delayed(source_id, attempt, deadline):
-            if not attempts:
-                publish_attempt_evidence(setup, attempt, worker, len(events), checkpoint=False)
-                # First real probe has no suitable post-barrier checkpoint.
-                assert not original(source_id, attempt, deadline)
-                assert not session.in_transaction()
-                with setup.database.session_factory.begin() as other:
-                    assert other.scalar(select(func.pg_backend_pid())) != reader_pid
-                    other.add(KafkaCheckpoint(source_identity=source_id, topic_identity="synthetic",
-                        worker_instance=worker, partitions={"0": {"low": 0, "high": len(events), "committed": len(events)}}))
-                # A second actor's newer barrier must not move this requirement.
-                with setup.database.session_factory.begin() as other:
-                    at = other.scalar(select(func.clock_timestamp()))
-                    other.add(AvailabilityMarker(source_identity=source_id, kind="barrier",
-                        created_at=at, availability_at=at))
-            attempts.append((attempt["id"], copy.deepcopy(attempt["plan"])))
-            return original(source_id, attempt, deadline)
-        service.history._ready = delayed
-        result = prepare(service, identity)
-        assert result["state"] == "prepared", result
-        attempt = service.repository.attempt(result["attempt_id"])
-        assert attempts and all(row == (attempt["id"], plan) for row in attempts)
-        assert attempt["cutoff"] == setup.cutoff
-        assert len(attempt["inputs"]) == plan["count"]
-        assert all(i["completeness"] == "complete" for i in attempt["inputs"])
-        assert service.warmup(identity) == {"state": "ready"}
+    plan,_,events,worker=overlapping_history(setup,accelerated)
+    with setup.database.session_factory() as session:
+        service=build_detector_service(session,setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"Fixed cutoff",config={"sample_size":16,"output_after":16,"trees":20},accelerated=accelerated,step=1 if accelerated else None)
+        result=prepare(service,identity)
+        assert result["state"]=="prepared",result
+        attempt=service.repository.attempt(result["attempt_id"])
+        assert attempt["plan"]==plan and attempt["cutoff"]==setup.cutoff
+        assert session.scalar(select(func.count()).select_from(AvailabilityMarker).where(AvailabilityMarker.source_identity==setup.source_id,AvailabilityMarker.kind=="barrier"))==0
+        before=copy.deepcopy(attempt)
+    with setup.database.session_factory.begin() as session:
+        session.add(KafkaCheckpoint(source_identity=setup.source_id,topic_identity="synthetic",worker_instance=worker,partitions={"0":{"low":0,"high":len(events),"committed":len(events)}}))
+    with setup.database.session_factory() as session:
+        assert build_detector_service(session,setup.catalog).repository.attempt(attempt["id"])==before
 
 
 def test_history_refreshes_remaining_sql_budget_between_working_reads(setup):
@@ -1183,90 +933,64 @@ def test_history_refreshes_remaining_sql_budget_between_working_reads(setup):
 
 
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
-def test_history_restarts_whole_snapshot_when_proof_disappears_after_preflight(setup):
-    from sqlalchemy import delete
-
-    from app.models import KafkaCheckpoint
-    plan, _, events, worker = overlapping_history(setup)
+@pytest.mark.parametrize("mutation", ["delete", "ecs", "diagnostics"])
+def test_overlap_missing_or_changed_saved_raw_is_rejected_before_training(setup, mutation):
+    from app.models import ParsedLog
+    overlapping_history(setup)
+    with setup.database.session_factory.begin() as session:
+        row=session.scalar(select(ParsedLog).where(ParsedLog.source_id==setup.source_id))
+        if mutation == "delete":
+            session.delete(row)
+        elif mutation == "ecs":
+            row.ecs_data = {**row.ecs_data, "network": {"bytes": 2**60 + 1}}
+        else:
+            row.normalization_diagnostics = [{"code": "synthetic_changed_diagnostic"}]
     with setup.database.session_factory() as session:
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "Snapshot race",
-            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
-        freeze_attempt_clock(service, setup.cutoff)
-        ready_fixture(service, setup, worker, len(events))
-        ready = service.history._ready
-        observed = []
-        def race(source, attempt, deadline):
-            if observed:
-                with setup.database.session_factory.begin() as other:
-                    other.add(KafkaCheckpoint(source_identity=source, topic_identity="synthetic",
-                        worker_instance=worker, partitions={"0": {"low": 0, "high": len(events), "committed": len(events)}}))
-            result = ready(source, attempt, deadline)
-            if not observed:
-                assert result
-                with setup.database.session_factory.begin() as other:
-                    other.execute(delete(KafkaCheckpoint).where(
-                        KafkaCheckpoint.source_identity == source,
-                        KafkaCheckpoint.observed_at > setup.cutoff + timedelta(seconds=10)))
-            observed.append(attempt["id"])
-            return result
-        service.history._ready = race
-        result = prepare(service, identity)
-        assert result["state"] == "prepared", result
-        assert len(observed) == 2 and len(set(observed)) == 1
-        attempt = service.repository.attempt(result["attempt_id"])
-        assert attempt["plan"] == plan and len(attempt["inputs"]) == plan["count"]
+        service=build_detector_service(session,setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"Missing member",config={"sample_size":16,"output_after":16,"trees":20},accelerated=True,step=1)
+        result=prepare(service,identity)
+        assert result["state"]=="waiting" and result["reason"]=="warmup_membership_source_unavailable",result
+        attempt=service.repository.attempt(result["attempt_id"])
+        assert attempt["inputs"]==[] and stored(setup,identity)["checkpoint"] is None
 
 
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
 @pytest.mark.parametrize("blocked", [False, True])
-def test_history_readiness_deadline_has_no_partial_inputs_or_automatic_retry(setup, blocked, monkeypatch):
+def test_history_read_deadline_has_no_partial_inputs_or_automatic_retry(setup, blocked, monkeypatch):
     import time
 
     from sqlalchemy import text
-
     overlapping_history(setup)
     with setup.database.session_factory() as session, setup.database.session_factory() as other:
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "No proof",
-            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
-        freeze_attempt_clock(service, setup.cutoff)
-        materialize = service.history.materialize
-        def limited(context, attempt, deadline):
-            if blocked:
-                other.execute(text("LOCK TABLE logs.availability_markers IN ACCESS EXCLUSIVE MODE"))
-            try:
-                return materialize(context, attempt, time.monotonic() + .15)
-            finally:
-                other.rollback()
-        monkeypatch.setattr(service.history, "materialize", limited)
-        started = time.monotonic()
-        result = prepare(service, identity)
-        assert time.monotonic() - started < 3
-        assert result["reason"] == "resource_budget:preparation_seconds"
-        state = service.state(identity)
-        assert state["detector"]["execution_state"] == "failed"
-        assert state["detector"]["failure_code"] == "resource_limit"
-        assert state["detector"]["checkpoint"] is None
-        assert state["detector"]["consumed_index"] is None
-        assert state["warmup"]["inputs"] == [] and state["warmup"]["status"] == "waiting"
+        service=build_detector_service(session,setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"Bounded snapshot",config={"sample_size":16,"output_after":16,"trees":20},accelerated=True,step=1)
+        materialize=service.history.materialize
+        def limited(context,attempt,deadline):
+            if blocked: other.execute(text("LOCK TABLE logs.aggregate_memberships IN ACCESS EXCLUSIVE MODE"))
+            try: return materialize(context,attempt,time.monotonic()+(.15 if blocked else .000001))
+            finally: other.rollback()
+        monkeypatch.setattr(service.history,"materialize",limited)
+        result=prepare(service,identity)
+        assert result["reason"]=="resource_budget:preparation_seconds",result
+        state=service.state(identity)
+        assert state["detector"]["execution_state"]=="failed" and state["detector"]["failure_code"]=="resource_limit"
+        assert state["detector"]["checkpoint"] is None and state["detector"]["consumed_index"] is None
+        assert state["warmup"]["inputs"]==[] and state["warmup"]["status"]=="waiting"
         service.recover(identity)
-        assert service.state(identity)["detector"] == state["detector"]
-        assert identity not in service.candidates()
+        assert service.state(identity)["detector"]==state["detector"] and identity not in service.candidates()
 
 
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
 @pytest.mark.parametrize("phase", ["readiness", "snapshot"])
 @pytest.mark.parametrize("action", ["stop", "delete", "owner"])
 def test_history_readiness_and_snapshot_are_fenced_before_write(setup, phase, action, monkeypatch):
-    plan, _, events, worker = overlapping_history(setup)
+    plan, _, _events, _worker = overlapping_history(setup)
     with setup.database.session_factory() as session:
         service = build_detector_service(session, setup.catalog)
         identity = service.create(setup.card.id, UUID(int=1), "Read fencing",
             config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
         freeze_attempt_clock(service, setup.cutoff)
-        ready_fixture(service, setup, worker, len(events))
-        original = service.history._ready if phase == "readiness" else service.history.materialize
+        original = service.history.plan if phase == "readiness" else service.history.materialize
         raced = []
         def mutation(*args):
             result = original(*args)
@@ -1285,7 +1009,7 @@ def test_history_readiness_and_snapshot_are_fenced_before_write(setup, phase, ac
                         other.commit()
                 raced.append(True)
             return result
-        monkeypatch.setattr(service.history, "_ready" if phase == "readiness" else "materialize", mutation)
+        monkeypatch.setattr(service.history, "plan" if phase == "readiness" else "materialize", mutation)
         try:
             with pytest.raises(DetectionError):
                 prepare(service, identity)
@@ -1293,7 +1017,7 @@ def test_history_readiness_and_snapshot_are_fenced_before_write(setup, phase, ac
             assert state["checkpoint"] is None and state["consumed_index"] is None
             with setup.database.session_factory() as read:
                 attempt = read.scalar(select(DetectorWarmup).where(DetectorWarmup.detector_id == identity))
-                assert attempt.plan == plan and attempt.inputs == []
+                assert attempt is None if phase == "readiness" else attempt.plan == plan and attempt.inputs == []
         finally:
             if action == "owner":
                 from app.models import DetectorCoordinator
@@ -1310,68 +1034,33 @@ def test_history_readiness_and_snapshot_are_fenced_before_write(setup, phase, ac
     ("retention", "kafka_backlog_or_retention"),
     ("interrupted", "known_source_or_processing_stop"),
 ])
-def test_history_readiness_does_not_promote_invalid_coverage(setup, fault, reason):
-    from app.models import InputAttestation, KafkaCheckpoint, SourceInterruption
-    from app.services.implementations.input_attestations import canonical_payload
-    _, windows, events, worker = overlapping_history(setup)
+def test_history_saved_quality_is_not_promoted_by_optional_new_reports(setup,fault,reason):
+    plan,_,_,_=overlapping_history(setup, fault=fault if fault in {"backlog","retention","interrupted"} else None)
     with setup.database.session_factory() as session:
-        service = build_detector_service(session, setup.catalog)
-        identity = service.create(setup.card.id, UUID(int=1), "Invalid coverage",
-            config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
-        freeze_attempt_clock(service, setup.cutoff)
-        ready_fixture(service, setup, worker, len(events))
-        original = service.history._ready
-        changed = []
-        def corrupt(*args):
-            result = original(*args)
-            if result and not changed:
-                with setup.database.session_factory.begin() as other:
-                    if fault in {"late_attestation", "attestation_gap"}:
-                        report = other.scalar(select(InputAttestation).where(InputAttestation.source_identity == setup.source_id))
-                        if fault == "late_attestation":
-                            report.received_at = other.scalar(select(func.clock_timestamp())) + timedelta(seconds=1)
-                        else:
-                            report.start_utc += timedelta(seconds=1)
-                            report.signed_payload = {**report.signed_payload, "start": report.start_utc.isoformat()}
-                            report.signature = setup.history_private.sign(canonical_payload(report.signed_payload))
-                    elif fault == "heartbeat":
-                        heartbeat = other.scalar(select(KafkaCheckpoint).where(
-                            KafkaCheckpoint.source_identity == setup.source_id,
-                            KafkaCheckpoint.observed_at > windows[0][0]).order_by(KafkaCheckpoint.observed_at).limit(1))
-                        heartbeat.worker_instance = uuid4()
-                    elif fault == "interrupted":
-                        other.add(SourceInterruption(source_identity=setup.source_id, kind="processing_stopped",
-                            started_at=windows[0][0], ended_at=windows[-1][1]))
-                    else:
-                        checkpoint = other.scalar(select(KafkaCheckpoint).where(
-                            KafkaCheckpoint.source_identity == setup.source_id).order_by(KafkaCheckpoint.observed_at.desc()).limit(1))
-                        checkpoint.partitions = {"0": {"low": 1 if fault == "retention" else 0,
-                            "high": len(events), "committed": len(events) - 1 if fault == "backlog" else len(events)}}
-                changed.append(True)
-            return result
-        service.history._ready = corrupt
-        result = prepare(service, identity)
-        assert result["state"] == "waiting", result
-        attempt = service.repository.attempt(result["attempt_id"])
-        assert any(i["reason"] == reason for i in attempt["inputs"])
-        assert not any(i.get("ml_input") for i in attempt["inputs"])
-        assert stored(setup, identity)["checkpoint"] is None
+        service=build_detector_service(session,setup.catalog)
+        identity=service.create(setup.card.id,UUID(int=1),"Saved quality",config={"sample_size":16,"output_after":16,"trees":20},accelerated=True,step=1)
+        result=prepare(service,identity)
+        assert result["state"]==("waiting" if fault in {"backlog","retention","interrupted"} else "prepared"),result
+        attempt=service.repository.attempt(result["attempt_id"])
+        assert attempt["plan"]==plan
+        if result["state"]=="waiting":
+            assert attempt["inputs"]==[] and stored(setup,identity)["checkpoint"] is None
+        else:
+            assert all(i["completeness"]=="complete" for i in attempt["inputs"])
 
 
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
 @pytest.mark.parametrize("mutation", ["delete", "add"])
 def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup, mutation):
-    from sqlalchemy import delete
-
     from app.models import AvailabilityMarker, ParsedLog
-    plan, windows, events, worker = overlapping_history(setup)
+    from sqlalchemy import delete
+    plan, windows, events, _worker = overlapping_history(setup)
     with setup.database.session_factory() as session:
         service = build_detector_service(session, setup.catalog)
         identity = service.create(setup.card.id, UUID(int=1), "Overlap",
             config={"sample_size": 16, "output_after": 16, "trees": 20}, accelerated=True, step=1)
         freeze_attempt_clock(service, setup.cutoff)
-        ready_fixture(service, setup, worker, len(events))
-        calculate = service.history.aggregates.calculate
+        calculate = service.history.aggregates.overlap_statistics
         removed = []
         def delete_during_batch(*args):
             result = calculate(*args)
@@ -1382,7 +1071,7 @@ def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup, mu
                     else:
                         when = windows[len(windows) // 2][0]
                         record_id = processed_record(deleting, setup, len(events), when)
-                        event = ParsedLog(id=uuid4(), source_id=setup.source_id, normalizer_version=1,
+                        event = ParsedLog(id=uuid4(), source_id=setup.source_id, connection_id=setup.connection_id, normalizer_version=1,
                             processed_record_id=record_id, normalizer_name="ECS", source_name="overlap",
                             connection_name="Synthetic", kafka_topic=str(setup.source_id), kafka_partition=0,
                             kafka_offset=len(events), deduplication_key=str(uuid4()), raw="synthetic",
@@ -1394,7 +1083,7 @@ def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup, mu
                             event_id=event.id, availability_at=when))
                 removed.append(True)
             return result
-        service.history.aggregates.calculate = delete_during_batch
+        service.history.aggregates.overlap_statistics = delete_during_batch
         result = prepare(service, identity)
         assert result["state"] == "prepared", result
         attempt = service.repository.attempt(result["attempt_id"])
@@ -1445,7 +1134,8 @@ def test_manual_stop_fences_every_candidate_and_its_diagnostic(setup, phase):
             service.warmup(identity)
             point(setup, 480, 1000)
             freeze_attempt_clock(service, setup.cutoff + timedelta(seconds=2))
-        before = service.state(identity)["detector"]
+        expected_context = service.state(identity)
+        before = expected_context["detector"]
         def stop():
             with setup.database.session_factory() as other:
                 build_detector_service(other, setup.catalog).stop(identity)
@@ -1485,7 +1175,7 @@ def test_manual_stop_fences_every_candidate_and_its_diagnostic(setup, phase):
         assert after["checkpoint"] == before["checkpoint"]
         assert after["consumed_index"] == before["consumed_index"]
         with pytest.raises(StaleCandidate):
-            service.fail(identity, "model_process_failed", {"detector": before})
+            service.fail(identity, "model_process_failed", expected_context)
         assert service.state(identity)["detector"] == after
 
 
@@ -1523,8 +1213,8 @@ def test_failed_or_interrupted_initial_start_needs_manual_retry(setup):
 def test_short_recovery_and_manual_backlog_keep_late_until_materialization(setup, reason, late_materialization):
     history(setup)
     identity = prepared(setup)
-    # scheduled cutoff+1 has passed; cutoff+2 is still in the future.
-    recovered_at = setup.cutoff + timedelta(seconds=1.1)
+    # close deadline cutoff+2 has passed; the next deadline cutoff+3 has not.
+    recovered_at = setup.cutoff + timedelta(seconds=2.1)
     if not late_materialization:
         point(setup, 480, 1000)
     with setup.database.session_factory() as session:

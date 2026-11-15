@@ -1,33 +1,6 @@
 """UTC-only bounded warmup planning."""
 
-from datetime import UTC, timedelta
-
-from .contracts import DetectionError
-
-
-def warmup_plan(anchor, duration, now, minimum, step, accelerated=True):
-    anchor, now = anchor.astimezone(UTC), now.astimezone(UTC)
-    if type(step) is not int or not 0 < step <= duration:
-        raise DetectionError("invalid_warmup_step")
-    count = max(minimum, 1 + (7 * duration + step - 1) // step) if accelerated else minimum
-    if count > 4096:
-        raise DetectionError("resource_budget:warmup_windows")
-    try:
-        cutoff_index = (now - anchor) // timedelta(seconds=duration)
-        if cutoff_index < 1:
-            raise DetectionError("insufficient_history")
-        cutoff = anchor + timedelta(seconds=cutoff_index * duration)
-        start = cutoff - timedelta(seconds=duration + (count - 1) * step)
-        if start < anchor:
-            raise DetectionError("insufficient_history")
-    except DetectionError:
-        raise
-    except (OverflowError, ValueError) as error:
-        raise DetectionError("history_datetime_range") from error
-    return {"cutoff": cutoff.isoformat(), "first_start": start.isoformat(),
-            "count": count, "step": step, "duration": duration,
-            "coverage_seconds": duration + (count - 1) * step,
-            "evaluation_start_index": cutoff_index}
+from datetime import timedelta
 
 
 def plan_windows(plan):

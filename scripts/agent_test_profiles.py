@@ -1651,8 +1651,10 @@ def main() -> None:
     parser.add_argument("--browser-spec", nargs="+", help="Select named specs from that smoke mode's browser group")
     args = parser.parse_args()
     from browser_test_scenarios import validate_browser_arguments
+    from event_time_test_scenarios import validate_runtime_arguments
     try:
         selected_browsers = validate_browser_arguments(args)
+        validate_runtime_arguments(args)
     except ValueError as exc:
         parser.error(str(exc))
     if args.rcf and args.profile != "backend-db":
@@ -1661,8 +1663,6 @@ def main() -> None:
         parser.error("--detector-only requires a smoke profile")
     if args.wal and (args.profile != "backend-db" or args.rcf):
         parser.error("--wal requires backend-db without --rcf")
-    if args.aggregate_only and args.profile != "end-to-end":
-        parser.error("--aggregate-only requires end-to-end")
     run = ROOT / ".test_runs" / "runs" / f"task21-{uuid4().hex}"
     run.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "TEMP": str(run), "TMP": str(run), "TMPDIR": str(run),
@@ -1719,9 +1719,13 @@ def main() -> None:
             return
         before = inventory(env)
         (run / "docker-before.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
-        env, compose, project = (prepare(run, args.profile, include_oidc="auth.spec.ts" in selected_browsers)
-                                 if args.browser_only else prepare(run, args.profile))
         if args.browser_only:
+            env, compose, project = prepare(run, args.profile, include_oidc="auth.spec.ts" in selected_browsers)
+        elif args.aggregate_only:
+            env, compose, project = prepare(run, args.profile, include_oidc=False)
+        else:
+            env, compose, project = prepare(run, args.profile)
+        if args.browser_only or args.aggregate_only or args.detector_only:
             overlay = run / "browser-consumer.yml"
             overlay.write_text("services:\n  api:\n    environment:\n      KAFKA_CONSUMERS_ENABLED: 'false'\n"
                 + (f"  frontend:\n    environment:\n      HMR_CLIENT_PORT: '{env['PROXY_BIND'].split(':')[1]}'\n"
@@ -1757,7 +1761,8 @@ def main() -> None:
                          "python", "scripts/run_tests.py", "--temporary", "--pytest",
                          *(args.pytest or ["tests/ml/rcf_gate.py", "tests/ml/rcf_service.py",
                                           "tests/test_detector_numeric.py", "tests/test_detector_rules.py",
-                                          "tests/ml/rcf_worker.py", "tests/ml/rcf_migrations.py"])], env=env, timeout=600)
+                                          "tests/ml/rcf_worker.py", "tests/test_model_runtime.py", "tests/ml/event_time.py",
+                                          "tests/ml/rcf_migrations.py"])], env=env, timeout=600)
             elif args.pytest:
                 command([sys.executable, "-m", "pytest", "-q", *args.pytest], env=env, cwd=ROOT / "backend")
             else:
@@ -1782,6 +1787,8 @@ def main() -> None:
         elif args.profile in {"smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             production = args.profile in {"smoke-production", "external-end-to-end"}
             services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "aggregate-worker", "detector-worker", "proxy"]
+            if args.aggregate_only:
+                services.remove("provisioner")
             if args.browser_only:
                 services.remove("provisioner")
                 if not any(name.startswith(("aggregates.", "detectors.")) for name in selected_browsers):
@@ -1789,24 +1796,25 @@ def main() -> None:
                     services.remove("detector-worker")
             if args.profile == "external-end-to-end":
                 services.append("indexer")
-            if args.profile in {"smoke-development", "smoke-production"} and (not args.browser_only or "auth.spec.ts" in selected_browsers):
+            if not args.aggregate_only and args.profile in {"smoke-development", "smoke-production"} and (not args.browser_only or "auth.spec.ts" in selected_browsers):
                 services.append("oidc-idp")
             if not production:
                 services.append("frontend")
-            command([*compose, "up", "--build", "-d", *(services if args.browser_only else [] if args.profile.startswith("smoke-") else services)], env=env)
+            command([*compose, "up", "--build", "-d", *(services if args.browser_only or args.aggregate_only else [] if args.profile.startswith("smoke-") else services)], env=env)
             command([*compose, "up", "-d", "--wait", *services], env=env)
+            if args.aggregate_only or args.detector_only:
+                from capture_lifecycle_scenarios import capture_lifecycle
+                from event_time_test_scenarios import aggregate_event_time_smoke
+                smoke_http(env, production)
+                aggregate_event_time_smoke(compose, env, production, command,
+                    lambda: capture_lifecycle(compose, env, production, command, smoke_http,
+                        lambda: record_compose_volumes(project, env, run), services=services))
+                successful = True
+                return
             if args.browser_only:
                 from browser_test_scenarios import run_browsers
                 smoke_http(env, production)
                 run_browsers(compose, env, project, run, production, selected_browsers, command, oidc_administration_smoke)
-                successful = True
-                return
-            if args.detector_only:
-                from capture_lifecycle_scenarios import capture_lifecycle
-                from detector_test_scenarios import detector_runtime_smoke
-                detector_runtime_smoke(compose, env, production, command,
-                    lambda: capture_lifecycle(compose, env, production, command, smoke_http,
-                        lambda: record_compose_volumes(project, env, run)))
                 successful = True
                 return
             if args.profile in {"smoke-development", "smoke-production"}:
@@ -1830,39 +1838,24 @@ def main() -> None:
                 verify_agent_metadata(compose, project, env)
             smoke_http(env, production)
             if args.profile in {"smoke-development", "smoke-production", "end-to-end"}:
-                from aggregate_test_scenarios import aggregate_runtime_smoke
                 from capture_lifecycle_scenarios import capture_lifecycle
-                from detector_test_scenarios import detector_runtime_smoke
+                from event_time_test_scenarios import aggregate_event_time_smoke
                 if args.profile.startswith("smoke-"):
                     command([*compose, "run", "--rm", "--no-deps", "wal-bootstrap", "python", "-c",
                              (ROOT / "scripts/wal_bootstrap_scenarios.py").read_text(encoding="utf-8")], env=env, timeout=120)
-                def aggregate_browser(fixtures):
-                    result = run / "aggregate-browser-owned.json"
-                    config = run / "aggregate-browser-config.json"
-                    config.write_text(json.dumps({**fixtures, "result": str(result)}), encoding="utf-8")
-                    browser_env = {**env, "AGGREGATE_BROWSER_CONFIG": str(config),
-                                   "PLAYWRIGHT_BASE_URL": f"http://localhost:{env['PROXY_BIND'].split(':')[1]}"}
-                    if not browser_env.get("PLAYWRIGHT_CHROME_PATH"):
-                        for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                                          r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"):
-                            if Path(candidate).is_file():
-                                browser_env["PLAYWRIGHT_CHROME_PATH"] = candidate
-                                break
-                    command([NPM, "run", "test:browser", "--", "aggregates.live.spec.ts", "aggregates.ui.spec.ts",
-                             "--workers=1", "--output", str(run / "aggregate-browser-results")],
-                            env=browser_env, cwd=ROOT / "frontend", timeout=600)
-                    return json.loads(result.read_text(encoding="utf-8"))
-                def detector_smoke():
-                    detector_runtime_smoke(compose, env, production, command,
-                        lifecycle=(lambda: capture_lifecycle(compose, env, production, command, smoke_http,
-                            lambda: record_compose_volumes(project, env, run)))
-                        if args.profile.startswith("smoke-") else None)
-                aggregate_runtime_smoke(compose, env, production, command,
-                                        browser=aggregate_browser if args.profile == "end-to-end" and args.aggregate_only else None,
-                                        lifecycle=detector_smoke
-                                        if args.profile.startswith("smoke-") else None)
-                if args.profile == "end-to-end":
-                    detector_smoke()
+                # The HTTP fixture owns its processing identities. Recreate only
+                # API with consumers disabled, then restore the full profile for
+                # subsequent agent ingestion and authentication scenarios.
+                overlay = run / "event-time-consumer.yml"
+                overlay.write_text("services:\n  api:\n    environment:\n      KAFKA_CONSUMERS_ENABLED: 'false'\n", encoding="utf-8")
+                event_compose = [*compose, "-f", str(overlay)]
+                try:
+                    command([*event_compose, "up", "-d", "--no-deps", "--wait", "api"], env=env)
+                    aggregate_event_time_smoke(event_compose, env, production, command,
+                        lambda: capture_lifecycle(event_compose, env, production, command, smoke_http,
+                            lambda: record_compose_volumes(project, env, run), services=services))
+                finally:
+                    command([*compose, "up", "-d", "--no-deps", "--wait", "api"], env=env)
             if args.profile in {"smoke-development", "smoke-production"}:
                 oidc_administration_smoke(compose, env, production)
             if args.profile == "smoke-development":

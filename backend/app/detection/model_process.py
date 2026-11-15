@@ -1,37 +1,17 @@
-"""One bounded Python/JVM process per candidate; no reusable mutated cache."""
+"""Fresh candidate models over an injected runtime; no mutable forest cache."""
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-from .contracts import DetectionError, ModelConfig, StaleCandidate, canonical, digest
+from .contracts import DetectionError, ModelConfig, canonical, digest
+from .model_rpc import ModelTransport
 from .numeric import NumericQualityError
 
 
-def invoke(request, cancel=None):
-    deadline = time.monotonic() + 120
-    with subprocess.Popen([sys.executable, "-m", "app.detection.model_process"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
-        payload = canonical(request)
-        while True:
-            if cancel is not None and cancel.is_set() or time.monotonic() >= deadline:
-                process.kill()
-                process.communicate()
-                if cancel is not None and cancel.is_set():
-                    raise StaleCandidate("ownership_lost")
-                raise DetectionError("resource_budget:model_seconds")
-            try:
-                stdout, _ = process.communicate(input=payload, timeout=.2)
-                break
-            except subprocess.TimeoutExpired:
-                payload = None
-        returncode = process.returncode
-    if returncode:
-        raise DetectionError("model_process_failed")
-    response = json.loads(stdout)
+def checked_response(response):
     if "numeric_error" in response:
         raise NumericQualityError(response["numeric_error"], response["coordinate"])
     if "error" in response:
@@ -40,7 +20,7 @@ def invoke(request, cancel=None):
 
 
 class CandidateModel:
-    def __init__(self, checkpoint, config, keys, rule_hash, cancel=None):
+    def __init__(self, checkpoint, config, keys, rule_hash, cancel=None, transport=None):
         try:
             if len(canonical(checkpoint).encode()) > 64 * 1024**2:
                 raise DetectionError("resource_budget:checkpoint_bytes")
@@ -60,9 +40,10 @@ class CandidateModel:
                         "keys": keys, "rule_hash": rule_hash}
         self.candidate = None
         self.cancel = cancel
+        self.transport = transport
 
     def process(self, values):
-        response = invoke({**self.request, "values": values}, self.cancel)
+        response = checked_response(self.transport.invoke({**self.request, "values": values}, self.cancel))
         self.candidate = response["checkpoint"]
         return response["result"]
 
@@ -77,36 +58,75 @@ class CandidateModel:
 
 
 class BoundedModelFactory:
-    def __init__(self, cancel=None):
+    def __init__(self, cancel=None, transport: ModelTransport | None = None):
         self.cancel = cancel
+        self.transport = transport
 
     def warmup(self, config, keys, rule_hash, rows):
-        return invoke({"action": "warmup", "config": config, "keys": keys,
-                       "rule_hash": rule_hash, "rows": rows}, self.cancel)["checkpoint"]
+        if self.transport is None:
+            raise DetectionError("managed_worker_required")
+        return checked_response(self.transport.invoke({"action": "warmup", "config": config, "keys": keys,
+                       "rule_hash": rule_hash, "rows": rows}, self.cancel))["checkpoint"]
 
     def restore(self, checkpoint, config, keys, rule_hash):
-        return CandidateModel(checkpoint, config, keys, rule_hash, self.cancel)
+        if self.transport is None:
+            raise DetectionError("managed_worker_required")
+        return CandidateModel(checkpoint, config, keys, rule_hash, self.cancel, self.transport)
 
 
-def main():
-    from .aws_rcf import AwsModelFactory
-    request = json.load(sys.stdin)
+def calculate(request):
+    """Shared calculation for cold references and managed RPC; no retained model."""
+    from .aws_rcf import AwsModelFactory, runtime
+    timings = {}
+    started = time.monotonic()
     factory = AwsModelFactory()
     try:
+        runtime()
+        initialized = time.monotonic()
+        timings["init_seconds"] = initialized - started
         if request["action"] == "warmup":
             checkpoint = factory.warmup(request["config"], request["keys"],
                                         request["rule_hash"], request["rows"])
+            timings["warmup_seconds"] = time.monotonic() - initialized
             response = {"checkpoint": checkpoint}
-        else:
+        elif request["action"] == "advance":
             model = factory.restore(request["checkpoint"], request["config"],
                                     request["keys"], request["rule_hash"])
+            restored = time.monotonic()
             result = model.process(request["values"])
-            response = {"result": result, "checkpoint": model.checkpoint("candidate")}
+            processed = time.monotonic()
+            checkpoint = model.checkpoint("candidate")
+            timings.update(restore_seconds=restored - initialized,
+                process_seconds=processed - restored,
+                checkpoint_seconds=time.monotonic() - processed)
+            response = {"result": result, "checkpoint": checkpoint}
+        else:
+            raise DetectionError("model_process_failed")
     except NumericQualityError as error:
         response = {"numeric_error": error.reason, "coordinate": error.coordinate}
     except DetectionError as error:
         response = {"error": str(error)}
-    print(canonical(response))
+    return response, timings
+
+
+def main():
+    if sys.argv[1:] != ["--serve"]:
+        # Independent fresh-process reference, never used by the worker.
+        response, timings = calculate(json.load(sys.stdin))
+        print(canonical({"response": response, "timings": timings}))
+        return
+    from .model_rpc import read_frame, write_frame
+    while True:
+        envelope = read_frame(sys.stdin.buffer)
+        request = envelope["request"]
+        if (not isinstance(envelope.get("id"), str) or len(envelope["id"]) != 36
+                or envelope.get("action") != request.get("action")):
+            raise DetectionError("model_process_failed")
+        response, timings = calculate(request)
+        write_frame(sys.stdout.buffer, {"id": envelope["id"], "action": envelope["action"],
+                    "response": response, "timings": timings})
+        # Do not keep the last request/checkpoint/result alive while idle.
+        del envelope, request, response, timings
 
 
 if __name__ == "__main__":

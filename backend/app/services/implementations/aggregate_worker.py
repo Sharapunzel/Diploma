@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from ...aggregation.event_time import MAX_SCAN_PAGE
 from ...core.errors import DomainError
 from ..protocols.aggregates import AggregateWorkerServiceProtocol
 from .working_windows import WindowNotReady
@@ -22,8 +23,14 @@ class AggregateWorker:
         with self.sessions() as session:
             service = self.build(session, self.catalog)
             try:
-                service.advance(aggregate_id)
+                result = service.advance(aggregate_id)
                 service.record_worker_error(aggregate_id, None)
+                if isinstance(result, dict) and (
+                    result.get("state") in {"waiting_close_deadline", "history_waiting", "paused", "retired",
+                        "archived", "deleted", "failed", "candidate_cancelled", "scan_cancelled"}
+                    or result.get("state") == "scanned" and result.get("records", MAX_SCAN_PAGE) < MAX_SCAN_PAGE
+                ):
+                    return "waiting"
                 return "complete"
             except WindowNotReady as error:
                 service.record_worker_error(aggregate_id, str(error))
@@ -40,6 +47,10 @@ class AggregateWorker:
         if state == "failed":
             attempts = self.failures.get(aggregate_id, (0, 0))[0] + 1
             self.failures[aggregate_id] = (attempts, time.monotonic() + min(30, .25 * 2**min(attempts, 7)))
+        elif state == "waiting":
+            # Completed diagnostic cycles/no-work turns do not need continuous
+            # source scans and mutex traffic. Durable cursors stay in services.
+            self.failures[aggregate_id] = (0, time.monotonic() + .25)
         else:
             self.failures.pop(aggregate_id, None)
 

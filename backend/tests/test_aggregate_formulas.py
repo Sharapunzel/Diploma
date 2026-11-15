@@ -8,13 +8,12 @@ from uuid import UUID, uuid4
 
 import pytest
 import test_aggregate_service as aggregate_cases
-from pydantic import ValidationError
-from test_aggregate_sql import calculate
-
 from app.aggregation.budget import estimate
 from app.aggregation.results import AggregateStatistics, FeatureStatistics, interpret_result
 from app.aggregation.rules import AggregateRule, Limits, RuleError, compile_rule, operator_catalog
 from app.schemas.aggregates import CreateAggregateRequest
+from pydantic import ValidationError
+from test_aggregate_sql import calculate
 
 pytest_plugins = ["test_aggregate_sql"]
 
@@ -239,6 +238,21 @@ def test_real_legacy_receipt_replays_with_head_document(api_database, api_source
         "window_start_utc": "2026-11-01T00:00:00Z", "time_basis": "backend_processed_at_historical",
         "name": "Legacy", "rule_hash": LEGACY_HASH}
     digest = hashlib.sha256(json.dumps(old_document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    from datetime import UTC, datetime
+
+    from app.models import Aggregate, AggregateSchedule
+
+    identity, schedule = uuid4(), uuid4()
+    with api_database.session_factory.begin() as session:
+        session.add(AggregateSchedule(id=schedule, source_identity=api_source, anchor_utc=body.schedule.anchor_utc,
+            duration_seconds=300, next_index=0, semantic_basis="availability_v1"))
+        session.flush()
+        session.add(Aggregate(id=identity, schedule_id=schedule, source_identity=api_source,
+            source_name="Legacy source", source_type="kafka", name=body.name, rule=LEGACY,
+            rule_hash=LEGACY_HASH, original_boundary=body.schedule.boundary.isoformat(), timezone="UTC",
+            created_at=datetime.now(UTC), created_by=UUID(int=1), state="active",
+            request_key=f"{UUID(int=1)}:old-receipt", request_hash=digest,
+            semantic_basis="availability_v1", execution_mode="retired"))
     with api_database.session_factory() as session:
         api = aggregate_cases.service(session, catalog)
         card = api.create(body, UUID(int=1), "old-receipt")
@@ -251,15 +265,14 @@ def test_real_legacy_receipt_replays_with_head_document(api_database, api_source
 def test_extended_api_validate_preview_create_card_copy_and_points(api_database, api_source, catalog):
     import os
 
-    from fastapi import Depends
-    from fastapi.testclient import TestClient
-
     from app.config import Settings
     from app.core.security import hash_password
     from app.db import get_session
     from app.dependencies import get_aggregate_service
     from app.main import create_app
     from app.models import User
+    from fastapi import Depends
+    from fastapi.testclient import TestClient
 
     app = create_app(Settings(environment="test", database_url=os.environ["TEST_DATABASE_URL"]), database=api_database,
         ecs_catalog=catalog, start_consumers=False)
@@ -298,13 +311,12 @@ def test_extended_api_validate_preview_create_card_copy_and_points(api_database,
 def test_http_db_replay_rejects_explicit_null_without_changing_receipt(api_database, api_source, catalog, op, nested):
     import os
 
-    from fastapi.testclient import TestClient
-    from sqlalchemy import func, select
-
     from app.config import Settings
     from app.core.security import hash_password
     from app.main import create_app
     from app.models import Aggregate, User
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
 
     app = create_app(Settings(environment="test", database_url=os.environ["TEST_DATABASE_URL"]),
         database=api_database, ecs_catalog=catalog, start_consumers=False)

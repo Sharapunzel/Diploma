@@ -2,6 +2,7 @@
 
 from sqlalchemy.engine import make_url
 
+from .adapters.model_runtime import ModelRuntime
 from .aggregate_composition import build_aggregate_service
 from .detection.model_process import BoundedModelFactory
 from .repositories.sqlalchemy import SqlAlchemyUnitOfWork
@@ -30,5 +31,21 @@ def build_detector_service(session, catalog, owner=None, models=None):
     return DetectorService(repository, history, aggregate.windows, aggregate.capture, uow, models or BoundedModelFactory(), owner)
 
 
-def build_worker_detector_service(session, catalog, owner, cancel):
-    return build_detector_service(session, catalog, owner, BoundedModelFactory(cancel))
+def build_worker_detector_service(session, catalog, owner, cancel, transport=None):
+    return build_detector_service(session, catalog, owner, BoundedModelFactory(cancel, transport))
+
+
+class WorkerDetectorServices:
+    """Composition scope for one owner; standby never starts a JVM."""
+    def __init__(self):
+        self.transport = None
+
+    def __call__(self, session, catalog, owner, cancel):
+        if self.transport is None:
+            self.transport = ModelRuntime()
+        return build_worker_detector_service(session, catalog, owner, cancel, self.transport)
+
+    def close(self):
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None

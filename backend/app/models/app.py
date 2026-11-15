@@ -387,6 +387,15 @@ class AggregateSchedule(Base):
     anchor_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     next_index: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    semantic_basis: Mapped[str] = mapped_column(Text)
+    execution_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    bootstrap_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    online_start_index: Mapped[int | None] = mapped_column(BigInteger)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    active_cleanup_id: Mapped[UUID | None] = mapped_column()
+    scan_after: Mapped[UUID | None] = mapped_column()
+    scan_cycle: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    turn: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 class WorkingWindowPoint(Base):
     __tablename__ = "working_window_points"
@@ -415,3 +424,4 @@ class WorkingWindowPoint(Base):
     completeness_reason: Mapped[str] = mapped_column(Text, nullable=False)
     evidence_refs: Mapped[dict] = mapped_column(JSONB, nullable=False)
     features: Mapped[list | None] = mapped_column(JSONB)
+    time_basis: Mapped[str] = mapped_column(Text)

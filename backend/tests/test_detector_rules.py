@@ -1,37 +1,34 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
+from app.aggregation.event_time import EventTimeBudgetError, index_at, warmup_indices
 from app.detection.contracts import DetectionError, ModelConfig, digest, feature_vector
-from app.detection.history import plan_windows, warmup_plan, warmup_summary
+from app.detection.history import warmup_summary
 
 
 def test_utc_plan_and_overlap_coverage():
     anchor = datetime(2026, 1, 1, tzinfo=UTC)
-    now = anchor + timedelta(days=5, seconds=27)
-    plan = warmup_plan(anchor, 300, now, 512, 5)
-    windows = list(plan_windows(plan))
-    assert len(windows) == 512
-    assert windows[-1][1] <= now
-    assert windows[1][0] - windows[0][0] == timedelta(seconds=5)
-    assert windows[-1][1] - windows[0][0] >= timedelta(seconds=8 * 300)
-    other = warmup_plan(anchor, 300, now.astimezone(), 512, 5)
+    last_end = anchor + timedelta(days=5)
+    last = index_at(anchor, 300, last_end) - 1
+    plan = warmup_indices(last, 300, 5, 256, 256, True)
+    assert len(plan["starts"]) == 512 and plan["complete"]
+    assert plan["starts"][-1]+300 == (last_end-anchor).total_seconds()
+    assert plan["starts"][1]-plan["starts"][0] == 5
+    assert plan["starts"][-1]+300-plan["starts"][0] >= 8*300
+    other = warmup_indices(index_at(anchor,300,last_end.astimezone())-1,300,5,256,256,True)
     assert other == plan
 
 
 @pytest.mark.parametrize("step", [0, -1, 301, True, 1.5])
 def test_bad_step(step):
-    with pytest.raises(DetectionError):
-        warmup_plan(datetime(2026, 1, 1, tzinfo=UTC), 300,
-                    datetime(2026, 2, 1, tzinfo=UTC), 512, step)
+    with pytest.raises(ValueError, match="invalid_warmup_step"):
+        warmup_indices(10000,300,step,256,256,True)
 
 
 def test_plan_budget_and_short_history():
-    anchor = datetime(2026, 1, 1, tzinfo=UTC)
-    with pytest.raises(DetectionError, match="resource_budget"):
-        warmup_plan(anchor, 604800, anchor + timedelta(days=60), 512, 1)
-    with pytest.raises(DetectionError, match="insufficient_history"):
-        warmup_plan(anchor, 300, anchor + timedelta(seconds=500), 512, 300)
+    with pytest.raises(EventTimeBudgetError, match="candidate_windows"):
+        warmup_indices(59,604800,1,256,256,True)
+    assert not warmup_indices(0,300,300,256,256,False)["complete"]
 
 
 @pytest.mark.parametrize("change", ["missing", "extra", "duplicate", "order", "null", "bool", "reason", "invalid"])

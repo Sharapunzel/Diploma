@@ -14,7 +14,7 @@
 | Постоянные тесты подготовки стенда и очистки | `python -B -m pytest scripts/test_prepare_dev_kafka.py scripts/test_agent_test_profiles_cleanup.py` с временными путями в каталоге прогона |
 | Общий pgoutput gate: протокол, replay и потеря слота | `python -B scripts/check_pgoutput_gate.py` |
 | Собственный сквозной путь через UI | `python -B scripts/agent_test_profiles.py end-to-end` |
-| Дополнительные live/UI-сценарии агрегатов | `python -B scripts/agent_test_profiles.py end-to-end --aggregate-only` |
+| Серверные event-time агрегаты, RCF, пауза и очистка | `smoke-development --aggregate-only`, `smoke-production --aggregate-only`; также `end-to-end --aggregate-only` |
 | Постоянный detector-worker, обе поставки, 5-секундная цепочка и сохранение состояния | Включено в полный собственный E2E и оба smoke; адресно `smoke-development --detector-only` / `smoke-production --detector-only` |
 | Внешний индексер, API и UI | `python -B scripts/agent_test_profiles.py external-end-to-end` |
 | Постоянные браузерные сценарии | Playwright на подготовленном изолированном development/production-контуре; ограничения текущих команд описаны ниже |
@@ -121,6 +121,24 @@ verification service на сети той же PostgreSQL. JVM heap — 512 MiB,
 общий с остальными профилями. Постоянный detector-worker входит в оба режима,
 полную сборку/ожидание/cleanup и lifecycle up/down/up. Полный ML-набор включает
 `tests/ml/rcf_worker.py` вместе с модельными, сервисными и миграционными тестами.
+Он также включает `tests/test_model_runtime.py` с проверками IPC.
+
+В worker переиспользуется один JVM-runtime владельца, а каждый кандидат
+создаёт новую модель из checkpoint БД. Lifetime, framing, deadline и отмена —
+в [контракте детекторов](detectors.md#lifetime-jvm-и-модели).
+Адресный Linux-прогон:
+
+```powershell
+python -B scripts/agent_test_profiles.py backend-db --rcf --pytest tests/ml/rcf_worker.py tests/test_model_runtime.py tests/ml/rcf_service.py::test_worker_discards_candidate_archived_during_real_model_and_resumes
+```
+
+Он печатает безопасную сводку cold/warm init/restore/process/checkpoint, PID и RSS.
+Cold reference запускается отдельным свежим процессом на каждый запрос.
+Проверяются чередование конфигураций, повтор неподтверждённого кандидата,
+точное совпадение результатов и checkpoint; реальные IPC faults, kill/reap
+и отсутствие оставшихся I/O-потоков. Оба `--aggregate-only` smoke сохраняют
+прежние D5, три модели/два источника и шесть проверок точных индексов.
+
 `--detector-only` выбирает поставку/worker/lifecycle и доступен обеим ролям.
 Он может быть достаточным smoke перед коммитом серверной worker-задачи, если
 UI/OIDC/TLS-agent и их контракты не затронуты; их сценарии автоматически не добавляются.
@@ -139,7 +157,52 @@ frontend/oidc-idp. Это не минимальный запуск одних wo
 
 `frontend` запускает typecheck, lint, format:check, тесты и сборку. `backend-db` поднимает тестовую PostgreSQL и по умолчанию выполняет полный набор без трёх файлов, требующих брокер: `test_kafka_integration.py`, `test_agent_recovery.py`, `test_window_kafka_evidence.py`. Используется штатный `backend/scripts/run_tests.py --temporary`; `--pytest` выбирает профильные тесты. Эти три файла проверяются в `kafka-integration`, который поднимает PostgreSQL и Kafka с SCRAM/ACL, сверяет metadata внешнего и внутреннего listener и без `--pytest` запускает весь backend-набор через тот же runner. Для адреса и credentials тестов скрипт задаёт `KAFKA_TEST_BOOTSTRAP_SERVERS`, `KAFKA_TEST_SECURITY_PROTOCOL`, `KAFKA_TEST_READER_PASSWORD_FILE`, `KAFKA_TEST_ADMIN_PASSWORD_FILE`, `KAFKA_TEST_DEV_ALLOWED_BOOTSTRAP_SERVERS` и `TEST_DATABASE_URL`.
 
-`end-to-end --aggregate-only` использует тот же development Compose, но выполняет только серверный сценарий агрегатов через proxy. Он проверяет два источника, реальные pgoutput/worker, отдельный исторический барьер, обработку секундных окон, восстановление после остановки, два worker с разными TZ, смену пояса БД и архивирование/удаление. Сценарий также входит в обычные `end-to-end`, `smoke-development` и `smoke-production`. Это ограниченный замер своевременности, а не предельный нагрузочный тест.
+`--aggregate-only` в существующих `smoke-development`, `smoke-production` и
+`end-to-end` выбирает серверный event-time сценарий без браузера. Несовместимые
+селекторы (`--rcf`, `--wal`, `--pytest`, `--detector-only`, `--browser-only`)
+отклоняются до создания ресурсов. Это не новый профиль. API, proxy, pgoutput,
+aggregate/detector workers настоящие; development использует frontend только
+для проверки proxy. OIDC/provisioner в этой ветке не собираются и не запускаются.
+API consumers отключены в изолированном overlay: writer пишет атомарные
+event/processed-record/marker. Два источника включены, отсутствие необязательного
+probe не подменяется искусственным complete.
+
+Проверяются старый архив до bootstrap, его последнее окно, exact membership,
+циклическое обнаружение late, неизменность сохранённой точки, D=5 и три настоящих
+AWS RCF модели sample_size=8: обычная и overlap на одном агрегате, независимая
+на втором. Замер штатных оценок начинается с окон, открытых после готовности
+всех лесов: evaluation_completed_at <= close_not_before_at+5 с. Далее — находки,
+pause/unpause, restart workers, catch-up, replay прежней квитанции, остановка всех
+связанных моделей, отказ N<M, сохранение M, физическое освобождение payload,
+перезапуск aggregate-worker после частичного подтверждённого удаления без потери
+прогресса и границы операции, независимость Findings/checkpoints и running
+up --build/down/up. После этих циклов сравниваются также cursor, paused,
+generation, постоянные closure identity и завершённые операции очистки. В полных
+smoke/E2E используется тот же серверный сценарий; потребители API восстанавливаются
+перед дальнейшей проверкой приёма агентов. `--detector-only` — совместимый
+серверный селектор этого сценария.
+
+Runtime smoke печатает UTC-моменты готовности моделей, исходную границу замера,
+идентичности источников/агрегатов/детекторов и результаты каждого контрольного
+индекса. Timestamp читаются из сохранённых outcomes именно этого индекса, даже
+если карточка уже показывает следующий. При отказе до cleanup выводятся позиции,
+backlog, Docker stats, последние 48 шагов coordinator и до 16 шагов запуска из его heartbeat: длительность
+state/read и всего шага, начало и исход. Для оценки отдельно видны чтение,
+модельный кандидат, финальный lock и commit. Raw, credentials и checkpoint не выводятся.
+
+UI39 и browser fixture прежнего временного основания адаптируются задачей 41;
+их не используют для заявления готовности нового UI. TASK-40 не меняет frontend.
+`--aggregate-only` к этой fixture не обращается.
+
+```powershell
+python -B scripts/agent_test_profiles.py backend-db --pytest tests/test_event_time_contracts.py tests/test_event_time_pipeline.py tests/test_event_time_migration.py
+python -B scripts/agent_test_profiles.py backend-db --rcf --pytest tests/ml/event_time.py
+python -B scripts/agent_test_profiles.py smoke-development --aggregate-only
+python -B scripts/agent_test_profiles.py smoke-production --aggregate-only
+```
+
+Профили на одном Docker daemon запускаются последовательно: параллельная сборка
+мешает сопоставлению исходного и итогового инвентаря общей службы Docker.
 
 `smoke-development` собирает и запускает PostgreSQL, Kafka, migration, provisioner, API, frontend и proxy, затем проверяет `/agents` через proxy. `end-to-end` использует development UI: регистрирует агента и два топика, однократно получает конфигурацию, отправляет тестовую запись временным Fluent Bit, проверяет Kafka, включает source с нормализатором и сверяет PostgreSQL и страницу «События». Он также проверяет сохранение сырого лога и Kafka-происхождения, перезапускает API и убеждается, что сохранённая запись не продублирована. Перед UI-сценарием профиль извлекает встроенный Lua Code filter `systemd` непосредственно из генератора конфига и запускает его на синтетической записи с Fluent Bit 4.2.3. Вход задан с timestamp `2000-01-01T00:00:00Z`; проверяется точный конверт `{timestamp, log}`, сохранение старого времени в строке `log` и timestamp времени обработки. Проверка использует синтетический dummy input, не читает живой journald. Fluent Bit использует неизменённый скачанный конфиг и внешний Kafka listener; тестовый контейнер разделяет сетевое пространство брокера, чтобы тот же loopback-адрес и динамический внешний порт были доступны без публикации тестового порта наружу. Проверка установки на отдельном хосте и живое чтение Windows Event Log остаются вне этого теста.
 

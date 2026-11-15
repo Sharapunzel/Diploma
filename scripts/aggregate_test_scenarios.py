@@ -4,14 +4,13 @@ import json
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
-from itertools import pairwise
 from uuid import uuid4
-
-import httpx
 
 
 def aggregate_runtime_smoke(compose, env, production, command, browser=None, lifecycle=None, prepare_only=False):
-    """Exercise the real proxy/API/decoder/worker, including restart and history."""
+    """Retained preparation for the TASK-41 browser fixture, without calculation."""
+    if not prepare_only:
+        raise ValueError("Use event_time_test_scenarios.aggregate_event_time_smoke")
     username, password = "aggregate-" + uuid4().hex, secrets.token_urlsafe(24)
     setup = """
 import json,os
@@ -89,8 +88,6 @@ with db.session_factory.begin() as s:
   assert SqlAlchemyProcessingRepository(s).store_event(record,event)
 db.dispose()
 """
-    port = env["HTTPS_BIND" if production else "PROXY_BIND"].split(":")[1]
-    origin = f"{'https' if production else 'http'}://localhost:{port}"
     verified = datetime.fromisoformat(data["verified_from"])
     anchor = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=4)
     assert anchor > verified
@@ -129,185 +126,5 @@ db.dispose()
     while datetime.now(UTC) < anchor + timedelta(seconds=1):
         assert time.monotonic() < deadline
         time.sleep(.05)
-    def expect(response, code=200):
-        if response.status_code != code:
-            raise AssertionError(f"Aggregate HTTP {response.status_code}: {response.text[:500]}")
-        return response.json()
     if prepare_only:
         return {"username": username, "password": password, "sources": data["sources"], "empty_source":data["empty_source"], "anchor": anchor.isoformat()}
-    with httpx.Client(base_url=origin, verify=env["KAFKA_CA_FILE"] if production else True, timeout=20) as client:
-        expect(client.post("/api/v1/auth/local/login", json={"username": username, "password": password}))
-        csrf = {"X-CSRF-Token": expect(client.get("/api/v1/auth/session"))["csrf_token"]}
-        ids = []
-        expected_features = {}
-        for index, source in enumerate(data["sources"]):
-            rule = {"features": [{"key": "count", "name": "Count", "op": "count"},
-                {"key": "unique", "name": "Unique", "op": "distinct_count", "field": "user.id"}]}
-            if index:
-                rule["features"].append({"key": "bytes", "name": "Bytes", "op": "avg", "field": "network.bytes"})
-                rule["where"] = {"op": "all", "args": [
-                    {"op": "has_any", "field": "event.category", "value": ["web"]},
-                    {"op": "in", "field": "http.request.method", "value": ["GET", "POST"]}]}
-            else:
-                rule["where"] = {"op": "has_any", "field": "event.category", "value": ["authentication"]}
-                rule["features"] += [
-                    {"key": "failures", "name": "Failures", "op": "count", "where": {"op": "eq", "field": "event.outcome", "value": "failure"}},
-                    {"key": "ratio", "name": "Ratio", "op": "derive", "expr": {"op": "divide", "args": [{"ref": "failures"}, {"ref": "count"}]}}]
-            # Extended operations traverse the same validate/preview/create,
-            # historical and permanent-worker paths as legacy features.
-            rule["where"] = {"op": "all", "args": [rule["where"],
-                {"op": "not", "args": [{"op": "eq", "field": "event.outcome", "value": "ignored"}]},
-                {"op": "not_in", "field": "event.dataset", "value": ["ignored"]},
-                {"op": "starts_with", "field": "event.dataset", "value": "synthetic_"},
-                {"op": "in_cidr", "field": "source.ip", "value": "192.0.2.0/24"},
-                {"op": "between", "field": "event.created", "value": ["1999-01-01T00:00:00Z", "2001-01-01T00:00:00Z"]},
-                {"op": "has_none", "field": "event.category", "value": ["ignored"]}]}
-            rule["features"] += [
-                {"key": "mode", "name": "Mode", "op": "mode_share", "field": "event.dataset"},
-                {"key": "pct", "name": "Percent", "op": "derive", "expr": {"op": "percent", "args": [{"ref": "mode"}]}},
-                {"key": "rate", "name": "Rate", "op": "derive", "expr": {"op": "per_second", "args": [{"ref": "count"}]}},
-                {"key": "present", "name": "Present", "op": "present_count", "field": "source.ip"},
-                {"key": "managed", "name": "Managed", "op": "true_count", "field": "cloud.entity.attributes.managed"},
-                {"key": "date_mode", "name": "Date mode", "op": "mode_count", "field": "event.created"},
-                {"key": "date_share", "name": "Date share", "op": "mode_share", "field": "event.created"},
-                {"key": "boundary_date", "name": "Boundary date", "op": "mode_count", "field": "event.start"},
-                {"key": "invalid_date", "name": "Invalid date", "op": "mode_count", "field": "event.end"},
-                {"key": "r2", "name": "Ratio", "op": "derive", "expr": {"op": "ratio", "args": [{"ref": "managed"}, {"ref": "count"}]}}]
-            if index:
-                rule["features"] += [{"key": op, "name": op, "op": op, "field": "network.bytes",
-                                      **({"percentile": .75} if op == "percentile" else {})}
-                                     for op in ["range", "variance", "stddev", "median", "percentile", "mode_count"]]
-            body = {"source_id": source, "aggregate_rule": rule,
-                    "schedule": {"boundary": anchor.isoformat(), "timezone": "UTC", "duration_seconds": 1}}
-            validated = expect(client.post("/api/v1/aggregates/validate", json=body, headers=csrf))
-            preview_body = {**body, "window_start_utc": anchor.isoformat(), "time_basis": "availability_at"}
-            preview = expect(client.post("/api/v1/aggregates/preview", json=preview_body, headers=csrf))
-            assert preview["completeness"] == "unverified"
-            assert preview["event_count"] == 1, (
-                f"Aggregate seeded preview mismatch: source_index={index}, "
-                f"start={preview['start_utc']}, end={preview['end_utc']}, "
-                f"observed={preview['observed_rows']}, selected={preview['event_count']}, "
-                f"basis={preview['time_basis']}, quality={preview['completeness']}"
-            )
-            created = expect(client.post("/api/v1/aggregates", json={**preview_body,
-                "name": "Runtime aggregate", "rule_hash": validated["rule_hash"]},
-                headers={**csrf, "Idempotency-Key": uuid4().hex}), 201)
-            ids.append(created["id"])
-            expected_features[created["id"]] = preview["features"]
-            historical = expect(client.post(f"/api/v1/aggregates/{created['id']}/historical-points",
-                json={"window_start_utc": anchor.isoformat()}, headers=csrf))
-            assert preview["features"] == historical["features"]
-            assert preview["event_count"] == historical["event_count"] == 1
-            assert [f["key"] for f in preview["features"]] == validated["feature_keys"]
-            assert historical["kind"] == "historical" and historical["time_basis"] == "availability_at"
-            repeated = expect(client.post(f"/api/v1/aggregates/{created['id']}/historical-points",
-                json={"window_start_utc": anchor.isoformat()}, headers=csrf))
-            assert repeated["id"] == historical["id"]
-
-        command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
-                 "api", "python", "-c", seed], env=env)
-        def working(aggregate_id):
-            return [p for p in expect(client.get(f"/api/v1/aggregates/{aggregate_id}/points"))["items"] if p["kind"] == "working"]
-        deadline = time.monotonic() + 25
-        while not all(any(p["event_count"] == 1 for p in working(aggregate_id)) for aggregate_id in ids):
-            assert time.monotonic() < deadline, "Permanent aggregate worker did not produce points"
-            time.sleep(.1)
-        normal_delays = [(datetime.fromisoformat(p["actual_completed_at"]) -
-                          datetime.fromisoformat(p["scheduled_at"])).total_seconds()
-                         for aggregate_id in ids for p in working(aggregate_id)]
-        assert normal_delays and max(normal_delays) < 1, normal_delays
-        print(f"Controlled 1-second windows: worst completion delay={max(normal_delays):.3f}s", flush=True)
-        # Keep two workers alive while testing recovery. PostgreSQL serializes
-        # schedule ownership; the alternate process uses the same service/image.
-        command([*compose, "stop", "aggregate-worker"], env=env)
-        before = {aggregate_id: len(working(aggregate_id)) for aggregate_id in ids}
-        change_zone = "from app.config import settings; from app.db import Database; from sqlalchemy import text; db=Database(settings.database_url); s=db.session_factory(); s.execute(text(\"ALTER DATABASE diploma_test SET timezone='Asia/Tokyo'\")); s.commit(); s.close(); db.dispose()"
-        command([*compose, "exec", "-T", "api", "python", "-c", change_zone], env=env)
-        time.sleep(2.2)
-        command([*compose, "up", "-d", "--no-deps", "--no-build", "aggregate-worker"], env=env)
-        command([*compose, "exec", "-d", "-e", "TZ=Pacific/Honolulu", "aggregate-worker", "python", "-m", "app.aggregate_worker"], env=env)
-        command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
-                 "-e", "SMOKE_OFFSET=2", "api", "python", "-c", seed], env=env)
-        deadline = time.monotonic() + 20
-        while not all(len(working(aggregate_id)) >= before[aggregate_id] + 2
-                      and sum(p["event_count"] == 1 for p in working(aggregate_id)) >= 2 for aggregate_id in ids):
-            assert time.monotonic() < deadline, "Worker did not recover missed windows"
-            time.sleep(.1)
-        for aggregate_id in ids:
-            points = working(aggregate_id)
-            assert len({p["start_utc"] for p in points}) == len(points)
-            chronological = sorted(points, key=lambda p: datetime.fromisoformat(p["start_utc"]))
-            assert all(left["end_utc"] == right["start_utc"] for left, right in pairwise(chronological))
-            assert all(datetime.fromisoformat(p["end_utc"]) - datetime.fromisoformat(p["start_utc"]) == timedelta(seconds=1)
-                       and p["scheduled_at"] == p["end_utc"] for p in points)
-            assert all(p["features"][0]["value"] == p["event_count"] and p["completeness"] != "complete" for p in points)
-            event_point = next(p for p in points if p["event_count"] == 1)
-            assert event_point["features"] == expected_features[aggregate_id]
-            assert event_point["event_time_min"].startswith("2000-01-01")
-            values = {f["key"]: f for f in event_point["features"]}
-            assert values["mode"]["value"] == 1 and values["pct"]["value"] == 100
-            assert values["rate"]["value"] == 1 and values["present"]["value"] == 1
-            assert values["managed"]["value"] == values["r2"]["value"] == 1
-            assert values["date_mode"]["value"] == values["date_share"]["value"] == 1
-            assert values["boundary_date"]["value"] == 1
-            assert values["invalid_date"] == {"key": "invalid_date", "value": None,
-                "reason": "invalid_input_type", "valid_count": 0, "invalid_count": 1}
-            assert all(f["reason"] is None for key, f in values.items() if key != "invalid_date")
-            if aggregate_id == ids[1]:
-                assert [values[op]["value"] for op in ["range", "variance", "stddev", "median", "percentile", "mode_count"]] == [0, 0, 0, 100, 100, 1]
-                assert event_point["features"][2]["value"] == 100
-            else:
-                assert event_point["features"][3]["value"] == 1
-            assert any((datetime.fromisoformat(p["actual_completed_at"]) - datetime.fromisoformat(p["scheduled_at"])).total_seconds() < 1 for p in points)
-            expect(client.post(f"/api/v1/aggregates/{aggregate_id}/archive", headers=csrf))
-            expect(client.post(f"/api/v1/aggregates/{aggregate_id}/resume", headers=csrf))
-            assert expect(client.get(f"/api/v1/aggregates/{aggregate_id}"))["skipped_ranges"]
-            expect(client.delete(f"/api/v1/aggregates/{aggregate_id}", headers=csrf))
-            stable = expect(client.get(f"/api/v1/aggregates/{aggregate_id}/points"))["total"]
-            time.sleep(.15)
-            assert expect(client.get(f"/api/v1/aggregates/{aggregate_id}/points"))["total"] == stable
-        command([*compose, "exec", "-T", "api", "python", "-c", change_zone.replace("Asia/Tokyo", "UTC")], env=env)
-        # Keep the same synthetic user, sources, WAL and worker alive for UI compatibility.
-        # The enclosing profile owns the database/Compose cleanup even on browser failure.
-        if browser is not None:
-            browser_ids = browser({"username": username, "password": password,
-                                   "sources": data["sources"], "empty_source":data["empty_source"], "anchor": anchor.isoformat()})
-            for identity in browser_ids:
-                expect(client.delete(f"/api/v1/aggregates/{identity}", headers=csrf))
-            ids.extend(browser_ids)
-        if lifecycle is not None:
-            lifecycle()
-        cleanup = """
-import json,os
-from uuid import UUID
-from sqlalchemy import delete
-from sqlalchemy.engine import make_url
-from app.config import settings
-from app.db import Database
-from app.models import Aggregate,AggregateSchedule,HistoricalAggregatePoint,WorkingWindowPoint,AvailabilityMarker,ParsedLog,ProcessedKafkaRecord,Source,SourceInterruption,KafkaConnection,User,Normalizer
-assert make_url(settings.database_url).database=='diploma_test'
-owned=json.loads(os.environ['SMOKE_OWNED']);db=Database(settings.database_url)
-with db.session_factory.begin() as s:
- for identity in owned['aggregates']:
-  aggregate=s.get(Aggregate,UUID(identity));schedule_id=aggregate.schedule_id
-  s.execute(delete(HistoricalAggregatePoint).where(HistoricalAggregatePoint.aggregate_id==aggregate.id))
-  s.execute(delete(WorkingWindowPoint).where(WorkingWindowPoint.schedule_id==schedule_id))
-  s.delete(aggregate);s.flush()
-  s.execute(delete(AggregateSchedule).where(AggregateSchedule.id==schedule_id))
- for identity in [*owned['sources'],*([owned['empty_source']] if owned.get('empty_source') else [])]:
-  source_id=UUID(identity)
-  s.execute(delete(ParsedLog).where(ParsedLog.source_id==source_id))
-  s.execute(delete(ProcessedKafkaRecord).where(ProcessedKafkaRecord.source_id==source_id))
-  s.execute(delete(AvailabilityMarker).where(AvailabilityMarker.source_identity==source_id))
-  s.execute(delete(SourceInterruption).where(SourceInterruption.source_identity==source_id))
-  s.execute(delete(Source).where(Source.id==source_id))
- if owned.get('normalizer'):
-  s.execute(delete(Normalizer).where(Normalizer.id==UUID(owned['normalizer'])))
- s.execute(delete(KafkaConnection).where(KafkaConnection.id==UUID(owned['connection'])))
- s.execute(delete(User).where(User.username==owned['username']))
-db.dispose()
-"""
-        owned = {**data, "aggregates": ids, "username": username}
-        command([*compose, "exec", "-T", "-e", "SMOKE_OWNED=" + json.dumps(owned),
-                 "api", "python", "-c", cleanup], env=env)
-    print("Aggregate proxy/API/real WAL/permanent worker smoke passed: two sources, historical barrier, 1-second windows, restart, archive/delete", flush=True)

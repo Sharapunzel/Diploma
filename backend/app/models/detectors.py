@@ -84,6 +84,8 @@ class Detector(Base):
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_code: Mapped[str | None] = mapped_column(Text)
     last_failure: Mapped[dict | None] = mapped_column(JSONB)
+    last_consumed_projection: Mapped[dict | None] = mapped_column(JSONB)
+    last_evaluated_projection: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class DetectorCoordinator(Base):
@@ -100,7 +102,7 @@ class DetectorRecovery(Base):
     __tablename__ = "detector_recoveries"
     __table_args__ = (
         CheckConstraint("first_index >= 0 AND last_index >= first_index", name="range_valid"),
-        CheckConstraint("reason IN ('crash_recovery','manual_resume')", name="reason_valid"),
+        CheckConstraint("reason IN ('crash_recovery','manual_resume','aggregate_resume')", name="reason_valid"),
         Index("ix_detector_recovery", "detector_id", "first_index", "last_index"),
         {"schema": "logs"},
     )
@@ -140,7 +142,7 @@ class DetectorOutcome(Base):
     )
     id: Mapped[UUID] = mapped_column(primary_key=True)
     detector_id: Mapped[UUID] = mapped_column(ForeignKey("logs.detectors.id", ondelete="RESTRICT"))
-    working_point_id: Mapped[UUID] = mapped_column(ForeignKey("logs.working_window_points.id", ondelete="RESTRICT"))
+    working_point_id: Mapped[UUID] = mapped_column(ForeignKey("logs.aggregate_closures.origin_point_id", ondelete="RESTRICT"))
     window_index: Mapped[int] = mapped_column(BigInteger)
     revision: Mapped[int] = mapped_column(BigInteger)
     kind: Mapped[str] = mapped_column(Text)
@@ -156,7 +158,7 @@ class Finding(Base):
     )
     id: Mapped[UUID] = mapped_column(primary_key=True)
     detector_id: Mapped[UUID] = mapped_column(ForeignKey("logs.detectors.id", ondelete="RESTRICT"))
-    working_point_id: Mapped[UUID] = mapped_column(ForeignKey("logs.working_window_points.id", ondelete="RESTRICT"))
+    working_point_id: Mapped[UUID] = mapped_column(ForeignKey("logs.aggregate_closures.origin_point_id", ondelete="RESTRICT"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     late: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     data: Mapped[dict] = mapped_column(JSONB)

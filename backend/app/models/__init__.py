@@ -1,3 +1,13 @@
+from .aggregate_history import (
+    AggregateCleanupOperation,
+    AggregateClosure,
+    AggregateCommand,
+    AggregateHistorySpan,
+    AggregateLateEvent,
+    AggregateMembership,
+    AggregateSnapshot,
+    AggregateTimeExclusion,
+)
 from .aggregates import Aggregate, HistoricalAggregatePoint
 from .app import (
     AggregateSchedule,
@@ -40,7 +50,15 @@ from .oidc_provider import OidcProvider
 
 __all__ = [
     "Aggregate",
+    "AggregateCleanupOperation",
+    "AggregateClosure",
+    "AggregateCommand",
+    "AggregateHistorySpan",
+    "AggregateLateEvent",
+    "AggregateMembership",
     "AggregateSchedule",
+    "AggregateSnapshot",
+    "AggregateTimeExclusion",
     "AppSetting",
     "AuthSession",
     "AvailabilityMarker",

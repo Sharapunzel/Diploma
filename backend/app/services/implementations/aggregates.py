@@ -2,16 +2,23 @@
 
 import hashlib
 import json
-import time
 from datetime import UTC, timedelta
 from functools import wraps
-from uuid import uuid4, uuid5
+from uuid import uuid4
 
 from sqlalchemy.exc import DBAPIError
 
 from ...aggregation.budget import estimate
+from ...aggregation.event_time import (
+    EventTimeBudgetError,
+    EventTimeRangeError,
+    OperationBudget,
+    bounds,
+    close_deadline,
+    index_at,
+    online_start,
+)
 from ...aggregation.field_catalog import FieldCatalogLimits
-from ...aggregation.results import interpret_result
 from ...aggregation.rules import (
     OPERATORS,
     Limits,
@@ -34,33 +41,37 @@ from ...schemas.aggregates import (
     ValidateRequest,
     ValidationResult,
 )
+from .aggregate_execution import AggregateExecutionService
 from .aggregate_field_catalog import AggregateFieldCatalogService
-from .saved_coverage import evaluate_saved_coverage
+from .aggregate_snapshot import AggregateSnapshotService
 from .window_schedule import WindowSchedule
-from .working_windows import WorkingWindowService
 
 
 def guarded(method):
     @wraps(method)
     def call(self, *args, **kwargs):
-        for attempt in range(3):
-            try:
-                return method(self, *args, **kwargs)
-            except RuleError as error:
-                self.uow.rollback()
-                raise DomainError(error.code, "Правило агрегата не прошло проверку", 422,
-                                  {"path": error.path, "hint": error.hint}) from error
-            except DBAPIError as error:
-                self.uow.rollback()
-                code = getattr(error.orig, "sqlstate", None)
-                if code in {"40001", "40P01"} and attempt < 2:
-                    continue
-                safe = {"57014": "aggregate_timeout", "40001": "aggregate_retry_required",
-                        "40P01": "aggregate_retry_required"}.get(code, "aggregate_database_error")
-                raise DomainError(safe, "Расчёт не завершён; повторите запрос или уменьшите стоимость", 503) from error
-            except Exception:
-                self.uow.rollback()
-                raise
+        try:
+            return method(self, *args, **kwargs)
+        except RuleError as error:
+            self.uow.rollback()
+            raise DomainError(error.code, "Правило агрегата не прошло проверку", 422,
+                              {"path": error.path, "hint": error.hint}) from error
+        except EventTimeRangeError as error:
+            self.uow.rollback()
+            raise DomainError("schedule_datetime_range", "Границы или срок закрытия выходят за допустимый диапазон дат", 422) from error
+        except EventTimeBudgetError as error:
+            self.uow.rollback()
+            raise DomainError("resource_budget_exceeded", "Уменьшите окно или сложность правила", 422,
+                {"factor": error.factor, "hint": "Уменьшите объём событий или сложность конфигурации"}) from error
+        except DBAPIError as error:
+            self.uow.rollback()
+            code = getattr(error.orig, "sqlstate", None)
+            safe = {"57014": "aggregate_timeout", "40001": "aggregate_retry_required",
+                    "40P01": "aggregate_retry_required"}.get(code, "aggregate_database_error")
+            raise DomainError(safe, "Расчёт не завершён; повторите запрос или уменьшите стоимость", 503) from error
+        except Exception:
+            self.uow.rollback()
+            raise
     return call
 
 
@@ -126,7 +137,7 @@ class AggregateService:
         now = self.repository.now()
         budget = self._cost(compiled, body.source_id,
                             now - timedelta(seconds=body.schedule.duration_seconds), now,
-                            "availability_at", body.schedule.duration_seconds, False)
+                            "event_time", body.schedule.duration_seconds, False)
         return ValidationResult(rule_hash=compiled.sha256, anchor_utc=body.schedule.anchor_utc,
             duration_seconds=body.schedule.duration_seconds,
             feature_keys=[f.key for f in compiled.rule.features], budget=budget)
@@ -135,43 +146,30 @@ class AggregateService:
     def validate(self, body: ValidateRequest):
         return self._validate(body)
 
-    def _capture_ready(self):
-        state = self.capture.status()
-        if not state.ready:
-            raise DomainError("availability_capture_unavailable", "Захват времени доступности не готов", 503,
-                              {"reason": state.reason})
-
     def _preview(self, body):
+        if body.time_basis != "event_time":
+            raise DomainError("legacy_calculation_removed", "Укажите time_basis=event_time для нового расчёта", 422)
+        budget = OperationBudget(10)
+        self.repository.read_budget(budget.milliseconds())
         self._source(body.source_id)
-        compiled = compile_rule(body.aggregate_rule, self.catalog, self.budget_limits)
         schedule = WindowSchedule(body.schedule.anchor_utc, body.schedule.duration_seconds)
-        window = self._window(schedule, body.window_start_utc, self.repository.now())
-        if body.time_basis == "availability_at":
-            progress = self.repository.progress()
-            if (progress is None or progress.availability_verified_from_at is None
-                    or window.start < progress.availability_verified_from_at):
-                raise DomainError("historical_time_basis_unknown",
-                    "Для этого окна доступен только явно выбранный ретроспективный preview", 422)
-            self._capture_ready()
-        barrier = (self.repository.coverage_barrier(body.source_id, window.end)
-                   if body.time_basis == "availability_at" else None)
-        budget = self._cost(compiled, body.source_id, window.start, window.end, body.time_basis,
-                            schedule.duration_seconds, True)
-        values = interpret_result(self.repository.calculate(body.source_id, window.start, window.end, body.time_basis, compiled), compiled, schedule.duration_seconds)
-        # Recheck the actual statement's snapshot, even if writes occurred after
-        # estimation. Never return a truncated or over-budget partial result.
-        estimate(compiled, values["observed_rows"], budget["source_rows"], schedule.duration_seconds,
-                 self.budget_limits, True, values.pop("observed_width"))
-        completeness, reason = "unverified", "preview_snapshot_without_coverage_proof"
-        if barrier is not None:
-            proven, proven_reason, _ = evaluate_saved_coverage(self.evidence, body.source_id,
-                window.start, window.end, barrier.availability_at)
-            if proven in {"complete", "interrupted"}:
-                completeness, reason = proven, proven_reason
-        return PreviewResult(rule_hash=compiled.sha256, start_utc=window.start, end_utc=window.end,
-            scheduled_at=window.end, **values, completeness=completeness,
-            completeness_reason=reason, time_basis=body.time_basis,
-            budget=budget)
+        start = body.window_start_utc.astimezone(UTC)
+        index = index_at(schedule.anchor_utc, schedule.duration_seconds, start)
+        expected = schedule.anchor_utc + timedelta(seconds=index * schedule.duration_seconds)
+        end = start + timedelta(seconds=schedule.duration_seconds)
+        if start != expected:
+            raise DomainError("window_not_aligned", "Начало окна должно совпадать с границей расписания", 422)
+        if end > self.repository.now():
+            raise DomainError("window_not_completed", "Доступно только завершённое окно", 422)
+        candidate = AggregateSnapshotService(self.repository, self.uow, self.catalog, self.budget_limits).build(
+            body.source_id, body.aggregate_rule.model_dump(exclude_none=True), start, end,
+            schedule.duration_seconds, "preview", None, budget, True)
+        return PreviewResult(rule_hash=candidate["rule_hash"], start_utc=start, end_utc=end,
+            scheduled_at=end, **candidate["values"], completeness=candidate["completeness"],
+            completeness_reason=candidate["completeness_reason"], time_basis="event_time",
+            budget=candidate["budget"], snapshot_reference_at=candidate["reference"],
+            close_not_before_at=close_deadline(end, schedule.duration_seconds),
+            in_process=index >= 0, snapshot_metadata=candidate["metadata"])
 
     @guarded
     def preview(self, body: AggregatePreviewRequest):
@@ -183,6 +181,8 @@ class AggregateService:
         if not key or len(key) > 200:
             raise DomainError("idempotency_key_required", "Укажите Idempotency-Key до 200 символов", 422)
         request_document = body.model_dump(mode="json")
+        if body.time_basis is None:
+            request_document["time_basis"] = "availability_at"
         # Preserve pre-extension idempotency digests as well as rule hashes.
         # Other legacy nullable fields must retain their original serialization.
         for feature in [*request_document["aggregate_rule"]["features"],
@@ -198,29 +198,49 @@ class AggregateService:
             if previous.request_hash != digest:
                 raise DomainError("idempotency_conflict", "Ключ уже использован для другого запроса", 409)
             return self.card(previous.id)
+        if body.time_basis != "event_time":
+            raise DomainError("legacy_calculation_removed", "Новый агрегат требует time_basis=event_time", 422)
+        # Preserve exact replay above; reject new unrepresentable schedules.
+        first = online_start(body.schedule.anchor_utc, body.schedule.duration_seconds, self.repository.now())
+        _, first_end = bounds(body.schedule.anchor_utc, body.schedule.duration_seconds, first)
+        close_deadline(first_end, body.schedule.duration_seconds)
         self._validate(body)
         preview = self._preview(body)
         if preview.rule_hash != body.rule_hash:
             raise DomainError("rule_hash_mismatch", "Хэш не совпадает с проверенным правилом", 409)
+        # The RR preview deliberately released the first key lock. Reacquire it
+        # and resolve a concurrent create before the final atomic write.
+        self.repository.idempotency_lock(scoped_key)
+        previous = self.repository.by_key(scoped_key)
+        if previous:
+            if previous.request_hash != digest:
+                raise DomainError("idempotency_conflict", "Ключ уже использован для другого запроса", 409)
+            return self.card(previous.id)
         if not self.windows.lock_source(body.source_id):
             raise DomainError("source_unavailable", "Источник удалён или больше не является собственным", 409)
         now = self.repository.now()
         source = self._source(body.source_id)
         schedule = AggregateSchedule(id=uuid4(), source_identity=source.id,
-            anchor_utc=body.schedule.anchor_utc, duration_seconds=body.schedule.duration_seconds)
-        schedule.next_index = future_index(schedule, now)
+            anchor_utc=body.schedule.anchor_utc, duration_seconds=body.schedule.duration_seconds,
+            semantic_basis="event_time", bootstrap_at=now, paused=False,
+            online_start_index=online_start(body.schedule.anchor_utc, body.schedule.duration_seconds, now),
+            execution_generation=0, scan_cycle=0, turn=0)
+        _, first_end = bounds(schedule.anchor_utc, schedule.duration_seconds, schedule.online_start_index)
+        close_deadline(first_end, schedule.duration_seconds)
+        schedule.next_index = schedule.online_start_index
         aggregate = Aggregate(id=uuid4(), schedule_id=schedule.id, name=body.name,
             source_identity=source.id, source_name=source.name, source_type=source.source_type,
             rule=body.aggregate_rule.model_dump(exclude_none=True), rule_hash=preview.rule_hash,
             original_boundary=body.schedule.boundary.isoformat(), timezone=body.schedule.timezone,
             created_at=now, created_by=actor, state="active", request_key=scoped_key,
-            request_hash=digest, skipped_ranges=[])
+            request_hash=digest, skipped_ranges=[], semantic_basis="event_time", execution_mode="current")
         self.repository.add(aggregate, schedule)
         self.uow.commit()
         return self.card(aggregate.id)
 
     def _card(self, aggregate, schedule):
-        next_at = WindowSchedule(schedule.anchor_utc, schedule.duration_seconds).window(schedule.next_index).end
+        _, next_at = bounds(schedule.anchor_utc, schedule.duration_seconds, schedule.next_index)
+        deadline = close_deadline(next_at, schedule.duration_seconds) if aggregate.execution_mode == "current" else None
         return AggregateCard(id=aggregate.id, name=aggregate.name, source_id=aggregate.source_identity,
             source_name=aggregate.source_name, source_type=aggregate.source_type,
             aggregate_rule=aggregate.rule, rule_hash=aggregate.rule_hash,
@@ -229,8 +249,14 @@ class AggregateService:
             created_at=aggregate.created_at, created_by=aggregate.created_by, state=aggregate.state,
             archived_at=aggregate.archived_at, deleted_at=aggregate.deleted_at, deleted_by=aggregate.deleted_by,
             skipped_ranges=aggregate.skipped_ranges, next_index=schedule.next_index,
-            next_scheduled_at=next_at, lag_seconds=max(0, (self.repository.now() - next_at).total_seconds()) if aggregate.state == "active" else 0,
-            last_error=aggregate.last_error, last_error_at=aggregate.last_error_at)
+            next_scheduled_at=next_at, lag_seconds=max(0, (self.repository.now() - deadline).total_seconds()) if deadline and aggregate.state == "active" else 0,
+            last_error=aggregate.last_error, last_error_at=aggregate.last_error_at,
+            semantic_basis=aggregate.semantic_basis, execution_mode=aggregate.execution_mode,
+            execution_reason="aggregate_time_semantics_retired" if aggregate.execution_mode == "retired" else None,
+            bootstrap_at=schedule.bootstrap_at, online_start_index=schedule.online_start_index,
+            paused=schedule.paused, execution_generation=schedule.execution_generation,
+            active_cleanup_id=schedule.active_cleanup_id, next_close_not_before_at=deadline,
+            diagnostics=self.repository.diagnostics(aggregate.id))
 
     @guarded
     def card(self, aggregate_id):
@@ -244,12 +270,17 @@ class AggregateService:
 
     def _point(self, aggregate, point):
         historical = isinstance(point, HistoricalAggregatePoint)
+        closure = self.repository.closure_by_id(point.id)
         return PointCard(id=point.id, aggregate_id=aggregate.id, kind="historical" if historical else "working",
             start_utc=point.start_utc, end_utc=point.end_utc, scheduled_at=point.end_utc,
             actual_started_at=point.actual_started_at, actual_completed_at=point.actual_completed_at,
             event_count=point.event_count, event_time_min=point.event_time_min, event_time_max=point.event_time_max,
             features=point.features, completeness=point.completeness, completeness_reason=point.completeness_reason,
-            evidence_refs=point.evidence_refs, time_basis=point.time_basis if historical else "availability_at")
+            evidence_refs=point.evidence_refs, time_basis=point.time_basis,
+            origin=closure.origin if closure else "legacy", window_index=closure.window_index if closure else None,
+            snapshot_reference_at=closure.snapshot_reference_at if closure else None,
+            close_not_before_at=closure.close_not_before_at if closure else None,
+            snapshot_metadata=self.repository.snapshot_metadata(point.id))
 
     @guarded
     def points(self, aggregate_id, limit, offset):
@@ -260,7 +291,7 @@ class AggregateService:
     @guarded
     def copy(self, aggregate_id):
         aggregate, schedule = self._get(aggregate_id)
-        if aggregate.state == "deleted":
+        if aggregate.state == "deleted" and aggregate.execution_mode != "retired":
             raise DomainError("aggregate_deleted", "Удалённый агрегат нельзя копировать", 409)
         return ValidateRequest(source_id=aggregate.source_identity, aggregate_rule=aggregate.rule,
             schedule=ScheduleInput(boundary=aggregate.original_boundary, timezone=aggregate.timezone,
@@ -270,11 +301,16 @@ class AggregateService:
     def lifecycle(self, aggregate_id, action, actor):
         self.repository.limits(self.budget_limits, False)
         aggregate, schedule = self._get(aggregate_id, lock=True)
+        if schedule.active_cleanup_id:
+            raise DomainError("cleanup_in_progress", "Очистка ещё не завершена", 409)
+        if aggregate.execution_mode == "retired" and action != "delete":
+            raise DomainError("aggregate_time_semantics_retired", "Прежний расчёт остановлен; создайте копию", 409)
         now = self.repository.now()
         if aggregate.state == "deleted":
             if action == "delete":
                 return self._card(aggregate, schedule)
             raise DomainError("aggregate_deleted", "Агрегат удалён", 409)
+        schedule.execution_generation += 1
         if action == "archive" and aggregate.state == "active":
             aggregate.state, aggregate.archived_at = "archived", now
         elif action == "resume" and aggregate.state == "archived":
@@ -287,7 +323,8 @@ class AggregateService:
             schedule.next_index, aggregate.state, aggregate.archived_at = next_index, "active", None
         elif action == "delete":
             aggregate.state, aggregate.deleted_at, aggregate.deleted_by = "deleted", now, actor
-            self.detectors.stop_for_aggregate(aggregate.id, "aggregate_deleted", now)
+            if aggregate.execution_mode == "current":
+                self.detectors.stop_for_aggregate(aggregate.id, "aggregate_deleted", now)
         self.uow.commit()
         return self.card(aggregate_id)
 
@@ -309,13 +346,21 @@ class AggregateService:
         return AggregateFieldCatalogService(self.repository, self.uow, self.catalog,
             self.field_catalog_limits).read(source_id, query, limit, offset)
 
-    def _working_calculation(self, aggregate, stored, window):
-        from ...aggregation.rules import AggregateRule
-        compiled = compile_rule(AggregateRule.model_validate(aggregate.rule), self.catalog, self.budget_limits)
-        budget = self._cost(compiled, stored.source_identity, window.start, window.end, "availability_at", stored.duration_seconds, False)
-        values = interpret_result(self.repository.calculate(stored.source_identity, window.start, window.end, "availability_at", compiled), compiled, stored.duration_seconds)
-        estimate(compiled, values["observed_rows"], budget["source_rows"], stored.duration_seconds, self.budget_limits, False, values.pop("observed_width"))
-        return values
+    def _execution_service(self):
+        return AggregateExecutionService(self.repository, self.uow, self.catalog, self.budget_limits)
+
+    def aggregate_command(self, aggregate_id, actor, key, action, keep_last=None, operation_id=None):
+        from .aggregate_cleanup import AggregateCleanupService
+        return AggregateCleanupService(self.repository, self.uow).command(
+            aggregate_id, actor, key, action, keep_last, operation_id)
+
+    def cleanup_preview(self, aggregate_id, keep_last):
+        from .aggregate_cleanup import AggregateCleanupService
+        return AggregateCleanupService(self.repository, self.uow).preview(aggregate_id, keep_last)
+
+    def cleanup_operation(self, aggregate_id, operation_id):
+        from .aggregate_cleanup import AggregateCleanupService
+        return AggregateCleanupService(self.repository, self.uow).operation(aggregate_id, operation_id)
 
     @guarded
     def due(self, limit: int = 1000):
@@ -329,69 +374,35 @@ class AggregateService:
 
     @guarded
     def advance(self, aggregate_id):
-        self.repository.limits(self.budget_limits, False)
-        aggregate, _ = self._get(aggregate_id)
-        service = WorkingWindowService(self.windows, self.evidence, self.capture, self.uow,
-            calculator=lambda stored, window: self._working_calculation(aggregate, stored, window))
-        service.prepare_barrier(aggregate.schedule_id)
-        self.repository.limits(self.budget_limits, False)
-        return service.close_next_window(aggregate.schedule_id)
+        return self._execution_service().advance(aggregate_id)
 
     @guarded
     def historical(self, aggregate_id, body):
-        self.repository.limits(self.budget_limits, False)
-        aggregate, schedule = self._get(aggregate_id, lock=True, active=True)
-        window = self._window(schedule, body.window_start_utc, aggregate.created_at)
-        saved = self.repository.historical(aggregate_id, window.start)
-        if saved:
-            return self._point(aggregate, saved)
-        progress = self.repository.progress()
-        if (progress and progress.legacy_cutover_at is not None and window.end <= progress.legacy_cutover_at):
-            basis = "legacy_markerless"
-        elif (progress and progress.availability_verified_from_at is not None
-              and window.start >= progress.availability_verified_from_at):
-            basis = "availability_at"
-        else:
-            raise DomainError("historical_time_basis_unknown", "Основание времени исторического окна не доказано", 422)
-        started = self.repository.now()
-        barrier = None
-        if basis == "availability_at":
-            self._capture_ready()
-            if not self.windows.lock_source(aggregate.source_identity):
-                raise DomainError("source_unavailable", "Источник недоступен", 409)
-            marker_id = uuid5(aggregate.id, "historical:" + window.start.isoformat())
-            self.windows.ensure_barrier(marker_id, aggregate.source_identity, started)
-            self.uow.commit()
-            deadline = time.monotonic() + 10
-            while True:
-                aggregate, schedule = self._get(aggregate_id, lock=True, active=True)
-                saved = self.repository.historical(aggregate_id, window.start)
-                if saved:
-                    return self._point(aggregate, saved)
-                self._capture_ready()
-                barrier = self.windows.barrier(marker_id)
-                if barrier and barrier.availability_at is not None:
-                    break
-                self.uow.rollback()
-                if time.monotonic() >= deadline:
-                    raise DomainError("barrier_pending", "Барьер ещё не материализован; повторите запрос", 503)
-                time.sleep(.05)
-            if self.repository.markerless(aggregate.source_identity, window.start, window.end):
-                raise DomainError("availability_boundary_violation", "В окне найдены записи без маркера доступности", 409)
-        values = self._working_calculation(aggregate, schedule, window) if basis == "availability_at" else None
-        if values is None:
-            from ...aggregation.rules import AggregateRule
-            compiled = compile_rule(AggregateRule.model_validate(aggregate.rule), self.catalog, self.budget_limits)
-            budget = self._cost(compiled, aggregate.source_identity, window.start, window.end, basis, schedule.duration_seconds, False)
-            values = interpret_result(self.repository.calculate(aggregate.source_identity, window.start, window.end, basis, compiled), compiled, schedule.duration_seconds)
-            estimate(compiled, values["observed_rows"], budget["source_rows"], schedule.duration_seconds, self.budget_limits, False, values.pop("observed_width"))
-        completeness, reason, refs = (evaluate_saved_coverage(self.evidence, aggregate.source_identity,
-            window.start, window.end, barrier.availability_at) if barrier else ("unknown", "legacy_coverage_unproven", {}))
-        values.pop("observed_rows")
-        point = HistoricalAggregatePoint(aggregate_id=aggregate.id, start_utc=window.start, end_utc=window.end,
-            actual_started_at=started, actual_completed_at=self.repository.now(), **values,
-            time_basis="backend_processed_at_historical" if basis == "legacy_markerless" else basis,
-            completeness=completeness, completeness_reason=reason, evidence_refs=refs)
-        self.repository.add_historical(point)
-        self.uow.commit()
-        return self._point(aggregate, point)
+        aggregate, schedule = self._get(aggregate_id)
+        if aggregate.execution_mode == "retired":
+            raise DomainError("aggregate_time_semantics_retired", "Прежний расчёт остановлен; сохранённые точки доступны для чтения", 409)
+        window = self._window(schedule, body.window_start_utc, self.repository.now())
+        return self.point_at(aggregate_id, index_at(schedule.anchor_utc, schedule.duration_seconds, window.start))
+
+    @guarded
+    def point_at(self, aggregate_id, index):
+        aggregate, schedule = self._get(aggregate_id)
+        closure = self.repository.closure_at(schedule.id, index)
+        if closure is None:
+            raise DomainError("canonical_point_not_ready", "Окно ещё не рассчитано", 409)
+        return self._saved_point(aggregate, closure)
+
+    @guarded
+    def point_by_id(self, aggregate_id, point_id):
+        aggregate, _ = self._get(aggregate_id)
+        closure = self.repository.closure_by_id(point_id)
+        if closure is None or closure.aggregate_id != aggregate.id:
+            raise DomainError("aggregate_point_not_found", "Точка не найдена", 404)
+        return self._saved_point(aggregate, closure)
+
+    def _saved_point(self, aggregate, closure):
+        if closure.payload_state == "cleared":
+            raise DomainError("aggregate_point_cleared", "Данные точки очищены", 410,
+                {"origin_point_id": str(closure.origin_point_id), "window_index": closure.window_index,
+                 "time_basis": closure.time_basis, "origin": closure.origin})
+        return self._point(aggregate, self.repository.payload(closure))

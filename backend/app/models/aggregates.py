@@ -35,6 +35,8 @@ class Aggregate(Base):
     skipped_ranges: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
     request_key: Mapped[str] = mapped_column(Text, unique=True)
     request_hash: Mapped[str] = mapped_column(Text)
+    semantic_basis: Mapped[str] = mapped_column(Text)
+    execution_mode: Mapped[str] = mapped_column(Text)
     last_error: Mapped[str | None] = mapped_column(Text)
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

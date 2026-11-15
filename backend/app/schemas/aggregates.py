@@ -1,6 +1,6 @@
 """Aggregate API contracts. There is deliberately no update-rule request."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -28,7 +28,11 @@ class ScheduleInput(Node):
             zone = ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as error:
             raise ValueError("unknown_timezone") from error
-        local = self.boundary.astimezone(zone)
+        try:
+            local = self.boundary.astimezone(zone)
+            self.anchor_utc + timedelta(seconds=self.duration_seconds)
+        except (ValueError, OverflowError) as error:
+            raise ValueError("schedule_datetime_range") from error
         if (local.replace(tzinfo=None) != self.boundary.replace(tzinfo=None)
                 or local.utcoffset() != self.boundary.utcoffset()):
             raise ValueError("boundary_offset_does_not_match_timezone")
@@ -47,7 +51,8 @@ class ValidateRequest(Node):
 
 class AggregatePreviewRequest(ValidateRequest):
     window_start_utc: AwareDatetime
-    time_basis: Literal["availability_at", "backend_processed_at_historical"] = "availability_at"
+    # Legacy forms are accepted by transport only for exact create replay.
+    time_basis: Literal["event_time", "availability_at", "backend_processed_at_historical"] | None = None
 
 
 class CreateAggregateRequest(AggregatePreviewRequest):
@@ -109,6 +114,11 @@ class PreviewResult(UTCResponse):
     completeness_reason: str
     time_basis: str
     budget: BudgetEstimate
+    snapshot_reference_at: datetime | None = None
+    close_not_before_at: datetime | None = None
+    origin: str = "preview"
+    in_process: bool = True
+    snapshot_metadata: dict = Field(default_factory=dict)
 
 
 class AggregateCard(UTCResponse):
@@ -136,6 +146,16 @@ class AggregateCard(UTCResponse):
     lag_seconds: float
     last_error: str | None
     last_error_at: datetime | None
+    semantic_basis: str
+    execution_mode: str
+    execution_reason: str | None = None
+    bootstrap_at: datetime | None
+    online_start_index: int | None
+    paused: bool
+    execution_generation: int
+    active_cleanup_id: UUID | None
+    next_close_not_before_at: datetime | None
+    diagnostics: dict = Field(default_factory=dict)
 
 
 class AggregatePage(Node):
@@ -160,6 +180,63 @@ class PointCard(UTCResponse):
     completeness_reason: str
     evidence_refs: dict
     time_basis: str
+    origin: str = "legacy"
+    window_index: int | None = None
+    snapshot_reference_at: datetime | None = None
+    close_not_before_at: datetime | None = None
+    payload_state: str = "present"
+    snapshot_metadata: dict = Field(default_factory=dict)
+
+
+class CleanupRequest(Node):
+    keep_last: StrictInt = Field(ge=0, le=9223372036854775807)
+
+
+class AggregateCommandReceipt(UTCResponse):
+    operation_id: UUID
+    aggregate_id: UUID
+    action: str
+    recorded_at: datetime
+    execution_generation: int
+    cleanup_operation_id: UUID | None = None
+
+
+class CleanupBlocker(Node):
+    detector_id: UUID
+    name: str
+    reason: str
+    minimum_keep: int
+    protected_start_index: int | None = None
+    protected_end_index: int | None = None
+
+
+class CleanupProtection(UTCResponse):
+    aggregate_id: UUID
+    reference_at: datetime
+    requested_keep: int
+    total_points: int
+    minimum_keep: int
+    maximum_delete: int
+    planned_delete: int
+    tail_identity: dict | None
+    can_cleanup: bool
+    reason: str | None
+    blockers: list[CleanupBlocker]
+
+
+class CleanupOperation(UTCResponse):
+    id: UUID
+    aggregate_id: UUID
+    created_at: datetime
+    requested_keep: int
+    reference_tail: dict | None
+    planned_delete: int
+    deleted_points: int
+    deleted_bytes_if_measured: int | None
+    completed_at: datetime | None
+    status: Literal["pending", "running", "succeeded", "failed"]
+    safe_error: str | None
+    progress: dict
 
 
 class PointPage(Node):

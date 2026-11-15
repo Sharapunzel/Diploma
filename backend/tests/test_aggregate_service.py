@@ -11,12 +11,6 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi import Depends
-from fastapi.testclient import TestClient
-from psycopg.errors import SerializationFailure
-from sqlalchemy import delete, func, select
-from sqlalchemy.exc import DBAPIError
-
 from app.aggregate_composition import build_aggregate_service
 from app.config import Settings
 from app.core.errors import DomainError
@@ -32,6 +26,7 @@ from app.models import (
     HistoricalAggregatePoint,
     KafkaConnection,
     ParsedLog,
+    ProcessedKafkaRecord,
     Source,
     User,
     WorkingWindowPoint,
@@ -42,7 +37,12 @@ from app.schemas.aggregates import (
     HistoricalRequest,
 )
 from app.services.implementations.aggregate_worker import AggregateWorker
-from app.services.implementations.working_windows import WindowNotReady
+from event_time_fixtures import delete_aggregate
+from fastapi import Depends
+from fastapi.testclient import TestClient
+from psycopg.errors import SerializationFailure
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import DBAPIError
 
 
 @pytest.fixture(scope="module")
@@ -79,13 +79,10 @@ def source(database):
         with database.session_factory.begin() as session:
             aggregates = list(session.scalars(select(Aggregate).where(Aggregate.source_identity == source_id)))
             for aggregate in aggregates:
-                session.execute(delete(HistoricalAggregatePoint).where(HistoricalAggregatePoint.aggregate_id == aggregate.id))
-                session.execute(delete(WorkingWindowPoint).where(WorkingWindowPoint.schedule_id == aggregate.schedule_id))
-                session.delete(aggregate)
-                session.flush()
-                session.execute(delete(AggregateSchedule).where(AggregateSchedule.id == aggregate.schedule_id))
+                delete_aggregate(session, aggregate.id)
             session.execute(delete(AvailabilityMarker).where(AvailabilityMarker.source_identity == source_id))
             session.execute(delete(ParsedLog).where(ParsedLog.source_id == source_id))
+            session.execute(delete(ProcessedKafkaRecord).where(ProcessedKafkaRecord.source_id == source_id))
             session.execute(delete(Source).where(Source.id == source_id))
             session.execute(delete(KafkaConnection).where(KafkaConnection.id == connection_id))
 
@@ -102,7 +99,7 @@ def request(source_id, now=None, duration=1):
     return AggregatePreviewRequest(source_id=source_id,
         aggregate_rule={"features": [{"key": "n", "name": "Count", "op": "count"}]},
         schedule={"boundary": anchor, "timezone": "UTC", "duration_seconds": duration},
-        window_start_utc=anchor, time_basis="backend_processed_at_historical")
+        window_start_utc=anchor, time_basis="event_time")
 
 
 def create(database, catalog, source_id, key=None, duration=1, clock_shift=0):
@@ -117,12 +114,12 @@ def create(database, catalog, source_id, key=None, duration=1, clock_shift=0):
         return api.create(body, UUID(int=1), key or str(uuid4())), body
 
 
-def materialize(database, source_id):
-    with database.session_factory.begin() as session:
-        for marker in session.scalars(select(AvailabilityMarker).where(
-                AvailabilityMarker.source_identity == source_id, AvailabilityMarker.kind == "barrier",
-                AvailabilityMarker.availability_at.is_(None))):
-            marker.availability_at = session.scalar(select(func.clock_timestamp()))
+def close_one(api, aggregate_id):
+    for _ in range(6):
+        result = api.advance(aggregate_id)
+        if result["state"] == "closed":
+            return api.repository.session.get(WorkingWindowPoint, result["point_id"])
+    pytest.fail("No due event-time window was closed")
 
 
 def test_preview_readonly_hash_and_creation_idempotency(database, catalog, source):
@@ -131,7 +128,7 @@ def test_preview_readonly_hash_and_creation_idempotency(database, catalog, sourc
         api = service(session, catalog)
         checked, preview = api.validate(body), api.preview(body)
         assert checked.rule_hash == preview.rule_hash
-        assert preview.completeness == "unverified" and preview.event_count == 0
+        assert preview.completeness == "complete" and preview.event_count == 0
         assert session.scalar(select(func.count()).select_from(Aggregate).where(Aggregate.source_identity == source)) == 0
         assert session.scalar(select(func.count()).select_from(AvailabilityMarker).where(AvailabilityMarker.source_identity == source)) == 0
     card, body = create(database, catalog, source, key="repeat")
@@ -142,7 +139,7 @@ def test_preview_readonly_hash_and_creation_idempotency(database, catalog, sourc
         with pytest.raises(DomainError, match="Ключ"):
             api.create(changed, UUID(int=1), "repeat")
         stored = api.repository.schedule(card.schedule_id)
-        assert card.created_at <= stored.anchor_utc + timedelta(seconds=stored.next_index)
+        assert stored.anchor_utc + timedelta(seconds=stored.next_index) <= card.created_at < stored.anchor_utc + timedelta(seconds=stored.next_index + 1)
         assert api.copy(card.id).aggregate_rule == body.aggregate_rule
 
 
@@ -159,56 +156,51 @@ def test_concurrent_create_returns_one_uuid(database, catalog, source):
     assert ids[0] == ids[1]
 
 
-def test_worker_waits_for_barrier_then_atomic_point_and_cursor(database, catalog, source):
+def test_worker_closes_due_snapshot_without_wal_barrier(database, catalog, source):
     card, _ = create(database, catalog, source, clock_shift=3)
-    with database.session_factory() as session, pytest.raises(WindowNotReady, match="barrier_not_materialized"):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
-        point = service(session, catalog).advance(card.id)
-        assert point.features[0]["value"] == 0
-        assert point.completeness == "unknown"
-        assert session.get(AggregateSchedule, card.schedule_id).next_index == card.next_index + 1
-    with database.session_factory() as session:
-        points = service(session, catalog).points(card.id, 50, 0)
-        assert points["total"] == 1 and points["items"][0].kind == "working"
+        api = service(session, catalog)
+        point = close_one(api, card.id)
+        assert point.features[0]["value"] == 0 and point.completeness == "complete"
+        assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
+        assert api.points(card.id, 50, 0)["total"] == 1
+        assert session.scalar(select(func.count()).select_from(AvailabilityMarker).where(
+            AvailabilityMarker.source_identity == source)) == 0
 
 
-def test_archive_and_delete_block_materialized_barrier(database, catalog, source):
+def test_archive_and_delete_block_closure_and_resume_retains_intentional_gap(database, catalog, source):
     card, _ = create(database, catalog, source, clock_shift=3)
-    with database.session_factory() as session, pytest.raises(WindowNotReady):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
         api = service(session, catalog)
         api.lifecycle(card.id, "archive", UUID(int=1))
-        with pytest.raises(WindowNotReady, match="aggregate_inactive"):
+        for _ in range(3):
             api.advance(card.id)
+        assert api.points(card.id, 50, 0)["total"] == 0
+        assert api.card(card.id).next_index == card.next_index
         resumed = api.lifecycle(card.id, "resume", UUID(int=1))
         assert resumed.skipped_ranges and resumed.next_index > card.next_index
         deleted = api.lifecycle(card.id, "delete", UUID(int=1))
         assert deleted.state == "deleted"
         assert api.lifecycle(card.id, "delete", UUID(int=1)).deleted_at == deleted.deleted_at
-        with pytest.raises(WindowNotReady, match="aggregate_inactive"):
+        for _ in range(3):
             api.advance(card.id)
         with pytest.raises(DomainError):
             api.copy(card.id)
         assert api.points(card.id, 50, 0)["total"] == 0
 
 
-def test_unknown_historical_time_basis_is_rejected(database, catalog, source):
+def test_old_calculation_is_rejected_and_missing_canonical_point_is_not_ready(database, catalog, source):
     card, body = create(database, catalog, source)
     with database.session_factory() as session:
         api = service(session, catalog)
-        start = body.window_start_utc
-        api.repository.progress = lambda: SimpleNamespace(legacy_cutover_at=None, availability_verified_from_at=None)
         with pytest.raises(DomainError) as error:
-            api.historical(card.id, HistoricalRequest(window_start_utc=start))
-        assert error.value.code == "historical_time_basis_unknown"
-        with pytest.raises(DomainError) as preview_error:
-            api.preview(body.model_copy(update={"time_basis": "availability_at"}))
-        assert preview_error.value.code == "historical_time_basis_unknown"
-        assert api.preview(body).completeness == "unverified"
+            api.historical(card.id, HistoricalRequest(window_start_utc=body.window_start_utc))
+        assert error.value.code == "canonical_point_not_ready"
+        for basis in (None, "availability_at", "backend_processed_at_historical"):
+            with pytest.raises(DomainError) as error:
+                api.preview(body.model_copy(update={"time_basis": basis}))
+            assert error.value.code == "legacy_calculation_removed"
+        assert api.preview(body).completeness == "complete"
 
 
 def test_api_permissions_csrf_and_typed_contract(database, catalog, source):
@@ -259,13 +251,13 @@ def test_catalog_search_is_server_side_literal_scoped_and_backward_compatible(da
     with database.session_factory.begin() as session:
         for index, identity in enumerate(identities):
             schedule = uuid4()
-            session.add(AggregateSchedule(id=schedule, source_identity=source, anchor_utc=at - timedelta(seconds=600), duration_seconds=2, next_index=300))
+            session.add(AggregateSchedule(id=schedule, source_identity=source, anchor_utc=at - timedelta(seconds=600), duration_seconds=2, next_index=300, semantic_basis="event_time", bootstrap_at=at, online_start_index=300))
             session.flush()
             session.add(Aggregate(id=identity, schedule_id=schedule, name=names[identity], source_identity=source,
                 source_name="Источник поиска", source_type="kafka", rule={"features": [{"key":"n","name":"Count","op":"count"}]},
                 rule_hash="f" * 64, original_boundary=at.isoformat(), timezone="UTC", created_at=at,
                 created_by=uuid4(), state="active" if index < 57 else "archived" if index < 59 else "deleted",
-                request_key=uuid4().hex, request_hash="e" * 64))
+                request_key=uuid4().hex, request_hash="e" * 64, semantic_basis="event_time", execution_mode="current"))
     app = create_app(Settings(environment="test", database_url=os.environ["TEST_DATABASE_URL"]), database=database, ecs_catalog=catalog, start_consumers=False)
     names_user = ["search-admin-" + uuid4().hex, "search-guest-" + uuid4().hex]
     with database.session_factory.begin() as session:
@@ -313,64 +305,54 @@ def test_worker_error_isolation_and_interruptible_wait(database, catalog, source
     assert not thread.is_alive()
 
 
-def test_failed_point_write_rolls_back_features_and_cursor(database, catalog, source, monkeypatch):
+def test_failed_point_write_rolls_back_manifest_closure_payload_and_cursor(database, catalog, source, monkeypatch):
     card, _ = create(database, catalog, source, clock_shift=3)
-    with database.session_factory() as session, pytest.raises(WindowNotReady):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
         api = service(session, catalog)
-        original = api.windows.save_point
-        def failing(point, schedule):
-            original(point, schedule)
+        original = api.repository.add_event_point
+        def failing(*args):
+            original(*args)
             raise RuntimeError("simulated crash before commit")
-        monkeypatch.setattr(api.windows, "save_point", failing)
+        monkeypatch.setattr(api.repository, "add_event_point", failing)
         with pytest.raises(RuntimeError, match="simulated crash"):
-            api.advance(card.id)
+            close_one(api, card.id)
     with database.session_factory() as session:
         api = service(session, catalog)
         assert api.points(card.id, 50, 0)["total"] == 0
+        assert api.repository.closure_at(card.schedule_id, card.next_index) is None
         assert api.repository.schedule(card.schedule_id).next_index == card.next_index
-        api.advance(card.id)
+        close_one(api, card.id)
         assert api.points(card.id, 50, 0)["total"] == 1
 
 
-def test_explicit_legacy_history_is_frozen_and_concurrent(database, catalog, source):
-    card, body = create(database, catalog, source)
-    start = body.window_start_utc
-    def insert_legacy():
-        with database.session_factory.begin() as session:
-            origin = session.get(Source, source)
-            at = start + timedelta(milliseconds=500)
-            session.add(ParsedLog(source_id=source, connection_id=origin.connection_id,
-                normalizer_version=1, normalizer_name="legacy", source_name=origin.name,
-                connection_name="legacy", kafka_topic=origin.topic_name, kafka_partition=0,
-                kafka_offset=0, deduplication_key=str(uuid4()), fluent_bit_collected_at=at,
-                backend_received_at=at, backend_processed_at=at, raw="synthetic legacy",
-                ecs_data={"@timestamp": "2000-01-01T00:00:00Z"}))
-    insert_legacy()
-    def run():
-        with database.session_factory() as session:
-            api = service(session, catalog)
-            api.repository.progress = lambda: SimpleNamespace(
-                legacy_cutover_at=card.created_at, availability_verified_from_at=None)
-            return api.historical(card.id, HistoricalRequest(window_start_utc=start))
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        points = list(pool.map(lambda _: run(), range(2)))
-    assert points[0].id == points[1].id
-    assert points[0].kind == "historical" and points[0].completeness == "unknown"
-    assert points[0].time_basis == "backend_processed_at_historical"
-    assert points[0].event_count == points[0].features[0].value == 1
-    insert_legacy()
-    assert run().event_count == 1  # A late row never revises the saved snapshot.
+def test_unproven_raw_rows_do_not_create_history_or_mutate_saved_snapshot(database, catalog, source):
+    card, body = create(database, catalog, source, clock_shift=3)
+    with database.session_factory.begin() as session:
+        origin = session.get(Source, source)
+        session.add(ParsedLog(source_id=source, connection_id=origin.connection_id,
+            normalizer_version=1, normalizer_name="legacy", source_name=origin.name,
+            connection_name="legacy", kafka_topic=origin.topic_name, kafka_partition=0,
+            kafka_offset=0, deduplication_key=str(uuid4()), fluent_bit_collected_at=body.window_start_utc,
+            backend_received_at=body.window_start_utc, backend_processed_at=body.window_start_utc,
+            raw="synthetic legacy", ecs_data={"@timestamp": body.window_start_utc.isoformat()}))
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        point = close_one(api, card.id)
+        saved_id, saved_features = point.id, point.features
+        assert point.event_count == 0
+        with pytest.raises(DomainError) as error:
+            api.historical(card.id, HistoricalRequest(window_start_utc=body.window_start_utc))
+        assert error.value.code == "canonical_point_not_ready"
     with database.session_factory.begin() as session:
         session.execute(delete(ParsedLog).where(ParsedLog.source_id == source))
         session.execute(delete(Source).where(Source.id == source))
-    assert run().event_count == 1  # The snapshot also survives source/event deletion.
-    with database.session_factory() as session:
-        api = service(session, catalog)
-        assert api.repository.schedule(card.schedule_id).next_index == card.next_index
-        assert session.scalar(select(func.count()).select_from(AvailabilityMarker).where(AvailabilityMarker.source_identity == source)) == 0
+    def read():
+        with database.session_factory() as session:
+            return service(session, catalog).point_by_id(card.id, saved_id).model_dump()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        points = list(pool.map(lambda _: read(), range(2)))
+    assert points[0] == points[1]
+    assert points[0]["features"] == saved_features
 
 
 def test_worker_one_error_does_not_block_other_aggregate(database, catalog):
@@ -408,6 +390,26 @@ def test_worker_uses_only_declared_service_scenarios(database, catalog):
     worker.tick()
     assert seen == ids
     assert errors == [(ids[0], "aggregate_timeout"), (ids[1], None)]
+
+
+@pytest.mark.parametrize("result,idle", [
+    ({"state": "waiting_close_deadline"}, True), ({"state": "history_waiting"}, True),
+    ({"state": "scanned", "records": 499}, True), ({"state": "scanned", "records": 500}, False),
+    ({"state": "closed"}, False),
+])
+def test_worker_backs_off_idle_turns_but_keeps_full_pages_and_closes_ready(database, catalog, monkeypatch, result, idle):
+    from app.services.implementations import aggregate_worker as module
+    identity, calls, clock = uuid4(), [], [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    api = SimpleNamespace(due=lambda _: [identity], record_worker_error=lambda *_: None,
+        advance=lambda target: (calls.append(target), result)[1])
+    worker = AggregateWorker(database.session_factory, lambda *_: api, catalog, Event())
+    worker.tick()
+    worker.tick()
+    assert len(calls) == (1 if idle else 2)
+    clock[0] += .25
+    worker.tick()
+    assert len(calls) == (2 if idle else 3)
 
 
 def test_worker_slow_aggregate_does_not_hold_unrelated_one(database, catalog):
@@ -454,8 +456,9 @@ def test_definition_and_schedule_are_immutable_but_copy_creates_new_uuid(databas
 def test_preview_budget_refuses_before_calculation(database, catalog, source):
     with database.session_factory() as session:
         api = service(session, catalog)
-        api.repository.estimate_rows = lambda *_: (100001, 100001, 256)
-        api.repository.calculate = lambda *_: pytest.fail("over-budget preview was calculated")
+        api.repository.snapshot_events = lambda *_: ([], [], 100001, 256)
+        api.repository.event_source_rows = lambda *_: 100001
+        api.repository.event_statistics = lambda *_: pytest.fail("over-budget preview was calculated")
         with pytest.raises(DomainError) as error:
             api.preview(request(source))
         assert error.value.code == "resource_budget_exceeded"
@@ -464,41 +467,38 @@ def test_preview_budget_refuses_before_calculation(database, catalog, source):
 
 def test_runtime_timeout_rolls_back_point_and_cursor(database, catalog, source):
     card, _ = create(database, catalog, source, clock_shift=3)
-    with database.session_factory() as session, pytest.raises(WindowNotReady):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
         api = service(session, catalog)
-        api.budget_limits = replace(api.budget_limits, working_timeout_ms=20)
         def slow(*_):
+            api.repository.read_budget(20)
             session.execute(select(func.pg_sleep(.1)))
             pytest.fail("statement_timeout did not interrupt the calculation")
-        api.repository.calculate = slow
+        api.repository.event_statistics = slow
         with pytest.raises(DomainError) as error:
-            api.advance(card.id)
+            close_one(api, card.id)
         assert error.value.code == "aggregate_timeout"
         assert api.repository.schedule(card.schedule_id).next_index == card.next_index
         assert api.points(card.id, 50, 0)["total"] == 0
 
 
-def test_serialization_conflict_recalculates_from_fresh_transaction(database, catalog, source):
+def test_serialization_conflict_requires_new_turn_without_restarting_whole_budget(database, catalog, source):
     card, _ = create(database, catalog, source, clock_shift=3)
-    with database.session_factory() as session, pytest.raises(WindowNotReady):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
         api = service(session, catalog)
-        original, calls = api.repository.calculate, []
+        original, calls = api.repository.event_statistics, []
         def conflict(*args):
             values = original(*args)
             calls.append(True)
             if len(calls) == 1:
                 raise DBAPIError(None, None, SerializationFailure("synthetic serialization conflict"))
             return values
-        api.repository.calculate = conflict
-        api.advance(card.id)
+        api.repository.event_statistics = conflict
+        with pytest.raises(DomainError) as error:
+            close_one(api, card.id)
+        assert error.value.code == "aggregate_retry_required" and len(calls) == 1
+        assert api.repository.schedule(card.schedule_id).next_index == card.next_index
+        close_one(api, card.id)
         assert len(calls) == 2
-        assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
         assert api.points(card.id, 50, 0)["total"] == 1
 
 @pytest.mark.parametrize('op', ['median', 'percentile', 'mode_count', 'mode_share'])
@@ -510,8 +510,9 @@ def test_exact_materialization_budget_refuses_before_query(database, catalog, so
         **({'percentile': .5} if op == 'percentile' else {})}]})
     with database.session_factory() as session:
         api = service(session, catalog)
-        api.repository.estimate_rows = lambda *_: (10000, 10000, 10000)
-        api.repository.calculate = lambda *_: pytest.fail('over-budget exact materialization reached SQL')
+        api.repository.snapshot_events = lambda *_: ([], [], 10000, 10000)
+        api.repository.event_source_rows = lambda *_: 10000
+        api.repository.event_statistics = lambda *_: pytest.fail('over-budget exact materialization reached SQL')
         with pytest.raises(DomainError) as error:
             api.preview(body)
         assert error.value.code == 'resource_budget_exceeded'
@@ -562,15 +563,13 @@ def test_array_literal_budget_refuses_preview_and_atomic_point(database, catalog
         checked = api.validate(body)
         card = api.create(CreateAggregateRequest(**body.model_dump(), name='Array budget',
             rule_hash=checked.rule_hash), UUID(int=1), uuid4().hex)
-    with database.session_factory() as session, pytest.raises(WindowNotReady):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
         api = service(session, catalog)
         api.budget_limits = replace(api.budget_limits, cost=1000)
-        api.repository.estimate_rows = lambda *_: (1, 1, 22000)
-        api.repository.calculate = lambda *_: pytest.fail('array budget did not stop calculation')
-        for action in [lambda: api.preview(body), lambda: api.advance(card.id)]:
+        api.repository.snapshot_events = lambda *_: ([], [], 1, 22000)
+        api.repository.event_source_rows = lambda *_: 1
+        api.repository.event_statistics = lambda *_: pytest.fail('array budget did not stop calculation')
+        for action in [lambda: api.preview(body), lambda: close_one(api, card.id)]:
             with pytest.raises(DomainError) as error:
                 action()
             assert error.value.code == 'resource_budget_exceeded'
@@ -628,36 +627,33 @@ def test_bad_date_commits_quality_point_and_cursor_without_retry(database, catal
             kafka_offset=0, deduplication_key=str(uuid4()), fluent_bit_collected_at=at,
             backend_received_at=at, backend_processed_at=at, raw='synthetic date',
             ecs_data={'@timestamp': occurred, 'event': {'created': value}})
-        session.add(event)
-        session.flush()
+        from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
+        record = ProcessedKafkaRecord(id=uuid4(), connection_id=origin.connection_id,
+            connection_identity=origin.connection_id, kafka_topic_identity="synthetic",
+            source_id=source, kafka_topic=origin.topic_name, kafka_partition=0, kafka_offset=0,
+            result_status="complete", backend_received_at=at, backend_processed_at=at)
+        event.ecs_data = {"@timestamp": at.isoformat(), "event": {"created": value, "original": occurred}}
+        assert SqlAlchemyProcessingRepository(session).store_event(record, event)
         event_id = event.id
-        session.add(AvailabilityMarker(id=uuid4(), source_identity=source, kind='event',
-            event_id=event_id, created_at=at, availability_at=at))
-    with database.session_factory() as session, pytest.raises(WindowNotReady):
-        service(session, catalog).advance(card.id)
-    materialize(database, source)
     with database.session_factory() as session:
         api = service(session, catalog)
-        point = api.advance(card.id)
+        point = close_one(api, card.id)
         assert point.event_count == 1 and point.features[0]['value'] == 1
         assert point.features[1] == {'key': 'mode', 'value': None, 'reason': 'invalid_input_type',
                                      'valid_count': 0, 'invalid_count': 1}
         assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
         saved_id, saved_features = point.id, point.features
-        # Retry reaches the next window's barrier, never rewrites the bad point.
-        with pytest.raises(WindowNotReady):
-            api.advance(card.id)
-        assert api.points(card.id, 50, 0)['total'] == 1
+        assert api.point_by_id(card.id, point.id).id == point.id
         assert api.repository.schedule(card.schedule_id).next_index == card.next_index + 1
     with database.session_factory.begin() as session:
-        session.get(ParsedLog, event_id).ecs_data = {'@timestamp': occurred,
+        session.get(ParsedLog, event_id).ecs_data = {'@timestamp': at.isoformat(),
                                                     'event': {'created': '2000-01-01T00:00:00Z'}}
     with database.session_factory() as session:
         for zone in ['UTC', 'America/New_York', 'Pacific/Kiritimati']:
             session.execute(select(func.set_config('TimeZone', zone, True)))
             saved = service(session, catalog).points(card.id, 50, 0)['items'][0]
             assert saved.id == saved_id and [item.model_dump() for item in saved.features] == saved_features
-            assert saved.event_time_min == saved.event_time_max == datetime.fromisoformat(occurred)
+            assert saved.event_time_min == saved.event_time_max == at
 
 
 def test_saved_historical_utc_bounds_are_read_without_timezone_overflow(database, catalog, source):

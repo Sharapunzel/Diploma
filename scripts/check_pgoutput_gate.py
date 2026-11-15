@@ -33,7 +33,6 @@ from app.adapters.pgoutput import PgOutputDecoder
 from app.adapters.pgoutput_stream import ReplicationStream
 from app.adapters.replication_slot import PostgreSQLReplicationSlotAdapter
 from app.models import (
-    AggregateSchedule,
     ParsedLog,
     ProcessedKafkaRecord,
     Source,
@@ -47,9 +46,6 @@ from app.repositories.sqlalchemy.availability import (
 )
 from app.repositories.sqlalchemy.capture import (
     SqlAlchemyCaptureStateRepository,
-)
-from app.repositories.sqlalchemy.evidence import (
-    SqlAlchemyCoverageEvidenceRepository,
 )
 from app.repositories.sqlalchemy.windows import (
     SqlAlchemyWorkingWindowRepository,
@@ -501,31 +497,16 @@ def main():
                 time.sleep(0.05)
             assert actual is not None and actual == expected
             print("Processing repository saved event and its actual commit marker atomically", flush=True)
-            # Exercise the application barrier with a writer that starts before
-            # the scheduled end and commits after it while holding the source lock.
-            schedule_id = uuid4()
+            # Capture retains a source-locked barrier, independently of the
+            # removed availability aggregate execution. Verify commit ordering.
             anchor = actual - timedelta(seconds=1)
             boundary = anchor + timedelta(seconds=5)
-            with sessions.begin() as session:
-                session.add(AggregateSchedule(id=schedule_id, source_identity=source_id,
-                                              anchor_utc=anchor, duration_seconds=5))
-            def window_service(session):
-                from types import SimpleNamespace
-
-                from app.dependencies import build_aggregate_service
-                from app.ecs import PackagedEcsCatalog
-                aggregate_service = build_aggregate_service(session, PackagedEcsCatalog.load())
-                rule = {"features": [{"key": "n", "name": "Count", "op": "count"}]}
-                return working_windows.WorkingWindowService(
+            def barrier_service(session):
+                return working_windows.CaptureBarrierService(
                     SqlAlchemyWorkingWindowRepository(session),
-                    SqlAlchemyCoverageEvidenceRepository(session),
                     CaptureGuard(SqlAlchemyCaptureStateRepository(session),
-                                 PostgreSQLReplicationSlotAdapter(session),
-                                 min_safe_bytes=8 * 1024 * 1024),
-                    SqlAlchemyUnitOfWork(session),
-                    calculator=lambda stored, window: aggregate_service._working_calculation(
-                        SimpleNamespace(rule=rule), stored, window),
-                )
+                        PostgreSQLReplicationSlotAdapter(session), min_safe_bytes=8 * 1024 * 1024),
+                    SqlAlchemyUnitOfWork(session))
             writer = sessions()
             writer.begin()
             barrier_result = []
@@ -541,7 +522,7 @@ def main():
                 def close_barrier():
                     try:
                         with sessions() as session:
-                            barrier_result.append(window_service(session).prepare_barrier(schedule_id))
+                            barrier_result.append(barrier_service(session).prepare(source_id))
                     except Exception as exc:  # noqa: BLE001 - relay any worker failure to the main thread
                         barrier_error.append(exc)
                 waiter = threading.Thread(target=close_barrier)
@@ -568,27 +549,12 @@ def main():
                     break
                 time.sleep(0.05)
             assert barrier_time is not None
+            late_time = db.execute("SELECT availability_at FROM logs.availability_markers WHERE event_id=%s", (late_entry.id,)).fetchone()[0]
+            assert actual < boundary <= late_time <= barrier_time
             with sessions() as session:
-                point = window_service(session).close_next_window(schedule_id)
-                assert point.event_count == 1 and point.completeness == "unknown"
-                assert point.features == [{"key": "n", "value": 1, "reason": None, "valid_count": 1, "invalid_count": 0}]
-                assert point.event_time_min == point.event_time_max == datetime(2000, 1, 1, tzinfo=UTC)
-            db.execute("SELECT pg_sleep(greatest(0, extract(epoch from %s - clock_timestamp())))", (boundary + timedelta(seconds=5),))
-            with sessions() as session:
-                second_id = window_service(session).prepare_barrier(schedule_id)
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                second_time = db.execute("SELECT availability_at FROM logs.availability_markers WHERE id=%s", (second_id,)).fetchone()[0]
-                if second_time is not None:
-                    break
-                time.sleep(0.05)
-            assert second_time is not None
-            with sessions() as session:
-                point = window_service(session).close_next_window(schedule_id)
-                assert point.event_count == 1 and point.completeness == "unknown"
-                assert point.features[0]["value"] == 1
-                assert point.event_time_min == point.event_time_max == datetime(2000, 1, 1, tzinfo=UTC)
-            print("Application barrier waited for writer; before/after commits landed in successive windows", flush=True)
+                assert barrier_service(session).prepare(source_id, barrier_result[0]) == barrier_result[0]
+            assert db.execute("SELECT count(*) FROM logs.availability_markers WHERE id=%s", (barrier_result[0],)).fetchone()[0] == 1
+            print("Source-locked capture barrier waited for writer and preserved real commit order", flush=True)
             worker.terminate()
             worker.wait(timeout=10)
             worker = None

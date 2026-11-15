@@ -6,6 +6,54 @@
 Compose-режимах. HTTP управления и диагностики и интерфейс TASK-37 описаны ниже.
 Техническая готовность модели не гарантирует качество обнаружения.
 
+С `0021_event_time` новые модели используют событийные canonical points;
+прежние модели необратимо terminated с причиной aggregate_time_semantics_retired.
+Их checkpoint, inputs и находки сохраняются для чтения и не переназначаются
+новой копии агрегата. Новые create/start retired агрегата запрещены, точный
+replay прежней команды возвращает исходную immutable receipt без действия.
+
+Обычный прогрев читает непрерывную последовательность сохранённых canonical
+точек. Cutoff определяется доступной закрытой историей, а не неизвестным хвостом
+до wall-clock now. N_model=max(2*sample_size,output_after+1); требование 8D относится
+только к ускоренному режиму. Unknown/interrupted, очищенные и отсутствующие окна
+не обходятся выбором удобных пригодных строк и не пересчитываются свежим raw.
+Evaluation начинается с max(online_start_index,cutoff_index), initial_history
+не создаёт ретронаходок.
+
+Ускоренный overlap рассчитывается по точному membership базовых закрытых окон
+ДО where и проверяет SHA-256 исходных JSONB/диагностики. Новые late не входят
+в batch; missing/изменённые/очищенные необходимые данные дают объяснённый отказ.
+Prepared inputs самодостаточны, сохраняются после stop и повторно используются
+при новом start той же конфигурации. Их не заменяет новый снимок raw.
+Официальные AWS ядро/affine/порядок признаков и бюджеты сохраняются.
+
+Пауза агрегата сохраняет разрешение, модель и курсор, отменяя stale candidates.
+Unpause фиксирует recovery aggregate_resume по уже наступившим close deadlines;
+это отличается от late-event ledger. Stopped модель автоматически не запускается.
+В DTO видны aggregate_semantic_basis/execution_mode/paused, nominal scheduled_at
+и отдельно close_not_before_at; backlog/lag рассчитываются от close deadline.
+
+Находка содержит собственные exact actual/expected, ключи/названия признаков,
+source/window/basis/origin, quality/cohort, model/rule configuration, моменты
+агрегации и оценки, score/grade/confidence и объяснение. Expected берётся у AWS
+с обратным affine либо из медианы предшествующих пригодных входов с отдельным
+expected_origin=preceding_median. Текущая точка в медианный ориентир не входит.
+Expected — ориентир сравнения, не доказанная безопасная норма.
+
+Finding/Outcome используют постоянный origin_point_id через closure, без FK
+к удаляемому payload. После ручной очистки Finding не меняется и остаётся читаемой.
+Outcome становится тонким; для карточки сохраняются максимум две полноценные
+проекции last_consumed/last_evaluated, а не скрытая копия удалённого ряда.
+Очистка защищает диапазоны всех связанных моделей, как описано в
+[контракте агрегатов](aggregates.md#пауза-и-ручная-очистка).
+
+Адресные регрессии нового пути:
+
+```powershell
+python -B scripts/agent_test_profiles.py backend-db --pytest tests/test_event_time_pipeline.py
+python -B scripts/agent_test_profiles.py backend-db --rcf --pytest tests/ml/event_time.py
+```
+
 ## Интерфейс детекторов
 
 Раздел «Аномалии → Детекторы» (`/detectors`) доступен с `detectors.read`.
@@ -119,8 +167,8 @@ constraint `(actor_id,action,key)` и предметное изменение ф
 операции без HTTP-журнала и сохраняет прежние результаты. Разные команды
 сериализуются lifecycle-блокировками; порядок определяется транзакциями,
 а не временем клика. Незавершённого processing-key после rollback нет.
-Журнал долговечный, без TTL; downgrade 0020 сознательно удаляет его и новые
-права, сохраняя существующие модели, историю и остальные права/сессии.
+Журнал долговечный, без TTL. Начиная с 0021 downgrade непустой подсистемы
+запрещён: старые квитанции, модели и история не удаляются ради возврата схемы.
 
 При потере ответа нельзя автоматически создавать новый ключ или обещать,
 что изменение не произошло. `503 detector_command_unconfirmed` содержит
@@ -174,7 +222,7 @@ Skipped продвигает только consumed, поэтому last_evaluate
 | last_failure | `{reason,at,start_request_id}` либо null; прошлый failure не подменяет reason текущего запуска |
 | warmup | Сводка активной сохранённой попытки либо null, когда попытки ещё нет или её batch пуст |
 | recovery | Последний диапазон `{reason,first_index,last_index,started_at}` либо null; reason=crash_recovery/manual_resume |
-| next_scheduled_at/waiting_for_point | Следующий срок с учётом intentional archive / отсутствие готовой точки; null до границы оценки |
+| next_scheduled_at/next_close_not_before_at/waiting_for_point | Конец следующего окна / его close deadline с учётом intentional archive / отсутствие готовой точки; null до границы оценки |
 
 Warmup содержит cutoff, step_seconds, required_windows (минимум ModelConfig),
 planned_windows, materialized_windows, feature_valid_windows, eligible_windows,
@@ -212,7 +260,8 @@ python -B scripts/agent_test_profiles.py backend-db --pytest tests/test_detector
 
 Тесты используют настоящий app/router/session/CSRF и PostgreSQL, независимые
 соединения, rollback/потерю acknowledgement, lifecycle/replay, bounded projections,
-UTC, миграцию 0019→0020 и downgrade/upgrade. Полные проверки ревью выбирает
+UTC и безопасный отказ downgrade с данными. Пустой downgrade/upgrade и
+переход заполненной 0020→0021 проверяет test_event_time_migration.py. Полные проверки ревью выбирает
 Этапный архитектор по влиянию; новый API не добавляет frontend-потребителя.
 
 ## Воспроизведение
@@ -239,6 +288,38 @@ Gate расположен в `backend/tests/ml/rcf_gate.py`: имя намере
 Python/JVM-процесс; JVM не наследуется через fork и не перезапускается в процессе.
 Heap ограничен 512 MiB, контейнер — 1 GiB/2 CPU, каждый дочерний вызов — 120 с,
 весь verification-вызов — 600 с. Нет пользовательского Java HTTP-сервиса.
+
+## Lifetime JVM и модели
+
+Composition root владеет одним ленивым `ModelRuntime` через серверный adapter.
+Standby не запускает child. Один координатор передаёт ровно один запрос;
+конкурентный вызов отвергается без очереди. Child повторно использует загруженную
+JVM и библиотеки, но каждый warmup создаёт отдельную модель, а каждый advance
+восстанавливает новую из переданного подтверждённого checkpoint/config/keys/rule.
+Модель, mapper, inputs и outputs предыдущего запроса не остаются источником состояния.
+Child не читает БД и не подтверждает курсоры. Финальные owner/generation/revision,
+lifecycle, CAS и атомарный UoW остаются в родительском сервисе. При неизвестном
+commit источником истины служит БД, а не последний ответ процесса.
+
+IPC: 4-byte unsigned big-endian длина и UTF-8 JSON; UUID запроса и action
+должны совпадать в ответе. Кадр ограничен 129 MiB (два бюджета по 64 MiB плюс
+1 MiB envelope), прежние 64 MiB inputs/checkpoint не увеличены. Один I/O-поток
+на единственный RPC, без очереди ответов; он завершается до возврата управления.
+Общий deadline 120 с включает startup, кодирование, запись и чтение ответа.
+Ничего не усекается. EOF, malformed/oversized/wrong-id frame, timeout и сбой child
+инвалидируют транспорт: kill, reap, закрытие pipe и завершение I/O-потока.
+Следующий допустимый запрос создаёт новый child; failed initial start сам не повторяется.
+Потеря owner и SIGTERM/SIGINT закрывают весь runtime этого владельца до ожидания
+executor; новый владелец получает новый транспорт. Зависший RPC не блокирует heartbeat.
+
+Cold-process путь `python -m app.detection.model_process` используется только
+независимым тестовым reference; worker всегда использует framed `--serve`.
+Оба пути вызывают одну расчётную функцию и официальный mapper. Постоянная
+регрессия чередует два detector/config, сравнивает результаты, положительные
+решения/объяснения и полный следующий checkpoint, повторяет discarded candidate
+из неизменённого checkpoint, сверяет PID и ограниченность RSS. Выводит безопасные
+cold/warm init/restore/process/checkpoint timings. Worker heartbeat содержит
+ограниченные runtime timings без данных модели и секретов.
 
 ## Зависимости и состояние
 
@@ -330,7 +411,7 @@ null, nonfinite, invalid_count и reason отвергают весь векто�
 Достоверно пустое окно с пригодным count=0 допускается; статистический null
 не заменяется нулём.
 
-Cutoff — последняя завершённая UTC-граница до начала попытки.
+Cutoff — конец последнего доступного сохранённого canonical окна.
 N_model=max(2*sampleSize,outputAfter+1), по умолчанию 512. Обычный шаг=duration;
 ускоренный — целые секунды 0<step<=duration. Ускоренный план имеет
 max(N_model,1+ceil(7*duration/step)) окон и охват >=8*duration; перекрытия
@@ -339,25 +420,13 @@ max(N_model,1+ceil(7*duration/step)) окон и охват >=8*duration; пер
 без усечения. Бюджеты: 4096 окон, 30 с подготовки всего batch,
 64 MiB inputs и 64 MiB checkpoint.
 
-Обычная попытка может целиком использовать сохранённую working-последовательность,
-если все её окна имеют `complete`. Наличие всех строк с `unknown/interrupted`
-не подтверждает пригодность batch: тогда он целиком пересчитывается по барьеру
-новой попытки. Закрытые working points не меняются; отчёт, полученный после их
-барьера, может подтвердить только новый исторический снимок, если он получен до
-барьера этой попытки. Реальный gap и поздний относительно неё отчёт сохраняют `unknown`.
-Иначе весь batch, включая перекрывающиеся окна, рассчитывается через агрегатный
-компилятор и сохранённые coverage evidence. Барьер закреплён за попыткой:
-`uuid5(attempt_id, "warmup")`; чужие более новые барьеры его не заменяют.
-Короткие чтения с rollback между опросами ждут материализации этого барьера
-и свежего post-barrier checkpoint без lifecycle-lock и открытого RR.
-Ожидание, SQL/lock wait и расчёт входят в общий бюджет 30 с. Затем новый
-read-only REPEATABLE READ UoW заново проверяет барьер и все доказательства,
-читает весь batch из одного снимка. Свежесть checkpoint — прежние 10 с
-от одной опорной даты БД этого снимка, не плавающего времени каждого окна.
-При гонке готовности выбрасывается весь batch; повтор ограничен тем же
-deadline/attempt/cutoff. Истечение бюджета завершает старт с resource_limit
-и требует нового ручного действия. Старые точки
-не подмешиваются к пересчёту. Legacy без доказательств остаётся непригодной.
+Обычная попытка использует всю непрерывную canonical последовательность.
+Unknown/interrupted или отсутствующая точка дают отказ без raw fallback.
+Ускоренные перекрытия читают исходники через exact membership с fingerprint;
+поздние события в batch не добавляются. Весь batch читается в одном read-only
+REPEATABLE READ вне lifecycle-lock; каждый SQL получает остаток общего бюджета.
+До записи проверяются schedule generation, pause/cleanup, revision/attempt_id.
+Превышение бюджета сохраняет объяснённый неуспех без частичного batch.
 Короткий write-UoW повторно проверяет lifecycle/revision/active_attempt_id,
 сохраняет план и весь batch. Inputs содержат точные FeatureResult, quality/evidence,
 границы/основание, affine и ML-вход. DB-trigger запрещает менять inputs после
@@ -383,10 +452,12 @@ Waiting означает отсутствие пригодного прогре�
 не затирая более новый успех или удаление. Новая попытка имеет
 собственные UUID/cutoff/inputs hash и не переписывает прежнюю.
 
-Порядок блокировок: schedule агрегата → Source только для барьера → Detector
+Порядок блокировок: schedule агрегата → Detector
 по UUID. Ожидание SQL-блокировки ограничено 5 с, statement timeout — 30 с.
-Долгий ML выполняется без lifecycle-lock в новом Python/JVM-процессе
-на каждый кандидат (120 с, heap 512 MiB). Финальная транзакция сверяет lifecycle,
+Долгий ML выполняется без lifecycle-lock в одном управляемом дочернем
+Python/JVM-runtime владельца worker (120 с на RPC, heap 512 MiB).
+Каждый кандидат создаёт новую модель из переданного checkpoint БД; изменённый
+лес предыдущего запроса не переиспользуется. Финальная транзакция сверяет lifecycle,
 config/revision, active attempt и consumed cursor. Одна mutation сохраняет
 checkpoint, consumed/evaluated cursor, outcome и optional finding. Unique
 по detector/input и CAS исключают дубль. DB-trigger защищает определение
@@ -462,9 +533,9 @@ Stop повышает поколение и revision до возврата, от
 соседние детекторы. Повтор stop безопасен.
 
 Неудачный прогрев не повторяется после polling, новых данных или рестарта.
-Pending WAL-барьер — ожидание той же попытки, а не новый cutoff. Начатый
-первоначальный запуск после потери координатора получает start_interrupted и
-ждёт ручного start. Ещё не принятый requested допустимо выполнить после рестарта.
+Начатый первоначальный запуск после потери координатора при работающем
+агрегате получает start_interrupted и ждёт ручного start. Если агрегат на паузе,
+разрешение/подготовленные inputs сохраняются до unpause, включая смену владельца. Ещё не принятый requested допустимо выполнить после рестарта.
 Потеря acknowledgement разрешается чтением подтверждённой БД.
 
 При checkpoint start проверяет envelope и продолжает прежние модель, cutoff и
@@ -486,7 +557,7 @@ lock-сессии и время БД. Получение поколения пр
 Сервисный сценарий проверяет физический lock и фиксирует поколение отдельной
 короткой транзакцией до recovery; при ошибке выполняется rollback и переизбрание.
 Публикация takeover и финальный save сериализованы блокировкой этой записи.
-Порядок: coordinator → schedule → Source только для барьера → Detector.
+Порядок: coordinator → schedule → Detector.
 Start/stop/delete используют schedule → Detector и не ждут ML.
 
 Перед mutation и непосредственно перед commit проверяются session lock в
@@ -502,11 +573,11 @@ JVM-модель не переиспользуется.
 До восполнения running-моделей сохраняются detector_recoveries: первый и
 последний уже наступившие непотреблённые индексы, время БД, поколение и причина
 crash_recovery. Граница выводится из UTC anchor/duration, evaluation_start,
-consumed и scheduled_at, без поиска materialized points. Повторный takeover не
+consumed и close_not_before_at, без поиска materialized points. Повторный takeover не
 стирает диапазоны; точка, появившаяся позже, сохраняет происхождение. Ручное
 возобновление сохраняет manual_resume. Outcome и находка содержат применённые
 диапазоны; finding получает late=true. Обычная задержка polling late не создаёт.
-При сроках 10:00/10:05 восстановление в 10:01 уже помечает находку за 10:00.
+При close deadlines 10:00/10:05 восстановление в 10:01 уже помечает находку за 10:00.
 
 State читает один REPEATABLE READ snapshot: модель, execution state, запрос,
 безопасную причину, inputs/summary/🔥, recovery, последнее consumed/evaluated окно,
@@ -540,7 +611,8 @@ unhealthy. Standby/отсутствие моделей допустимы. Вы�
 продолжением и ограниченной выборкой обслуживает модели после первых N.
 
 Полный backend-db --rcf включает tests/ml/rcf_worker.py (CLI, health/deadline,
-отмена процесса) и расширенные rcf_service.py (управление, fencing,
+отмена загруженной JVM, cold/warm replay), tests/test_model_runtime.py (IPC faults)
+и расширенные rcf_service.py (управление, fencing,
 standby/takeover, recovery/late), прежние модельные и миграционные тесты.
 Адресная проверка изменённой поставки:
 
@@ -553,18 +625,19 @@ python -B scripts/agent_test_profiles.py smoke-production --detector-only
 затронутой поставки worker перед коммитом. UI/OIDC/TLS-agent не добавляются,
 если их пути не затронуты; ограничения запуска лишних сервисов описаны в
 [инструкции профилей](agent-test-profiles.md). Полные smoke и собственный E2E
-выбираются по влиянию либо при полной приёмке этапа; они также включают сценарий: два источника, synthetic saved history,
-обычный/ускоренный режим (здесь шаг=duration; перекрытие проверяет ML/DB),
-реальные WAL/aggregate/RCF worker, обычная/аномальная последовательность,
-сохранённое объяснение и завершение до следующей 5-секундной границы.
-API временно остановлен только на время синтетического обработчика/probe,
-чтобы реальный Kafka-consumer не присваивал его тестовые topic identities.
-Источники включены во время этого входа; после сценария они выключаются и API
-возвращается. Признаки остановки не удаляются и не обходятся.
-Синтетические доказательства синхронизируются тестовой блокировкой первой
-проверки покрытия до готовности реальных WAL-барьеров и свежих checkpoint;
-правила полноты не меняются. Блокировка снята до RCF и входит в замер от
-scheduled_at до подтверждённой видимости обоих outcomes в БД.
-Прежний секундный aggregate smoke сохраняет порог. Running up и down/up проверяют
-сохранность ручной остановки, checkpoint/inputs/history. Предел произвольной
-нагрузки этим сценарием не измеряется.
+выбираются по влиянию либо при полной приёмке этапа. Серверный event-time
+сценарий использует два включённых источника, D=5, три настоящие модели,
+обычный и ускоренный overlap (шаг 1 с), находки, late ledger, паузу/restart/catch-up
+и очистку с независимой защитой моделей одного агрегата. Замер штатных оценок
+начинается с окон, открытых после готовности всех моделей: подтверждение оценки
+не позднее 5 с после close deadline. Накопленные при первоначальных Java-прогревах
+окна остаются backlog запуска. Искусственные complete/модели не назначаются.
+HTTP идёт через обычный proxy; Kafka consumers API выключены, поскольку тестовый
+writer сам владеет своими processing identities. Running up --build/down/up
+проверяют checkpoint/inputs/findings/остановку. Это ограниченный сценарий,
+без обещания произвольной нагрузки. UI39/browser адаптируются задачей 41.
+
+```powershell
+python -B scripts/agent_test_profiles.py smoke-development --aggregate-only
+python -B scripts/agent_test_profiles.py smoke-production --aggregate-only
+```

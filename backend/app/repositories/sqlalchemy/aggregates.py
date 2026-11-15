@@ -3,26 +3,29 @@
 from datetime import UTC
 from uuid import UUID
 
-from sqlalchemy import Text, exists, func, select, text, update
+from sqlalchemy import Text, func, select, update
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.orm.attributes import set_committed_value
 
-from ...aggregation.rules import CompiledRule, Limits
+from ...aggregation.rules import Limits
 from ...models import (
     Aggregate,
     AggregateSchedule,
-    AvailabilityMarker,
     HistoricalAggregatePoint,
     ParsedLog,
-    ReplicationProgress,
     Source,
     WorkingWindowPoint,
 )
-from .aggregate_compiler import aggregate_statement, read_statistics
+from .aggregate_cleanup import SqlAlchemyAggregateCleanupQueries
+from .aggregate_discovery import SqlAlchemyAggregateDiscovery
+from .aggregate_event_time import SqlAlchemyEventTimeQueries
 from .aggregate_field_catalog import SqlAlchemyFieldCatalogQueries
+from .aggregate_overlap import SqlAlchemyAggregateOverlapQueries
 
 
-class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
+class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries, SqlAlchemyEventTimeQueries,
+                                   SqlAlchemyAggregateDiscovery, SqlAlchemyAggregateCleanupQueries,
+                                   SqlAlchemyAggregateOverlapQueries):
     def __init__(self, session: Session):
         self.session = session
 
@@ -36,15 +39,6 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
         for setting in ("statement_timeout", "lock_timeout"):
             self.session.execute(select(func.set_config(setting, str(milliseconds), True)))
 
-    def history_barrier(self, marker_id, source_id, cutoff):
-        return self.session.scalar(select(AvailabilityMarker).where(
-            AvailabilityMarker.id == marker_id,
-            AvailabilityMarker.kind == "barrier",
-            AvailabilityMarker.source_identity == source_id,
-            AvailabilityMarker.created_at >= cutoff,
-            AvailabilityMarker.availability_at >= cutoff,
-        ).execution_options(populate_existing=True))
-
     def limits(self, limits: Limits, preview: bool):
         timeout = limits.preview_timeout_ms if preview else limits.working_timeout_ms
         self.session.execute(select(func.set_config("statement_timeout", str(timeout), True)))
@@ -55,20 +49,15 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
         self.session.execute(select(func.set_config("jit", "off", True)))
 
     def _base(self, source_id, start, end, basis):
-        query = select(ParsedLog.ecs_data).where(ParsedLog.source_id == source_id)
-        if basis == "availability_at":
-            query = query.join(AvailabilityMarker, AvailabilityMarker.event_id == ParsedLog.id)
-            query = query.where(AvailabilityMarker.source_identity == source_id,
-                                AvailabilityMarker.kind == "event")
-            clock = AvailabilityMarker.availability_at
-        else:
-            clock = ParsedLog.backend_processed_at
-            if basis == "legacy_markerless":
-                query = query.where(~exists(select(1).where(AvailabilityMarker.event_id == ParsedLog.id)))
+        if basis != "event_time":
+            raise ValueError("legacy_calculation_removed")
+        from .aggregate_event_time import classified_events
+        events = classified_events(source_id, self.now())
+        query = select(events.c.ecs_data).where(events.c.reason.is_(None))
         if start is not None:
-            query = query.where(clock >= start)
+            query = query.where(events.c.event_time >= start.astimezone(UTC).replace(tzinfo=None))
         if end is not None:
-            query = query.where(clock < end)
+            query = query.where(events.c.event_time < end.astimezone(UTC).replace(tzinfo=None))
         return query
 
     def estimate_rows(self, source_id, start, end, basis, before_read=None):
@@ -81,24 +70,6 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
         total = self.session.scalar(select(func.count()).select_from(ParsedLog).where(ParsedLog.source_id == source_id))
         return rows, total, (size or 0) + 64
 
-    def calculate(self, source_id, start, end, basis, compiled: CompiledRule):
-        base = self._base(source_id, start, end, basis).subquery()
-        return read_statistics(self.session.execute(aggregate_statement(base, compiled)).mappings().one(), compiled)
-
-    def progress(self):
-        return self.session.get(ReplicationProgress, 1)
-
-    def coverage_barrier(self, source_id, end):
-        return self.session.scalar(select(AvailabilityMarker).where(
-            AvailabilityMarker.source_identity == source_id, AvailabilityMarker.kind == "barrier",
-            AvailabilityMarker.created_at >= end, AvailabilityMarker.availability_at >= end)
-            .order_by(AvailabilityMarker.availability_at.desc()).limit(1))
-
-    def markerless(self, source_id, start, end):
-        return self.session.scalar(select(exists(select(1).select_from(ParsedLog).where(
-            ParsedLog.source_id == source_id, ParsedLog.backend_processed_at >= start,
-            ParsedLog.backend_processed_at < end,
-            ~exists(select(1).where(AvailabilityMarker.event_id == ParsedLog.id))))))
 
     def idempotency_lock(self, key):
         self.session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(key, 0))))
@@ -117,6 +88,8 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
 
     def schedule(self, schedule_id, lock=False):
         query = select(AggregateSchedule).where(AggregateSchedule.id == schedule_id)
+        if lock:
+            query = query.execution_options(populate_existing=True)
         return self.session.scalar(query.with_for_update() if lock else query)
 
     def refresh(self, aggregate):
@@ -159,15 +132,13 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries):
         items = self._point_rows(select(HistoricalAggregatePoint).where(HistoricalAggregatePoint.aggregate_id == aggregate_id, HistoricalAggregatePoint.start_utc == start), HistoricalAggregatePoint)
         return items[0] if items else None
 
-    def add_historical(self, point):
-        self.session.add(point)
-        self.session.flush()
 
     def due(self, limit=100):
-        return list(self.session.scalars(select(Aggregate.id).join(AggregateSchedule, Aggregate.schedule_id == AggregateSchedule.id).where(
-            Aggregate.state == "active", AggregateSchedule.anchor_utc +
-            (AggregateSchedule.next_index + 1) * AggregateSchedule.duration_seconds * text("interval '1 second'") <= func.clock_timestamp()
-        ).order_by(Aggregate.last_error_at.asc().nullsfirst(), AggregateSchedule.anchor_utc + (AggregateSchedule.next_index + 1) * AggregateSchedule.duration_seconds * text("interval '1 second'"), Aggregate.id).limit(limit)))
+        return list(self.session.scalars(select(Aggregate.id).join(AggregateSchedule,
+            Aggregate.schedule_id == AggregateSchedule.id).where(
+                (Aggregate.execution_mode == "current") & (Aggregate.state != "deleted")
+                | AggregateSchedule.active_cleanup_id.is_not(None)
+            ).order_by(Aggregate.last_error_at.asc().nullsfirst(), Aggregate.id).limit(limit)))
 
     def record_error(self, aggregate_id: UUID, code: str | None):
         self.session.execute(update(Aggregate).where(Aggregate.id == aggregate_id).values(last_error=code, last_error_at=func.clock_timestamp()))

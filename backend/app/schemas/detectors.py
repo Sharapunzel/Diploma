@@ -94,6 +94,9 @@ class DetectorWindow(BaseModel):
     evaluation_started_at: UtcDateTime | None
     evaluation_completed_at: UtcDateTime | None
     late: bool
+    time_basis: str = "availability_at"
+    origin: str = "legacy"
+    close_not_before_at: UtcDateTime | None = None
 
 
 class DetectorSummary(BaseModel):
@@ -102,6 +105,9 @@ class DetectorSummary(BaseModel):
     aggregate_id: UUID
     aggregate_name: str
     aggregate_state: Literal["active", "archived", "deleted"]
+    aggregate_semantic_basis: str
+    aggregate_execution_mode: str
+    aggregate_paused: bool
     source_id: UUID
     source_name: str
     created_at: UtcDateTime
@@ -133,7 +139,7 @@ class DetectorWarmupSummary(BaseModel):
 
 
 class DetectorRecoverySummary(BaseModel):
-    reason: Literal["crash_recovery", "manual_resume"]
+    reason: Literal["crash_recovery", "manual_resume", "aggregate_resume"]
     first_index: int
     last_index: int
     started_at: UtcDateTime
@@ -161,6 +167,7 @@ class DetectorCard(DetectorSummary):
     warmup: DetectorWarmupSummary | None
     recovery: DetectorRecoverySummary | None
     next_scheduled_at: UtcDateTime | None
+    next_close_not_before_at: UtcDateTime | None
     waiting_for_point: bool | None
 
 

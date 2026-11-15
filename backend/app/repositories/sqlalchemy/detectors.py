@@ -3,7 +3,7 @@
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from functools import wraps
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import defer
@@ -19,6 +19,7 @@ from ...detection.execution import (
 )
 from ...models import (
     Aggregate,
+    AggregateClosure,
     AggregateSchedule,
     Detector,
     DetectorCommand,
@@ -101,10 +102,13 @@ class SqlAlchemyDetectorRepository:
             raise DetectionError("detector_context_not_found")
         detector = {key: utc(value) for key, value in detector.items()}
         aggregate = self.session.execute(select(Aggregate.schedule_id, Aggregate.name,
-            Aggregate.source_identity, Aggregate.source_name, Aggregate.state
+            Aggregate.source_identity, Aggregate.source_name, Aggregate.state,
+            Aggregate.execution_mode, Aggregate.semantic_basis
             ).where(Aggregate.id == detector["aggregate_id"])).mappings().one()
         schedule = self.session.execute(select(AggregateSchedule.id, AggregateSchedule.anchor_utc,
-            AggregateSchedule.duration_seconds).where(AggregateSchedule.id == aggregate["schedule_id"])).mappings().one()
+            AggregateSchedule.duration_seconds, AggregateSchedule.paused, AggregateSchedule.execution_generation,
+            AggregateSchedule.active_cleanup_id, AggregateSchedule.online_start_index
+            ).where(AggregateSchedule.id == aggregate["schedule_id"])).mappings().one()
         context = {"detector": detector, "aggregate": dict(aggregate),
             "schedule": {key: utc(value) for key, value in schedule.items()},
             "now": utc(self.session.scalar(select(func.clock_timestamp())))}
@@ -151,14 +155,15 @@ class SqlAlchemyDetectorRepository:
         if index is None:
             return None
         row = self.session.execute(select(DetectorOutcome.window_index.label("index"),
-            DetectorOutcome.kind, DetectorOutcome.reason, WorkingWindowPoint.start_utc,
-            WorkingWindowPoint.end_utc, WorkingWindowPoint.scheduled_at,
-            WorkingWindowPoint.actual_started_at.label("aggregation_started_at"),
-            WorkingWindowPoint.actual_completed_at.label("aggregation_completed_at"),
+            DetectorOutcome.kind, DetectorOutcome.reason, AggregateClosure.start_utc,
+            AggregateClosure.end_utc, AggregateClosure.end_utc.label("scheduled_at"),
+            AggregateClosure.snapshot_reference_at.label("aggregation_started_at"),
+            AggregateClosure.closed_at.label("aggregation_completed_at"),
+            AggregateClosure.time_basis, AggregateClosure.origin, AggregateClosure.close_not_before_at,
             DetectorOutcome.data["actual_started_at"].astext.label("evaluation_started_at"),
             DetectorOutcome.data["actual_completed_at"].astext.label("evaluation_completed_at"),
             DetectorOutcome.data["late"].as_boolean().label("late")
-            ).join(WorkingWindowPoint, WorkingWindowPoint.id == DetectorOutcome.working_point_id).where(
+            ).join(AggregateClosure, AggregateClosure.origin_point_id == DetectorOutcome.working_point_id).where(
                 DetectorOutcome.detector_id == detector_id, DetectorOutcome.window_index == index)).mappings().first()
         return {key: utc(value) for key, value in row.items()} if row else None
 
@@ -216,12 +221,11 @@ class SqlAlchemyDetectorRepository:
     def last_result(self, detector_id, index):
         if index is None:
             return None
-        row = self.session.scalar(select(DetectorOutcome).where(DetectorOutcome.detector_id == detector_id,
-            DetectorOutcome.window_index == index))
-        if row is None:
-            return None
-        points = self._points(select(WorkingWindowPoint).where(WorkingWindowPoint.id == row.working_point_id))
-        return {"outcome": snapshot(row), "point": points[0] if points else None}
+        row = self.session.execute(select(Detector.consumed_index, Detector.evaluated_index,
+            Detector.last_consumed_projection, Detector.last_evaluated_projection).where(Detector.id == detector_id)).one()
+        result = (row.last_consumed_projection if index == row.consumed_index else
+                  row.last_evaluated_projection if index == row.evaluated_index else None)
+        return deepcopy(result)
 
     def record_recovery(self, context, reason, generation):
         detector, schedule = context["detector"], context["schedule"]
@@ -230,7 +234,7 @@ class SqlAlchemyDetectorRepository:
         first = (detector["consumed_index"] + 1 if detector["consumed_index"] is not None
                  else detector["evaluation_start_index"])
         # scheduled_at = anchor + (index + 1)*duration, inclusive at DB now.
-        elapsed = (context["now"] - schedule["anchor_utc"]) // timedelta(seconds=schedule["duration_seconds"])
+        elapsed = (context["now"] - schedule["anchor_utc"] - timedelta(seconds=min(schedule["duration_seconds"], 300))) // timedelta(seconds=schedule["duration_seconds"])
         last = elapsed - 1
         if last >= first:
             self.session.add(DetectorRecovery(id=uuid4(), detector_id=detector["id"],
@@ -254,7 +258,9 @@ class SqlAlchemyDetectorRepository:
             detector.start_request_id = uuid4()
             detector.start_requested_at = context["now"]
             if detector.checkpoint is None:
-                detector.active_attempt_id = None
+                prepared = self.session.get(DetectorWarmup, detector.active_attempt_id) if detector.active_attempt_id else None
+                if not prepared or prepared.status != "prepared" or prepared.inputs_hash != digest(prepared.inputs):
+                    detector.active_attempt_id = None
         if state == "running":
             detector.execution_started_at = context["now"]
             detector.state, detector.reason = "ready", None
@@ -345,14 +351,8 @@ class SqlAlchemyDetectorRepository:
         query = select(WorkingWindowPoint).where(
             WorkingWindowPoint.schedule_id == schedule_id,
             WorkingWindowPoint.start_utc.in_(starts))
-        from sqlalchemy import Text
-        if before_read:
-            before_read()
-        size = self.session.scalar(select(func.sum(func.octet_length(
-            WorkingWindowPoint.features.cast(Text)))).where(
-                WorkingWindowPoint.schedule_id == schedule_id, WorkingWindowPoint.start_utc.in_(starts)))
-        if (size or 0) > 64 * 1024**2:
-            raise DetectionError("resource_budget:warmup_input_bytes")
+        from .warmup_payload import warmup_payload_preflight
+        warmup_payload_preflight(self.session, schedule_id, starts, before_read)
         if before_read:
             before_read()
         return self._points(query.order_by(WorkingWindowPoint.window_index))
@@ -431,13 +431,26 @@ class SqlAlchemyDetectorRepository:
         provenance = [{**r, "id": str(r["id"]), "detector_id": str(r["detector_id"]),
                        "started_at": r["started_at"].isoformat()} for r in provenance]
         outcome = {**outcome, "data": {**outcome["data"], "recovery": provenance, "late": bool(provenance)}}
+        def json_value(value):
+            if isinstance(value, (datetime, UUID)):
+                return value.isoformat() if isinstance(value, datetime) else str(value)
+            if isinstance(value, dict):
+                return {k: json_value(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [json_value(v) for v in value]
+            return value
+        projection = json_value({"point": point, "outcome": {**outcome, "window_index": point["window_index"]}})
+        detector.last_consumed_projection = projection
         if outcome["kind"] == "evaluated":
             detector.evaluated_index = point["window_index"]
+            detector.last_evaluated_projection = projection
         self.session.add(DetectorOutcome(id=uuid4(), detector_id=detector.id,
             working_point_id=point["id"], window_index=point["window_index"],
             revision=detector.revision, **outcome))
         if finding is not None:
-            finding = {**finding, "recovery": provenance}
+            finding = {**finding, "recovery": provenance, "late": bool(provenance),
+                "evaluation_started_at": outcome["data"]["actual_started_at"],
+                "evaluation_completed_at": outcome["data"]["actual_completed_at"]}
             self.session.add(Finding(id=uuid4(), detector_id=detector.id,
                 working_point_id=point["id"], created_at=detector.updated_at, late=bool(provenance), data=finding))
         self.session.flush()

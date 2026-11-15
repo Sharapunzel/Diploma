@@ -25,7 +25,7 @@ engine.dispose()
 """
 
 
-def capture_lifecycle(compose, env, production, command, smoke_http, record_volumes):
+def capture_lifecycle(compose, env, production, command, smoke_http, record_volumes, services=None):
     def snapshot():
         output = command([*compose, "exec", "-T", "api", "python", "-c", SNAPSHOT], env=env, capture=True)
         return json.loads(output.strip().splitlines()[-1])
@@ -64,8 +64,8 @@ def capture_lifecycle(compose, env, production, command, smoke_http, record_volu
         if cycle == "down-up":
             command([*compose, "down"], env=env)
             assert volumes() == saved_volumes, "Ordinary down removed persistent volumes"
-        command([*compose, "up", "--build", "-d"], env=env)
-        command([*compose, "up", "-d", "--wait"], env=env)
+        command([*compose, "up", "--build", "-d", *(services or [])], env=env)
+        command([*compose, "up", "-d", "--wait", *(services or [])], env=env)
         check_running()
         record_volumes()
         after = snapshot()

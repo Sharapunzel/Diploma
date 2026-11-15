@@ -17,6 +17,10 @@ class ExecutionOwner:
 
 
 REASONS = {
+    "waiting_close_deadline": "Ожидание фиксированного срока закрытия текущего окна.",
+    "aggregate_time_semantics_retired": "Прежний расчёт остановлен. Создайте новый событийный агрегат через копию и отдельный детектор.",
+    "cleanup_in_progress": "Очистка истории агрегата ещё не завершена.",
+    "aggregate_paused": "Агрегат на паузе; модель и позиция сохранены.",
     "managed_worker_required": "Вычисления выполняет worker. Используйте start и state.",
     "warmup_required": "Требуется явный запуск и подготовка модели.",
     "working_point_pending": "Ожидание следующей готовой точки агрегата.",
@@ -63,7 +67,7 @@ def reason_details(reason):
     """Only declared factors cross the diagnostic boundary, never raw errors."""
     prefix, _, factor = str(reason).partition(":")
     if prefix == "resource_budget" and factor in {
-        "model_seconds", "model_memory", "checkpoint_bytes", "warmup_input_bytes",
+        "model_seconds", "model_memory", "checkpoint_bytes", "warmup_input_bytes", "model_frame_bytes",
         "warmup_windows", "preparation_seconds",
         "preview_rows", "statement_width", "operator_cost", "total_memory", "array_elements",
     }:

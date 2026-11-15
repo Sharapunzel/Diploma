@@ -5,14 +5,8 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from sqlalchemy import create_engine, select, text
-from sqlalchemy.orm import sessionmaker
-
 from app.adapters.pgoutput import DecodedCommit, InvalidReplicationMessage
 from app.models import (
-    AggregateSchedule,
     AvailabilityMarker,
     InputProbe,
     KafkaCheckpoint,
@@ -28,9 +22,13 @@ from app.services.implementations.availability_materializer import AvailabilityM
 from app.services.implementations.input_attestations import canonical_payload, ingest_attestation
 from app.services.implementations.saved_coverage import evaluate_saved_coverage
 from app.services.implementations.working_windows import (
+    CaptureBarrierService,
     WindowNotReady,
-    WorkingWindowService,
 )
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import sessionmaker
 
 
 @pytest.fixture
@@ -68,12 +66,10 @@ def persist_then_ack(sessions, feedback, commit):
         ).apply(commit)
 
 
-def window_service(session):
+def barrier_service(session):
     from types import SimpleNamespace
-    return WorkingWindowService(
-        SqlAlchemyWorkingWindowRepository(session), SqlAlchemyCoverageEvidenceRepository(session),
-        SimpleNamespace(status=lambda: SimpleNamespace(ready=True)), SqlAlchemyUnitOfWork(session),
-    )
+    return CaptureBarrierService(SqlAlchemyWorkingWindowRepository(session),
+        SimpleNamespace(status=lambda: SimpleNamespace(ready=True)), SqlAlchemyUnitOfWork(session))
 
 
 def test_materialization_is_committed_before_feedback_and_replay_is_idempotent(sessions):
@@ -123,8 +119,8 @@ def test_missing_marker_without_an_active_writer_is_not_acknowledged(sessions):
         assert session.get(AvailabilityMarker, marker_id) is None
 
 
-def test_working_window_requires_materialized_barrier_and_advances_once(sessions):
-    source, connection, schedule = uuid4(), uuid4(), uuid4()
+def test_capture_barrier_requires_materialization_and_keeps_identity(sessions):
+    source, connection = uuid4(), uuid4()
     with sessions.begin() as session:
         session.execute(text("""INSERT INTO app.kafka_connections
             (id, name, cluster_identity, bootstrap_servers)
@@ -133,29 +129,23 @@ def test_working_window_requires_materialized_barrier_and_advances_once(sessions
         session.execute(text("""INSERT INTO app.sources
             (id, name, connection_id, topic_name, is_enabled) VALUES (:id, :name, :connection, :topic, true)"""),
             {"id": source, "name": str(source), "connection": connection, "topic": str(source)})
-        session.add(AggregateSchedule(id=schedule, source_identity=source,
-                    anchor_utc=datetime.now(UTC) - timedelta(seconds=2), duration_seconds=1))
     with sessions() as session:
-        marker_id = window_service(session).prepare_barrier(schedule)
+        marker_id = barrier_service(session).prepare(source)
     with pytest.raises(WindowNotReady, match="barrier_not_materialized"), sessions() as session:
-        window_service(session).close_next_window(schedule)
+        barrier_service(session).materialized(marker_id)
     with sessions.begin() as session:
-        marker = session.get(AvailabilityMarker, marker_id)
-        marker.availability_at = datetime.now(UTC)
+        session.get(AvailabilityMarker, marker_id).availability_at = datetime.now(UTC)
     with sessions() as session:
-        point = window_service(session).close_next_window(schedule)
-        assert point.window_index == 0 and point.event_count == 0
-        assert point.event_time_min is None and point.event_time_max is None
-        assert point.completeness == "unknown"
-    with sessions() as session:
-        assert session.get(AggregateSchedule, schedule).next_index == 1
-    with pytest.raises(WindowNotReady, match="barrier_not_materialized"), sessions() as session:
-        window_service(session).close_next_window(schedule)
+        marker = barrier_service(session).materialized(marker_id)
+        assert marker.source_identity == source and marker.kind == "barrier"
+        at = marker.availability_at
+        assert barrier_service(session).prepare(source, marker_id) == marker_id
+        assert session.get(AvailabilityMarker, marker_id).availability_at == at
 
 
-def test_caller_cannot_inject_completeness_evidence():
+def test_capture_barrier_does_not_accept_injected_completeness():
     with pytest.raises(TypeError):
-        WorkingWindowService(None, None, None, None).close_next_window(uuid4(), evidence=[])
+        CaptureBarrierService(None, None, None).prepare(uuid4(), evidence=[])
 
 
 def test_saved_signed_coverage_requires_matching_kafka_checkpoint(sessions):
