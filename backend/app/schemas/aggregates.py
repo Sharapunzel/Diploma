@@ -1,7 +1,7 @@
 """Aggregate API contracts. There is deliberately no update-rule request."""
 
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -72,6 +72,7 @@ class UTCResponse(Node):
 
 
 class BudgetEstimate(Node):
+    execution_policy: "ExecutionPolicy"
     exact_materialized_features: int = 0
     array_elements_limit: int = 4096
     statement_columns: int = 0
@@ -88,6 +89,52 @@ class BudgetEstimate(Node):
     time_guarantee: bool
 
 
+class ExecutionPolicy(Node):
+    policy_version: Literal["window_execution_v1"]
+    soft_latency_seconds: Literal[5]
+    hard_budget_seconds: float = Field(gt=0, le=30, allow_inf_nan=False, strict=True)
+
+
+class ExecutionTimings(Node):
+    selection: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    manifest: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    statistics: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    interpret: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cohorts: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    snapshot: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    save: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    commit: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_serializer(mode="wrap")
+    def known_parts(self, handler):
+        return {key: value for key, value in handler(self).items() if value is not None}
+
+
+class ExecutionDiagnostics(ExecutionPolicy, UTCResponse):
+    calculation_status: Literal["computed", "uncomputed"]
+    calculation_reason: Literal["execution_budget_exceeded"] | None
+    attempt_id: UUID
+    origin: Literal["preview", "online", "initial_history"]
+    window_index: StrictInt | None
+    start_utc: AwareDatetime
+    end_utc: AwareDatetime
+    started_at: AwareDatetime
+    execution_deadline_at: AwareDatetime
+    measured_at: AwareDatetime
+    measured_through: Literal["before_commit", "preview_complete", "finalization"]
+    elapsed_seconds: float = Field(ge=0, allow_inf_nan=False)
+    queue_seconds: float | None = Field(ge=0, allow_inf_nan=False)
+    online_latency_seconds: float | None = Field(ge=0, allow_inf_nan=False)
+    soft_latency_exceeded: bool | None
+    timings: ExecutionTimings
+
+    @model_validator(mode="after")
+    def valid_outcome(self):
+        if (self.calculation_status == "uncomputed") != (self.calculation_reason == "execution_budget_exceeded"):
+            raise ValueError("calculation_reason_mismatch")
+        return self
+
+
 class ValidationResult(UTCResponse):
     rule_hash: str
     anchor_utc: datetime
@@ -101,6 +148,9 @@ class NamedFeatureResult(FeatureResult):
 
 
 class PreviewResult(UTCResponse):
+    calculation_status: Literal["computed"] = "computed"
+    calculation_reason: None = None
+    execution: ExecutionDiagnostics
     rule_hash: str
     start_utc: datetime
     end_utc: datetime
@@ -121,7 +171,35 @@ class PreviewResult(UTCResponse):
     snapshot_metadata: dict = Field(default_factory=dict)
 
 
+class AutoCleanupProtector(Node):
+    detector_id: UUID
+    name: str
+    reason: Literal["unconsumed_points", "frozen_warmup", "prepared_warmup_continuation", "planned_warmup", "insufficient_warmup_history"]
+    protected_from_index: StrictInt
+    protected_to_index: StrictInt | None
+
+
+class AutoCleanupSummary(UTCResponse):
+    policy_version: Literal["model_history_v1"] | None
+    status: Literal["scheduled", "idle", "compacting", "protected", "deferred", "error", "inactive"]
+    reason: str | None
+    checked_at: datetime | None
+    next_check_at: datetime | None
+    reserve_windows: StrictInt | None
+    keep_from_index: StrictInt | None
+    protected_from_index: StrictInt | None
+    auto_cleared_total: StrictInt | None
+    history_revision: StrictInt | None
+    last_cleared_at: datetime | None
+    retained_from_index: StrictInt | None
+    retained_to_index: StrictInt | None
+    protected_total: StrictInt | None
+    protected_by: list[AutoCleanupProtector] = Field(max_length=10)
+
+
 class AggregateCard(UTCResponse):
+    execution_policy: ExecutionPolicy
+    last_execution: ExecutionDiagnostics | None
     id: UUID
     name: str
     source_id: UUID
@@ -156,6 +234,7 @@ class AggregateCard(UTCResponse):
     active_cleanup_id: UUID | None
     next_close_not_before_at: datetime | None
     diagnostics: dict = Field(default_factory=dict)
+    auto_cleanup: AutoCleanupSummary
 
 
 class AggregatePage(Node):
@@ -163,7 +242,7 @@ class AggregatePage(Node):
     total: int
 
 
-class PointCard(UTCResponse):
+class PointIdentity(UTCResponse):
     id: UUID
     aggregate_id: UUID
     kind: Literal["working", "historical"]
@@ -172,6 +251,29 @@ class PointCard(UTCResponse):
     scheduled_at: datetime
     actual_started_at: datetime
     actual_completed_at: datetime
+
+    time_basis: str
+    origin: str = "legacy"
+    window_index: int | None = None
+    close_not_before_at: datetime | None = None
+    payload_state: Literal["present"] = "present"
+
+    @model_validator(mode="after")
+    def matching_execution_identity(self):
+        execution = getattr(self, "execution", None)
+        if execution is not None:
+            duration = (self.end_utc - self.start_utc).total_seconds()
+            if (execution.origin != self.origin or execution.window_index != self.window_index
+                    or execution.start_utc != self.start_utc or execution.end_utc != self.end_utc
+                    or execution.hard_budget_seconds != min(30.0, (4 * duration) / 5)):
+                raise ValueError("execution_window_mismatch")
+        return self
+
+
+class ComputedPointCard(PointIdentity):
+    calculation_status: Literal["computed"] = "computed"
+    calculation_reason: None = None
+    execution: ExecutionDiagnostics | None
     event_count: int
     event_time_min: datetime | None
     event_time_max: datetime | None
@@ -179,13 +281,38 @@ class PointCard(UTCResponse):
     completeness: str
     completeness_reason: str
     evidence_refs: dict
-    time_basis: str
-    origin: str = "legacy"
-    window_index: int | None = None
     snapshot_reference_at: datetime | None = None
-    close_not_before_at: datetime | None = None
-    payload_state: str = "present"
     snapshot_metadata: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def valid_execution(self):
+        if self.execution is not None and self.execution.calculation_status != "computed":
+            raise ValueError("calculation_execution_mismatch")
+        return self
+
+
+class UncomputedPointCard(PointIdentity):
+    calculation_status: Literal["uncomputed"]
+    calculation_reason: Literal["execution_budget_exceeded"]
+    execution: ExecutionDiagnostics
+    event_count: None
+    event_time_min: None
+    event_time_max: None
+    features: None
+    completeness: None
+    completeness_reason: None
+    evidence_refs: None
+    snapshot_reference_at: None
+    snapshot_metadata: None
+
+    @model_validator(mode="after")
+    def valid_execution(self):
+        if self.execution.calculation_status != "uncomputed":
+            raise ValueError("calculation_execution_mismatch")
+        return self
+
+
+PointCard = Annotated[ComputedPointCard | UncomputedPointCard, Field(discriminator="calculation_status")]
 
 
 class CleanupRequest(Node):

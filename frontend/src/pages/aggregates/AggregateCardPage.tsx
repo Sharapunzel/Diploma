@@ -3,20 +3,23 @@ import { Button, Input, Spin } from "antd";
 import { LoadingOverlay } from "../../shared/ui/LoadingOverlay";
 import { observer } from "mobx-react-lite";
 import { Link, useParams, useLocation } from "react-router-dom";
-import { exact, printAggregate } from "../../app/api/aggregateJson";
+import { exact, object, printAggregate } from "../../app/api/aggregateJson";
 import { CardStore } from "../../features/aggregates/CardStore";
 import { useAggregateScope } from "../../features/aggregates/useAggregateScope";
 import { browserZone } from "../../features/aggregates/time";
 import { CalendarTime } from "./CalendarTime";
 import { RuleEditor } from "./RuleEditor";
 import { RuleExchange } from "./RuleExchange";
-import { states } from "../../features/aggregates/labels";
+import { states, reasonText } from "../../features/aggregates/labels";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
 import { AggregateError } from "./AggregateError";
 import { PointsView } from "./PointsView";
 import { Time } from "./ResultView";
+import { BudgetView } from "./BudgetView";
 import { FieldLabel } from "./AggregateHelp";
 import { AggregateNotice } from "./AggregateNotice";
+import { CleanupPanel } from "./CleanupPanel";
+import { AutoCleanupPanel } from "./AutoCleanupPanel";
 import styles from "./Aggregates.module.css";
 
 export const AggregateCardPage = observer(() => {
@@ -28,11 +31,11 @@ export const AggregateCardPage = observer(() => {
   );
   const [zone, setZone] = useState(browserZone);
   const [confirm, setConfirm] = useState<{
-    action: "archive" | "delete";
+    action: "archive" | "delete" | "pause";
     owner: typeof store;
   } | null>(null);
   const [lastConfirmAction, setLastConfirmAction] = useState<
-    "archive" | "delete"
+    "archive" | "delete" | "pause"
   >("archive");
   const operators = store.operators;
   const [start, setStart] = useState("");
@@ -48,7 +51,7 @@ export const AggregateCardPage = observer(() => {
   const a = store.card;
   const write = session.has("aggregates.write");
   const confirmationOpen = confirm !== null && confirm.owner === store;
-  const openConfirmation = (action: "archive" | "delete") => {
+  const openConfirmation = (action: "archive" | "delete" | "pause") => {
     setLastConfirmAction(action);
     setConfirm({ action, owner: store });
   };
@@ -76,46 +79,68 @@ export const AggregateCardPage = observer(() => {
         />
       )}
       {!a ? (
-        store.lifecycle.isPending("load") && <LoadingOverlay />
+        store.cardLoading && <LoadingOverlay />
       ) : (
         <>
           <div className={styles.toolbar}>
             <Button
               aria-label="Обновить состояние"
-              disabled={store.lifecycle.isPending("action")}
-              loading={store.lifecycle.isPending("load")}
+              disabled={
+                store.lifecycle.isPending("action") ||
+                store.commandBusy ||
+                store.lifecycle.isPending("load")
+              }
+              loading={store.cardLoading}
               onClick={() => void store.load()}
             >
               Обновить состояние
             </Button>
-            {write && a.state !== "deleted" && (
-              <>
+            {write &&
+              (a.state !== "deleted" || a.execution_mode === "retired") && (
                 <Link to={`/aggregates/new?copy=${encodeURIComponent(a.id)}`}>
                   <Button>Копировать</Button>
                 </Link>
-                {a.state === "archived" ? (
+              )}
+            {write && a.state !== "deleted" && (
+              <>
+                {a.execution_mode !== "retired" &&
+                  (a.state === "archived" ? (
+                    <Button
+                      key="resume"
+                      aria-label="Возобновить"
+                      disabled={!store.canMutate || !!a.active_cleanup_id}
+                      loading={store.lifecycle.isPending("action")}
+                      onClick={() => void store.action("resume")}
+                    >
+                      Возобновить
+                    </Button>
+                  ) : (
+                    <Button
+                      key="archive"
+                      aria-label="Архивировать"
+                      disabled={!store.canMutate || !!a.active_cleanup_id}
+                      onClick={() => openConfirmation("archive")}
+                    >
+                      Архивировать
+                    </Button>
+                  ))}
+                {a.execution_mode !== "retired" && a.state === "active" && (
                   <Button
-                    key="resume"
-                    aria-label="Возобновить"
-                    disabled={!store.canMutate}
-                    loading={store.lifecycle.isPending("action")}
-                    onClick={() => void store.action("resume")}
+                    aria-label={a.paused ? "Продолжить" : "Пауза"}
+                    disabled={!store.canCommand || !!a.active_cleanup_id}
+                    loading={store.commandBusy}
+                    onClick={() =>
+                      a.paused
+                        ? void store.sendCommand("unpause")
+                        : openConfirmation("pause")
+                    }
                   >
-                    Возобновить
-                  </Button>
-                ) : (
-                  <Button
-                    key="archive"
-                    aria-label="Архивировать"
-                    disabled={!store.canMutate}
-                    onClick={() => openConfirmation("archive")}
-                  >
-                    Архивировать
+                    {a.paused ? "Продолжить" : "Пауза"}
                   </Button>
                 )}
                 <Button
                   danger
-                  disabled={!store.canMutate}
+                  disabled={!store.canMutate || !!a.active_cleanup_id}
                   onClick={() => openConfirmation("delete")}
                 >
                   Удалить агрегат
@@ -123,6 +148,50 @@ export const AggregateCardPage = observer(() => {
               </>
             )}
           </div>
+          {store.commandOutcome === "unknown" && (
+            <div className={styles.stack} role="status">
+              <AggregateNotice
+                type="warning"
+                message="Результат команды неизвестен. Исходные действие, агрегат, тело и ключ сохранены. Противоположная или новая команда не обходит неизвестный результат."
+              />
+              <Button
+                disabled={store.commandBusy}
+                loading={store.commandBusy}
+                onClick={() => void store.replayCommand()}
+              >
+                Повторить команду с тем же ключом
+              </Button>
+            </div>
+          )}
+          {store.commandOutcome === "confirmed" && (
+            <p role="status">
+              {store.commandReceipt?.action === "cleanup" ||
+              store.commandReceipt?.action === "cleanup_retry"
+                ? "Очистка принята. Завершение проверяется отдельно."
+                : "Команда подтверждена. Текущее состояние читается отдельно."}
+            </p>
+          )}
+          {store.commandError !== null && (
+            <AggregateError error={store.commandError} />
+          )}
+          {store.commandReadError !== null && (
+            <>
+              <p>
+                Команда принята; чтение карточки не удалось. Повторите только
+                чтение.
+              </p>
+              <AggregateError
+                error={store.commandReadError}
+                onRetry={() => void store.refreshCommandCard()}
+              />
+            </>
+          )}
+          {a.execution_mode === "retired" && (
+            <AggregateNotice
+              type="info"
+              message="Прежний расчёт остановлен. Сохранённые результаты используют прежнее основание времени и доступны для чтения. Для событийного расчёта создайте копию и новый детектор с отдельным прогревом."
+            />
+          )}
           <div className={styles.field}>
             <FieldLabel help="UTC или название IANA, например Asia/Yekaterinburg. Меняет только подписи времени; сохранённое расписание остаётся прежним.">
               Пояс отображения
@@ -154,7 +223,11 @@ export const AggregateCardPage = observer(() => {
               <dd>
                 {a.created_by}; <Time value={a.created_at} zone={zone} />
               </dd>
-              <dt>Исходная граница и пояс</dt>
+              <dt>
+                {a.execution_mode === "retired"
+                  ? "Прежняя исходная граница и пояс"
+                  : "Начало истории, сетка окон и исходный пояс"}
+              </dt>
               <dd>
                 {a.original_boundary} ({a.timezone})
               </dd>
@@ -164,14 +237,58 @@ export const AggregateCardPage = observer(() => {
                 с
               </dd>
               <dt>Состояние</dt>
-              <dd>{states[a.state] || a.state}</dd>
-              <dt>Ближайший плановый расчёт</dt>
+              <dd>
+                {states[a.state] || a.state}
+                {a.paused && " · Пауза"}
+                {a.execution_mode === "retired" &&
+                  " · Прежний расчёт остановлен"}
+                {a.active_cleanup_id && " · Очистка истории"}
+              </dd>
+              <dt>Конец следующего окна по расписанию</dt>
               <dd>
                 <Time value={a.next_scheduled_at} zone={zone} />
               </dd>
-              <dt>Отставание</dt>
+              <dt>Закрытие следующего online-окна не ранее</dt>
+              <dd>
+                <Time value={a.next_close_not_before_at} zone={zone} />
+              </dd>
+              <dt>Последняя подтверждённая позиция</dt>
+              <dd>Следующий индекс: {exact(a.next_index)}</dd>
+              <dt>Запуск процесса / начало online</dt>
+              <dd>
+                <Time value={a.bootstrap_at} zone={zone} />; индекс{" "}
+                {exact(a.online_start_index)}
+              </dd>
+              <dt>Отставание расчёта после срока</dt>
               <dd>{exact(a.lag_seconds)} с</dd>
             </dl>
+            <p>
+              Принадлежность:{" "}
+              {a.semantic_basis === "event_time"
+                ? "исходный ECS @timestamp"
+                : "прежнее время доступности"}
+              .{" "}
+              {a.execution_mode === "current" &&
+                "Срок online — конец + min(длительность, 300 секунд). Пауза и перезапуск его не переносят. Начальная завершённая история рассчитывается сразу."}
+            </p>
+            {a.paused &&
+              a.state === "active" &&
+              a.execution_mode === "current" && (
+                <p role="status">
+                  Новые расчёты приостановлены с сохранением позиции. После
+                  продолжения доступные накопившиеся окна восполняются; отдельно
+                  остановленные детекторы не запускаются.
+                </p>
+              )}
+            {a.state === "archived" && (
+              <p role="status">
+                Во время архивирования окна намеренно пропускаются и не
+                восполняются при архивном возобновлении.
+              </p>
+            )}
+            {a.active_cleanup_id && (
+              <p role="status">Ожидание завершения очистки истории.</p>
+            )}
             {a.last_error && (
               <AggregateNotice
                 type="warning"
@@ -251,18 +368,22 @@ export const AggregateCardPage = observer(() => {
             <h3 aria-label="3. Проверка, диагностика и история">
               3. Проверка, диагностика и история{" "}
             </h3>
-            {write && a.state === "active" && (
+            <BudgetView
+              duration={a.duration_seconds}
+              policy={a.execution_policy}
+              execution={a.last_execution}
+            />
+            {write && a.execution_mode !== "retired" && (
               <section className={styles.modalTile}>
-                <h3>Расчёт одного прошедшего окна</h3>
+                <h3>Просмотр сохранённого окна</h3>
                 <p>
-                  Выберите начало завершённого окна до создания агрегата.
-                  Длительность окна — {a.duration_seconds} с, как в расписании.
-                  Результат сохранится в истории и будет показан ниже за
-                  выбранный период. Повторный расчёт того же окна не создаёт
-                  копию и не меняет автоматическое расписание.
+                  Выберите начало окна сетки. Длительность —{" "}
+                  {a.duration_seconds} с. Это чтение готового результата, без
+                  нового расчёта и дополнительной точки. Ещё не готовое окно и
+                  очищенное окно дают разные объяснения.
                 </p>
                 <CalendarTime
-                  label="Начало окна для дополнительного расчёта"
+                  label="Начало сохранённого окна"
                   value={start}
                   scheduleAnchor={a.anchor_utc}
                   zone={zone}
@@ -284,16 +405,12 @@ export const AggregateCardPage = observer(() => {
                   <AggregateError error={store.historyError} />
                 )}
                 <Button
-                  aria-label="Рассчитать выбранное окно"
+                  aria-label="Просмотреть сохранённое окно"
                   loading={store.lifecycle.isPending("history")}
-                  disabled={
-                    !store.canMutate || store.lifecycle.isPending("history")
-                  }
+                  disabled={store.lifecycle.isPending("history")}
                   onClick={() => {
                     if (!start) {
-                      setHistoryError(
-                        "Выберите начало окна для дополнительного расчёта.",
-                      );
+                      setHistoryError("Выберите начало сохранённого окна.");
                       return;
                     }
                     void store.history(start).then((ok) => {
@@ -301,7 +418,7 @@ export const AggregateCardPage = observer(() => {
                     });
                   }}
                 >
-                  Рассчитать выбранное окно
+                  Просмотреть сохранённое окно
                 </Button>
               </section>
             )}
@@ -311,10 +428,66 @@ export const AggregateCardPage = observer(() => {
                 message="Агрегат удалён. Новые расчёты окончательно остановлены, сохранённая история доступна."
               />
             )}
+            <section
+              className={styles.modalTile}
+              aria-label="Диагностика событийного времени"
+            >
+              <h3>Опоздания и исключения</h3>
+              <p>
+                Опоздавших записей: {exact(a.diagnostics.late_count)}. Они не
+                меняют признаки, оценки и прежний снимок.
+              </p>
+              <p>
+                Период событий:{" "}
+                <Time
+                  value={
+                    typeof a.diagnostics.late_start === "string"
+                      ? a.diagnostics.late_start
+                      : null
+                  }
+                  zone={zone}
+                />{" "}
+                —{" "}
+                <Time
+                  value={
+                    typeof a.diagnostics.late_end === "string"
+                      ? a.diagnostics.late_end
+                      : null
+                  }
+                  zone={zone}
+                />
+                .{" "}
+                {reasonText(
+                  typeof a.diagnostics.late_reason === "string"
+                    ? a.diagnostics.late_reason
+                    : null,
+                )}
+              </p>
+              {object(a.diagnostics.exclusions) && (
+                <ul>
+                  {Object.entries(a.diagnostics.exclusions).map(
+                    ([reason, count]) => (
+                      <li key={reason}>
+                        {reasonText(reason)}: {exact(count)}
+                      </li>
+                    ),
+                  )}
+                </ul>
+              )}
+              <p>
+                Доступна сводка сохранённой диагностики. Отдельного списка
+                поздних событий или участников снимка этот интерфейс не
+                получает; исходные события сохраняются.
+              </p>
+            </section>
+            <AutoCleanupPanel store={store} zone={zone} />
+            <CleanupPanel store={store} write={write} zone={zone} />
             <PointsView
               aggregate={a}
               zone={zone}
               refresh={refresh}
+              clearedVersion={store.pointsVersion}
+              clearVersion={store.pointsClearVersion}
               historicalPoint={store.historicalResult}
               selectionKey={start}
             />
@@ -322,28 +495,45 @@ export const AggregateCardPage = observer(() => {
           <ConfirmationDialog
             key={lastConfirmAction}
             open={confirmationOpen}
-            pending={confirmationOpen && store.lifecycle.isPending("action")}
+            pending={
+              confirmationOpen &&
+              (store.lifecycle.isPending("action") || store.commandBusy)
+            }
             title={
-              lastConfirmAction === "delete"
-                ? "Удалить агрегат?"
-                : "Архивировать агрегат?"
+              lastConfirmAction === "pause"
+                ? "Поставить агрегат на паузу?"
+                : lastConfirmAction === "delete"
+                  ? "Удалить агрегат?"
+                  : "Архивировать агрегат?"
             }
             message={
-              lastConfirmAction === "delete"
-                ? `Новые расчёты «${a.name}» будут окончательно остановлены. Все связанные детекторы будут остановлены; модели, исторические точки и связи сохраняются.`
-                : `Новые расчёты «${a.name}» остановятся. История сохранится; после возобновления намеренно пропущенные окна не восполняются.`
+              lastConfirmAction === "pause"
+                ? `Агрегат «${a.name}» (${a.id}): новые расчёты остановятся с сохранением позиции. После продолжения накопленные окна будут восполнены; правило, история и модели сохранятся.`
+                : lastConfirmAction === "delete"
+                  ? `Новые расчёты «${a.name}» будут окончательно остановлены. Все связанные детекторы будут остановлены; модели, исторические точки и связи сохраняются.`
+                  : `Новые расчёты «${a.name}» остановятся. История сохранится; после возобновления намеренно пропущенные окна не восполняются.`
             }
             confirmText={
-              lastConfirmAction === "delete" ? "Удалить" : "Архивировать"
+              lastConfirmAction === "pause"
+                ? "Пауза"
+                : lastConfirmAction === "delete"
+                  ? "Удалить"
+                  : "Архивировать"
             }
             danger
             onCancel={() => setConfirm(null)}
             onConfirm={() => {
-              if (confirm && confirm.owner === store)
+              if (confirm && confirm.owner === store) {
+                if (confirm.action === "pause") {
+                  setConfirm(null);
+                  void store.sendCommand("pause");
+                  return;
+                }
                 void store.action(confirm.action).then((ok) => {
                   if (ok || store.mutationOutcome === "unknown")
                     setConfirm(null);
                 });
+              }
             }}
           >
             {store.error !== null && <AggregateError error={store.error} />}

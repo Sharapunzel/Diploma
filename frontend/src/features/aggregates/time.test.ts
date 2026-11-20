@@ -1,5 +1,10 @@
 import { expect, it } from "vitest";
-import { calendarInstants, scheduleFraction } from "./time";
+import {
+  calendarInstants,
+  scheduleFraction,
+  selectedWindow,
+  suggestPreviewWindow,
+} from "./time";
 
 it.each([
   ["2026-01-01T00:00:00.123456Z", ".123456"],
@@ -16,6 +21,44 @@ it.each([
   ["", ""],
 ])("keeps the exact UTC schedule fraction of %s", (iso, fraction) => {
   expect(scheduleFraction(iso)).toBe(fraction);
+});
+
+it("suggests an exact completed grid window, marking future-anchor previews outside the process", () => {
+  const now = Date.parse("2026-01-01T00:12:00Z");
+  expect(suggestPreviewWindow("2026-01-01T00:00:00.123456Z", 300, now)).toBe(
+    "2026-01-01T00:00:00.123456Z",
+  );
+  const suggested = suggestPreviewWindow(
+    "2026-01-01T00:20:00.123456Z",
+    300,
+    now,
+  );
+  expect(suggested).toBe("2026-01-01T00:05:00.123456Z");
+  expect(
+    selectedWindow(suggested, "2026-01-01T00:20:00.123456Z", 300, now),
+  ).toEqual({
+    start: suggested,
+    end: "2026-01-01T00:10:00.123456Z",
+    index: "-3",
+    inProcess: false,
+    completed: true,
+  });
+});
+it("checks alignment without rounding copied microseconds or historical fractional offsets", () => {
+  const anchor = "1900-01-01T00:00:00.123456+05:21:10";
+  expect(selectedWindow(anchor, anchor, 300).end).toBe(
+    "1899-12-31T18:43:50.123456Z",
+  );
+  expect(() =>
+    selectedWindow("1900-01-01T00:00:00.123455+05:21:10", anchor, 300),
+  ).toThrow("выровнено");
+  expect(
+    selectedWindow(
+      "2026-01-01T00:00:00.123456+00:00:00.000001",
+      "2026-01-01T00:00:00.123455Z",
+      1,
+    ).index,
+  ).toBe("0");
 });
 
 it("accepts equivalent whole-second calendar formats without discarding nonzero fractions", () => {

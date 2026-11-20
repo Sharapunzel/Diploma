@@ -10,15 +10,16 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg import sql
+from sqlalchemy import MetaData, create_engine, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
+
 from app.aggregate_composition import build_aggregate_service
 from app.core.errors import DomainError
 from app.db import Database
 from app.ecs import PackagedEcsCatalog
 from app.schemas.aggregates import CreateAggregateRequest
-from psycopg import sql
-from sqlalchemy import MetaData, create_engine, text
-from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError
 
 
 @pytest.fixture
@@ -151,5 +152,5 @@ def test_populated_retirement_replay_and_old_writer_fences(legacy_database, basi
     refused = migrate("downgrade", "0020_detector_commands", check=False)
     assert refused.returncode != 0 and "explicit data-preserving migration" in refused.stderr
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0021_event_time"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0024_aggregate_execution_budget"
         assert connection.scalar(text("SELECT checkpoint FROM logs.detectors WHERE id=:id"), {"id": detector}) == checkpoint

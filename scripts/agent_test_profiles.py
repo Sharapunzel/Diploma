@@ -173,7 +173,17 @@ def remove_new_images(before: dict, env: dict[str, str], project: str,
         if image_id in prior_ids:
             continue
         if not tag.startswith(allowed) and image_id not in (builder_images or set()):
-            raise RuntimeError(f"New image has unclear ownership: {tag}")
+            owned_dangling = False
+            if tag == "<none>:<none>" and project:
+                details = json.loads(command(["docker", "image", "inspect", image_id], env=env, capture=True))
+                if isinstance(details, list) and len(details) == 1 and isinstance(details[0], dict):
+                    image = details[0]
+                    config = image.get("Config")
+                    labels = config.get("Labels") if isinstance(config, dict) else None
+                    owned_dangling = (image.get("Id") == image_id and isinstance(labels, dict)
+                        and labels.get("com.docker.compose.project") == project)
+            if not owned_dangling:
+                raise RuntimeError(f"New image has unclear ownership: {tag}")
         attached = command(["docker", "ps", "-a", "--filter", f"ancestor={image_id}",
                             "--format", "{{.ID}}"], env=env, capture=True).strip()
         if attached:
@@ -1644,17 +1654,22 @@ def main() -> None:
     parser.add_argument("--pytest", nargs="*", help="Specific backend test nodes for a focused retry")
     parser.add_argument("--check-only", action="store_true", help="Resolve and validate Compose without starting containers")
     parser.add_argument("--aggregate-only", action="store_true", help="Run the aggregate end-to-end scenario without unrelated UI scenarios")
+    parser.add_argument("--aggregate-performance", action="store_true", help="Measure controlled aggregate load using the same isolated smoke services")
+    parser.add_argument("--aggregate-performance-group", choices=("baseline-through-20", "shared-30", "distributed-30"),
+        help="Select one approved aggregate load group; each isolated profile retains its 1200-second budget")
     parser.add_argument("--rcf", action="store_true", help="Run the mandatory Linux/JVM RCF gate in backend-db")
     parser.add_argument("--detector-only", action="store_true", help="Exercise detector worker and Compose lifecycle in the selected smoke profile")
     parser.add_argument("--wal", action="store_true", help="Run the Linux live capture bootstrap gate in backend-db")
     parser.add_argument("--browser-only", action="store_true", help="Run the standard browser group in the selected smoke mode")
     parser.add_argument("--browser-spec", nargs="+", help="Select named specs from that smoke mode's browser group")
     args = parser.parse_args()
+    from aggregate_performance import validate_performance_arguments
     from browser_test_scenarios import validate_browser_arguments
     from event_time_test_scenarios import validate_runtime_arguments
     try:
         selected_browsers = validate_browser_arguments(args)
         validate_runtime_arguments(args)
+        validate_performance_arguments(args)
     except ValueError as exc:
         parser.error(str(exc))
     if args.rcf and args.profile != "backend-db":
@@ -1721,11 +1736,16 @@ def main() -> None:
         (run / "docker-before.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
         if args.browser_only:
             env, compose, project = prepare(run, args.profile, include_oidc="auth.spec.ts" in selected_browsers)
-        elif args.aggregate_only:
+        elif args.aggregate_only or args.aggregate_performance:
             env, compose, project = prepare(run, args.profile, include_oidc=False)
         else:
             env, compose, project = prepare(run, args.profile)
-        if args.browser_only or args.aggregate_only or args.detector_only:
+        if args.aggregate_performance or args.browser_only and "detectors.live.spec.ts" in selected_browsers:
+            from aggregate_performance import controlled_clock_overlay
+            clock_overlay, clock_file = controlled_clock_overlay(run)
+            compose += ["-f", str(clock_overlay)]
+            env["AGGREGATE_CLOCK_FILE"] = str(clock_file)
+        if args.browser_only or args.aggregate_only or args.detector_only or args.aggregate_performance:
             overlay = run / "browser-consumer.yml"
             overlay.write_text("services:\n  api:\n    environment:\n      KAFKA_CONSUMERS_ENABLED: 'false'\n"
                 + (f"  frontend:\n    environment:\n      HMR_CLIENT_PORT: '{env['PROXY_BIND'].split(':')[1]}'\n"
@@ -1787,7 +1807,7 @@ def main() -> None:
         elif args.profile in {"smoke-development", "smoke-production", "end-to-end", "external-end-to-end"}:
             production = args.profile in {"smoke-production", "external-end-to-end"}
             services = ["postgres", "kafka", "kafka-acls", "migrate", "api", "provisioner", "aggregate-worker", "detector-worker", "proxy"]
-            if args.aggregate_only:
+            if args.aggregate_only or args.aggregate_performance:
                 services.remove("provisioner")
             if args.browser_only:
                 services.remove("provisioner")
@@ -1796,12 +1816,19 @@ def main() -> None:
                     services.remove("detector-worker")
             if args.profile == "external-end-to-end":
                 services.append("indexer")
-            if not args.aggregate_only and args.profile in {"smoke-development", "smoke-production"} and (not args.browser_only or "auth.spec.ts" in selected_browsers):
+            if not args.aggregate_only and not args.aggregate_performance and args.profile in {"smoke-development", "smoke-production"} and (not args.browser_only or "auth.spec.ts" in selected_browsers):
                 services.append("oidc-idp")
             if not production:
                 services.append("frontend")
-            command([*compose, "up", "--build", "-d", *(services if args.browser_only or args.aggregate_only else [] if args.profile.startswith("smoke-") else services)], env=env)
+            command([*compose, "up", "--build", "-d", *(services if args.browser_only or args.aggregate_only or args.aggregate_performance else [] if args.profile.startswith("smoke-") else services)], env=env)
             command([*compose, "up", "-d", "--wait", *services], env=env)
+            if args.aggregate_performance:
+                from aggregate_performance import run_aggregate_performance
+                smoke_http(env, production)
+                run_aggregate_performance(compose, env, production, run, command,
+                    case_group=args.aggregate_performance_group)
+                successful = True
+                return
             if args.aggregate_only or args.detector_only:
                 from capture_lifecycle_scenarios import capture_lifecycle
                 from event_time_test_scenarios import aggregate_event_time_smoke

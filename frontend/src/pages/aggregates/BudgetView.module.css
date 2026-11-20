@@ -49,3 +49,20 @@
   color: var(--color-text-secondary);
   line-height: 1.6;
 }
+
+.section {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.section > h5,
+.section > p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.section > h5 {
+  font-size: 0.95rem;
+}

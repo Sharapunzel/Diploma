@@ -55,6 +55,16 @@ export const DetectorsPage = observer(() => {
             {d.aggregate_name} · {aggregateStates[d.aggregate_state]}
           </span>
           <span>{d.source_name}</span>
+          <span>
+            {d.aggregate_semantic_basis === "event_time"
+              ? "Событийное время"
+              : "Прежнее время доступности"}
+            {d.aggregate_execution_mode === "retired"
+              ? " · Прежний расчёт остановлен"
+              : d.aggregate_paused
+                ? " · Пауза агрегата"
+                : ""}
+          </span>
         </div>
       ),
     },

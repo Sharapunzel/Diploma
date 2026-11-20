@@ -16,6 +16,8 @@ class SqlAlchemyAggregateOverlapQueries:
             ).order_by(AggregateClosure.window_index)))
         if len(closures) != len(base_indices) or any(c.payload_state != "present" for c in closures):
             raise DetectionError("warmup_canonical_coverage_missing")
+        if any(c.calculation_status != "computed" for c in closures):
+            raise DetectionError("warmup_window_uncomputed")
         ids = [c.origin_point_id for c in closures]
         self.read_budget(budget.milliseconds())
         qualities = list(self.session.scalars(select(WorkingWindowPoint.completeness).where(WorkingWindowPoint.id.in_(ids))))
@@ -35,7 +37,8 @@ class SqlAlchemyAggregateOverlapQueries:
             raise DetectionError("warmup_membership_source_unavailable")
         if count > MAX_EVENTS or size > MAX_SNAPSHOT_BYTES:
             raise EventTimeBudgetError("overlap_input_bytes")
-        base = select(ParsedLog.ecs_data).select_from(joined).where(ParsedLog.id.is_not(None)).subquery()
+        base = select(ParsedLog.ecs_data, func.timezone("UTC", membership.c.event_time).label("event_time")
+            ).select_from(joined).where(ParsedLog.id.is_not(None)).subquery()
         self.read_budget(budget.milliseconds())
         statistics = read_statistics(self.session.execute(aggregate_statement(base, compiled)).mappings().one(), compiled)
         budget.check()

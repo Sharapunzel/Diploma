@@ -79,3 +79,94 @@ def test_constant_history_mapper_continuation():
     reference = probe(points + [[.5, .5]] * 101, 2)
     assert not differences(reference["results"][512:], continued["results"])
     assert not differences(reference["state"], continued["state"])
+
+
+def test_pinned_checkpoint_golden(capsys, monkeypatch):
+    """Repeatable native asset recipe on the existing backend-db --rcf profile.
+
+    Select this node and capture output in the owned run directory. Its
+    RCF_CHECKPOINT_GOLDEN marker contains only a deterministic synthetic model.
+    On intentional regeneration, extract that JSON into the permanent fixture;
+    never substitute a hand-written mapper. The complete RCF gate repeats the
+    writer/hash/real-restore comparison against the checked-in asset.
+    """
+    from dataclasses import asdict
+    from time import monotonic
+
+    from app.aggregation.event_time import OperationBudget
+    from app.detection.aws_rcf import AwsModelFactory
+    from app.detection.checkpoint import validate_checkpoint
+    from app.detection.contracts import DetectionError, ModelConfig, canonical, digest
+
+    config = asdict(ModelConfig(dimensions=2, trees=20, sample_size=8, output_after=8, seed=42))
+    keys, rule_hash = ["count", "bytes"], digest({"synthetic_native_golden": 1})
+    rows = [[(i * 7) % 11, (i * i * 3) % 17] for i in range(16)]
+    factory = AwsModelFactory()
+    checkpoint = factory.warmup(config, keys, rule_hash, rows)
+    # Export before the neutral check: an unexpected native schema must remain
+    # inspectable after a failed gate, without weakening that gate's assertion.
+    with capsys.disabled():
+        print("RCF_CHECKPOINT_GOLDEN=" + canonical(checkpoint), flush=True)
+    started = monotonic()
+    validate_checkpoint(checkpoint, config, keys, rule_hash, check_budget=OperationBudget(.85).check)
+    with capsys.disabled():
+        print({"native_checkpoint_validation_seconds": monotonic() - started,
+            "checkpoint_bytes": len(canonical(checkpoint).encode()), "sha256": checkpoint["sha256"]})
+    restored = factory.restore(checkpoint, config, keys, rule_hash)
+    result = restored.process([17, 23])
+    asset = Path(__file__).parents[1] / "fixtures" / "aws_rcf_4_4_0_checkpoint.json"
+    assert asset.is_file(), "The mandatory native checkpoint fixture is missing"
+    saved = json.loads(asset.read_text(encoding="utf-8"))
+    assert saved["sha256"] == checkpoint["sha256"]
+    assert digest(saved["body"]) == saved["sha256"]
+    assert factory.restore(saved, config, keys, rule_hash).process([17, 23]) == result
+    damaged = json.loads(canonical(checkpoint))
+    damaged["body"]["mapper"]["forestState"]["pointStoreState"]["pointData"] = "AAAA"
+    damaged["sha256"] = digest(damaged["body"])
+    with monkeypatch.context() as scope:
+        scope.setattr("app.detection.checkpoint.validate_mapper",
+            lambda *_a, **_k: pytest.fail("Execution duplicated the native codec proof"))
+        # The common envelope/history checks pass. Only the actual pinned Java
+        # mapper can reject these three bytes, so the negative proves the native
+        # restoration boundary rather than the Python protection parser.
+        with pytest.raises(DetectionError, match="checkpoint_corrupt"):
+            factory.restore(damaged, config, keys, rule_hash)
+
+
+def test_default_checkpoint_validation_budget(capsys):
+    """A typical full production envelope must fit the maintenance work budget."""
+    from dataclasses import asdict
+    from time import monotonic
+
+    from app.aggregation.event_time import OperationBudget
+    from app.detection.aws_rcf import AwsModelFactory
+    from app.detection.checkpoint import validate_checkpoint, validate_execution_checkpoint
+    from app.detection.contracts import ModelConfig, canonical_size, digest
+
+    defaults = ModelConfig(dimensions=2)
+    config, keys = asdict(defaults), ["count", "bytes"]
+    assert (defaults.trees, defaults.sample_size, defaults.output_after, defaults.minimum_inputs) == (100, 256, 256, 512)
+    rule_hash = digest({"synthetic_default_validation_budget": 1})
+    rows = [[i % 31, (i * 7) % 97] for i in range(defaults.minimum_inputs)]
+    checkpoint = AwsModelFactory().warmup(config, keys, rule_hash, rows)
+    size = canonical_size(checkpoint)
+    started, validated = monotonic(), False
+    try:
+        validate_checkpoint(checkpoint, config, keys, rule_hash, check_budget=OperationBudget(.85).check)
+        validated = True
+    finally:
+        elapsed = monotonic() - started
+        with capsys.disabled():
+            print({"default_checkpoint_validation_seconds": elapsed, "validated": validated,
+                "checkpoint_bytes": size, "config": config}, flush=True)
+    assert elapsed < .85
+    unbudgeted_started = monotonic()
+    validate_checkpoint(checkpoint, config, keys, rule_hash)
+    with capsys.disabled():
+        print({"default_checkpoint_unbudgeted_validation_seconds": monotonic() - unbudgeted_started,
+            "checkpoint_bytes": size, "config": config}, flush=True)
+    execution_started = monotonic()
+    validate_execution_checkpoint(checkpoint, config, keys, rule_hash)
+    with capsys.disabled():
+        print({"default_checkpoint_execution_validation_seconds": monotonic() - execution_started,
+            "checkpoint_bytes": size, "config": config}, flush=True)

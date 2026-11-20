@@ -364,8 +364,8 @@ it("chooses the feature type inside a four-block modal and isolates cancel from 
   const headings = within(modal).getAllByRole("heading");
   for (const title of [
     "1. Настройки признака",
-    "2. Входы",
-    "3. Операции и условия",
+    "2. Входные данные",
+    "3. Операции и отбор",
     "4. Итоговая формула",
   ])
     expect(headings).toContain(
@@ -428,27 +428,44 @@ async function applyFeature() {
   return parseAggregate(screen.getByTestId("wire").textContent!);
 }
 
+it("keeps a compound exact formula when changing and restoring its single operation selector", async () => {
+  const initial = parseAggregate(
+    '{"features":[{"key":"n","name":"N","op":"formula","expr":{"op":"add","args":[{"aggregate":{"op":"sum","field":"source.bytes"}},{"value":9007199254740993}]}}]}',
+  ) as JsonObject;
+  render(<InteractiveEditor initial={initial} />);
+  fireEvent.click(screen.getByRole("button", { name: "N · n" }));
+  expect(
+    screen.queryByRole("combobox", { name: "Признак: агрегация" }),
+  ).toBeNull();
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "Операция входа" }));
+  fireEvent.click(screen.getByRole("option", { name: /^Количество событий/ }));
+  expect(screen.getByTestId("wire").textContent).toBe(printAggregate(initial));
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "Операция входа" }));
+  fireEvent.click(
+    screen.getByRole("option", { name: /^Формула над итогами окна/ }),
+  );
+  expect(await applyFeature()).toEqual(initial);
+});
+
 it("keeps feature and global event filters when replacing its input", async () => {
   render(<InteractiveEditor initial={filteredRule} />);
   fireEvent.click(screen.getByRole("button", { name: "События · events" }));
-  fireEvent.click(
-    screen.getByRole("button", { name: "Использовать итог окна" }),
-  );
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "Операция входа" }));
+  fireEvent.click(screen.getByRole("option", { name: /^Количество событий/ }));
   expect(await applyFeature()).toEqual({
     where: globalWhere,
     features: [
       {
         key: "events",
         name: "События",
-        op: "formula",
-        expr: { aggregate: { op: "count" } },
+        op: "count",
         where: featureWhere,
       },
     ],
   });
 });
 
-it.each(["Способ вычисления", "Признак: агрегация"])(
+it.each(["Операция входа"])(
   "keeps event filters when changing the operation through %s",
   async (control) => {
     render(<InteractiveEditor initial={filteredRule} />);

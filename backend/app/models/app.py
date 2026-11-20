@@ -396,6 +396,7 @@ class AggregateSchedule(Base):
     scan_after: Mapped[UUID | None] = mapped_column()
     scan_cycle: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     turn: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_execution: Mapped[dict | None] = mapped_column(JSONB)
 
 class WorkingWindowPoint(Base):
     __tablename__ = "working_window_points"
@@ -406,6 +407,12 @@ class WorkingWindowPoint(Base):
         CheckConstraint("actual_completed_at >= actual_started_at", name="completion_valid"),
         CheckConstraint("event_count >= 0", name="count_nonnegative"),
         CheckConstraint("completeness IN ('complete', 'unknown', 'interrupted')", name="completeness_valid"),
+        CheckConstraint("(calculation_status='computed' AND calculation_reason IS NULL) OR "
+            "(calculation_status='uncomputed' AND calculation_reason IS NOT NULL AND calculation_reason='execution_budget_exceeded')", name="calculation_valid"),
+        CheckConstraint("(calculation_status='computed' AND event_count IS NOT NULL AND completeness IS NOT NULL "
+            "AND completeness_reason IS NOT NULL AND evidence_refs IS NOT NULL AND evidence_refs <> 'null'::jsonb) OR "
+            "(calculation_status='uncomputed' AND event_count IS NULL AND event_time_min IS NULL AND event_time_max IS NULL "
+            "AND features IS NULL AND completeness IS NULL AND completeness_reason IS NULL AND evidence_refs IS NULL)", name="calculation_payload_valid"),
         Index("uq_working_window_schedule_index", "schedule_id", "window_index", unique=True),
         {"schema": "logs"},
     )
@@ -417,11 +424,13 @@ class WorkingWindowPoint(Base):
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     actual_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     actual_completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    event_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_count: Mapped[int | None] = mapped_column(BigInteger)
     event_time_min: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     event_time_max: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completeness: Mapped[str] = mapped_column(Text, nullable=False)
-    completeness_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence_refs: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    features: Mapped[list | None] = mapped_column(JSONB)
+    completeness: Mapped[str | None] = mapped_column(Text)
+    completeness_reason: Mapped[str | None] = mapped_column(Text)
+    evidence_refs: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    features: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
     time_basis: Mapped[str] = mapped_column(Text)
+    calculation_status: Mapped[str] = mapped_column(Text, default="computed", server_default="computed")
+    calculation_reason: Mapped[str | None] = mapped_column(Text)

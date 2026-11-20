@@ -91,7 +91,12 @@ it("exposes an enabled explicit retry after an unknown create result without cha
           features: [],
           completeness: "unverified",
           completeness_reason: "preview_snapshot_without_coverage_proof",
-          time_basis: "availability_at",
+          time_basis: "event_time",
+          origin: "preview",
+          in_process: true,
+          snapshot_reference_at: moment,
+          close_not_before_at: moment,
+          snapshot_metadata: { delivery_coverage: "not_attested" },
           budget: { estimated_rows: 22 },
         };
       if (path === "/aggregates") {
@@ -128,7 +133,7 @@ it("exposes an enabled explicit retry after an unknown create result without cha
   ).toBe("true");
   expect(
     process
-      .getByLabelText("Исходная граница", { exact: true })
+      .getByLabelText("Начало истории и сетка окон", { exact: true })
       .getAttribute("aria-required"),
   ).toBe("true");
   const validate = diagnostics.getByRole("button", {
@@ -146,7 +151,7 @@ it("exposes an enabled explicit retry after an unknown create result without cha
   );
   fireEvent.click(await screen.findByText(/Source ·/));
   fireEvent.change(
-    process.getByLabelText("Исходная граница", { exact: true }),
+    process.getByLabelText("Начало истории и сетка окон", { exact: true }),
     {
       target: { value: moment.slice(0, 19) },
     },

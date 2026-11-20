@@ -8,13 +8,13 @@ import {
 } from "../../app/api/aggregates";
 import { CardStore } from "./CardStore";
 import { DraftStore } from "./DraftStore";
+import { aggregateFixture } from "../../app/api/aggregateTestData";
 
 afterEach(() => vi.unstubAllGlobals());
 const anchor = "2026-01-01T00:00:00Z";
 const card = {
-  id: "confirmed",
+  ...aggregateFixture(),
   name: "Aggregate",
-  source_id: "source",
   source_name: "Source",
   source_type: "kafka",
   rule_hash: "a".repeat(64),
@@ -22,7 +22,6 @@ const card = {
   original_boundary: anchor,
   timezone: "UTC",
   created_at: anchor,
-  created_by: "user",
   state: "deleted",
   next_scheduled_at: anchor,
   aggregate_rule: {

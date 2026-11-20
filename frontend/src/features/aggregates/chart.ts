@@ -65,7 +65,10 @@ export function chartSeries(points: Point[], feature: string) {
     return {
       kind,
       values: sorted.map((point) => {
-        const result = point.features?.find((f) => f.key === feature);
+        const result =
+          point.calculation_status === "uncomputed"
+            ? undefined
+            : point.features?.find((f) => f.key === feature);
         const value =
           result?.value == null ? null : Number(exact(result.value));
         const valid =

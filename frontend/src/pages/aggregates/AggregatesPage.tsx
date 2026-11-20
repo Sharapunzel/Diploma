@@ -9,7 +9,7 @@ import {
 } from "../../features/aggregates/ListStore";
 import { useAggregateScope } from "../../features/aggregates/useAggregateScope";
 import type { Aggregate } from "../../app/api/aggregates";
-import { states } from "../../features/aggregates/labels";
+import { states, reasonText } from "../../features/aggregates/labels";
 import { AggregateError } from "./AggregateError";
 import { FieldLabel } from "./AggregateHelp";
 import styles from "./Aggregates.module.css";
@@ -25,7 +25,17 @@ export const AggregatesPage = observer(() => {
       title: "Имя",
       key: "name",
       width: 260,
-      render: (_, a) => <Link to={`/aggregates/${a.id}`}>{a.name}</Link>,
+      render: (_, a) => (
+        <>
+          <Link to={`/aggregates/${a.id}`}>{a.name}</Link>
+          {a.last_execution?.calculation_status === "uncomputed" && (
+            <p className={styles.notice}>
+              <strong>Последнее окно не рассчитано</strong>.{" "}
+              {reasonText(a.last_execution.calculation_reason)}
+            </p>
+          )}
+        </>
+      ),
     },
     {
       title: "Собственный источник",
@@ -52,7 +62,13 @@ export const AggregatesPage = observer(() => {
       title: "Состояние",
       key: "state",
       width: 160,
-      render: (_, a) => states[a.state] || a.state,
+      render: (_, a) => (
+        <>
+          {a.state === "active" ? "Активен" : states[a.state] || a.state}
+          {a.paused && <p>Пауза</p>}
+          {a.execution_mode === "retired" && <p>Прежний расчёт остановлен</p>}
+        </>
+      ),
     },
     {
       title: "Действия",
@@ -160,7 +176,7 @@ export const AggregatesPage = observer(() => {
               />
             </div>
             <div className={styles.field}>
-              <FieldLabel help="Активные агрегаты рассчитывают новые окна. Архивные сохраняют историю и могут быть возобновлены.">
+              <FieldLabel help="Фильтр жизненного цикла. Пауза и прекращённый прежний расчёт показаны отдельными метками; они не являются фильтрами серверного списка.">
                 Состояние
               </FieldLabel>
               <Select

@@ -6,9 +6,10 @@ import { displayTime } from "../../features/aggregates/time";
 import { reasonText, timeBases } from "../../features/aggregates/labels";
 import { BudgetView } from "./BudgetView";
 import styles from "./ResultView.module.css";
+import { SnapshotSummary } from "./SnapshotSummary";
 
 export const quality: Record<string, string> = {
-  complete: "Полнота подтверждена",
+  complete: "Полученный снимок без известных нарушений",
   unknown: "Полнота неизвестна",
   interrupted: "Обработка прервана",
   unverified: "Полнота не проверена",
@@ -19,6 +20,24 @@ export function Time({ value, zone }: { value: string | null; zone: string }) {
       {displayTime(value, zone)}
       {value && <code>{value}</code>}
     </span>
+  );
+}
+export function UncomputedNotice() {
+  return (
+    <div role="status">
+      <p>
+        <strong>Не рассчитано</strong>: исчерпан бюджет времени
+        (execution_budget_exceeded).
+      </p>
+      <p>
+        Это окончательный исход окна. Значения, состав событий и опоздания для
+        него недоступны; автоматического пересчёта нет. Исходные события
+        сохранены.
+      </p>
+      <p>
+        Детектор пропускает это окно без обучения и оценки, сохраняя модель.
+      </p>
+    </div>
   );
 }
 export function FeatureTable({
@@ -96,11 +115,18 @@ export function ResultView({
 }) {
   return (
     <section className={styles.result} aria-label="Предварительный результат">
-      <h3>Предварительный расчёт</h3>
+      <h3>Предварительный расчёт — результат не сохранён</h3>
       <p className={styles.notice}>
         Пробный расчёт одного завершённого окна расписания. Результат не создаёт
-        агрегат или сохранённую точку и не подтверждает полноту рабочего окна.
+        агрегат или сохранённую точку. Новые поступления могут изменить
+        следующую пробу.
       </p>
+      {result.in_process === false && (
+        <p role="status">
+          Диагностика вне процесса: окно до начала автоматической истории. Оно
+          не расширяет сохранённый ряд или прогрев.
+        </p>
+      )}
       <div className={styles.overview}>
         <section className={styles.tile}>
           <h4>Расчётное окно</h4>
@@ -118,10 +144,26 @@ export function ResultView({
               </dd>
             </div>
             <div className={styles.fact}>
-              <dt>Момент закрытия окна по расписанию</dt>
+              <dt>Конец окна по расписанию</dt>
               <dd>
                 <Time value={result.scheduled_at} zone={zone} />
               </dd>
+            </div>
+            <div className={styles.fact}>
+              <dt>Не ранее закрытия online-окна</dt>
+              <dd>
+                <Time value={result.close_not_before_at} zone={zone} />
+              </dd>
+            </div>
+            <div className={styles.fact}>
+              <dt>Момент пробного снимка</dt>
+              <dd>
+                <Time value={result.snapshot_reference_at} zone={zone} />
+              </dd>
+            </div>
+            <div className={styles.fact}>
+              <dt>Происхождение</dt>
+              <dd>Предварительный расчёт (preview)</dd>
             </div>
           </dl>
         </section>
@@ -153,7 +195,8 @@ export function ResultView({
         <section className={styles.tile}>
           <h4>Время возникновения событий</h4>
           <p className={styles.notice}>
-            Диапазон ECS @timestamp отличается от технического окна обработки.
+            Диапазон исходного ECS @timestamp вошедших событий. При отсутствии
+            событий диапазон не подставляется.
           </p>
           <dl className={styles.facts}>
             <div className={styles.fact}>
@@ -171,13 +214,25 @@ export function ResultView({
           </dl>
         </section>
       </div>
+      {result.snapshot_metadata && (
+        <SnapshotSummary metadata={result.snapshot_metadata} zone={zone} />
+      )}
       <section className={styles.tile}>
         <h4>Значения признаков</h4>
+        <p className={styles.notice}>
+          Модели нужен весь пригодный числовой вектор. Null и ошибки координат
+          не заменяются нулём; успешная проверка правила не гарантирует
+          готовность модели.
+        </p>
         <FeatureTable features={result.features} />
       </section>
       {showBudget && (
         <div className={styles.tile}>
-          <BudgetView budget={result.budget} />
+          <BudgetView
+            budget={result.budget}
+            execution={result.execution}
+            policy={result.execution}
+          />
         </div>
       )}
     </section>

@@ -248,7 +248,7 @@ it.each([0, 500, 503, 200])(
       source: "source",
       name: "Old",
       boundary: "2026-01-01T00:00:00.123456Z",
-      window: "2026-01-01T00:00:00Z",
+      window: "2026-01-01T00:00:00.123456Z",
     }))
       d.setField(key as "name", v);
     await d.validate();

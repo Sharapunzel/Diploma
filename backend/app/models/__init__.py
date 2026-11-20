@@ -1,3 +1,4 @@
+from .aggregate_execution import AggregateWindowAttempt
 from .aggregate_history import (
     AggregateCleanupOperation,
     AggregateClosure,
@@ -8,6 +9,7 @@ from .aggregate_history import (
     AggregateSnapshot,
     AggregateTimeExclusion,
 )
+from .aggregate_retention import AggregateRetentionState
 from .aggregates import Aggregate, HistoricalAggregatePoint
 from .app import (
     AggregateSchedule,
@@ -56,9 +58,11 @@ __all__ = [
     "AggregateHistorySpan",
     "AggregateLateEvent",
     "AggregateMembership",
+    "AggregateRetentionState",
     "AggregateSchedule",
     "AggregateSnapshot",
     "AggregateTimeExclusion",
+    "AggregateWindowAttempt",
     "AppSetting",
     "AuthSession",
     "AvailabilityMarker",

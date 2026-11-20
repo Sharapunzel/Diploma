@@ -15,22 +15,66 @@ class StaleCandidate(DetectionError):
     pass
 
 
-def canonical(value):
+def _normalized(item, check_budget):
     # PostgreSQL JSONB expands exponents and may decode integral numerals as int.
     # Hash the JSON numeric value, independent of that incidental Python type.
-    def normalized(item):
-        if isinstance(item, float) and item.is_integer():
-            return int(Decimal(str(item)))
-        if isinstance(item, dict):
-            return {key: normalized(child) for key, child in item.items()}
-        if isinstance(item, (tuple, list)):
-            return [normalized(child) for child in item]
-        return item
-    return json.dumps(normalized(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if check_budget:
+        check_budget()
+    if isinstance(item, float) and item.is_integer():
+        return int(Decimal(str(item)))
+    if isinstance(item, dict):
+        return {key: _normalized(child, check_budget) for key, child in item.items()}
+    if isinstance(item, (tuple, list)):
+        return [_normalized(child, check_budget) for child in item]
+    return item
 
 
-def digest(value):
-    return hashlib.sha256(canonical(value).encode()).hexdigest()
+def canonical(value, *, check_budget=None):
+    result = json.dumps(_normalized(value, check_budget), sort_keys=True,
+                        separators=(",", ":"), allow_nan=False)
+    if check_budget:
+        check_budget()
+    return result
+
+
+def _canonical_chunks(value, check_budget):
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
+    for chunk in encoder.iterencode(_normalized(value, check_budget)):
+        # The encoder may yield a whole large string. Do not retain a second
+        # full encoded byte copy or do an uninterruptible whole-document join.
+        for offset in range(0, len(chunk), 65536):
+            if check_budget:
+                check_budget()
+            yield chunk[offset:offset + 65536].encode()
+    if check_budget:
+        check_budget()
+
+
+def canonical_size(value, *, check_budget=None):
+    return sum(len(chunk) for chunk in _canonical_chunks(value, check_budget))
+
+
+def canonical_size_and_digest(value, *, check_budget):
+    size = 0
+    hashed = hashlib.sha256()
+    for chunk in _canonical_chunks(value, check_budget):
+        size += len(chunk)
+        hashed.update(chunk)
+    result = hashed.hexdigest()
+    check_budget()
+    return size, result
+
+
+def digest(value, *, check_budget=None):
+    if check_budget is None:
+        return hashlib.sha256(canonical(value).encode()).hexdigest()
+    hashed = hashlib.sha256()
+    for chunk in _canonical_chunks(value, check_budget):
+        hashed.update(chunk)
+    result = hashed.hexdigest()
+    if check_budget:
+        check_budget()
+    return result
 
 
 @dataclass(frozen=True)
@@ -71,6 +115,13 @@ class ModelConfig:
             "stopNormalization": 2147483647, "transformDecay": 1 / self.sample_size,
             "timeDecay": 1 / self.sample_size, "scoringStrategy": "EXPECTED_INVERSE_DEPTH",
             "weights": [1.] * self.dimensions, "nearExpectedIgnore": "release_defaults"}
+
+
+def validate_persisted_config(value):
+    """Saved state has every asdict field; create-time defaults remain separate."""
+    if not isinstance(value, dict) or set(value) != set(ModelConfig.__dataclass_fields__):
+        raise DetectionError("checkpoint_config_mismatch")
+    return ModelConfig(**value)
 
 
 def feature_vector(features, keys, completeness):

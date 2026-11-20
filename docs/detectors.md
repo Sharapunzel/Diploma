@@ -14,7 +14,7 @@ replay прежней команды возвращает исходную immut
 
 Обычный прогрев читает непрерывную последовательность сохранённых canonical
 точек. Cutoff определяется доступной закрытой историей, а не неизвестным хвостом
-до wall-clock now. N_model=max(2*sample_size,output_after+1); требование 8D относится
+до wall-clock now. N_model=max(2\*sample_size,output_after+1); требование 8D относится
 только к ускоренному режиму. Unknown/interrupted, очищенные и отсутствующие окна
 не обходятся выбором удобных пригодных строк и не пересчитываются свежим raw.
 Evaluation начинается с max(online_start_index,cutoff_index), initial_history
@@ -26,6 +26,33 @@ Evaluation начинается с max(online_start_index,cutoff_index), initial
 Prepared inputs самодостаточны, сохраняются после stop и повторно используются
 при новом start той же конфигурации. Их не заменяет новый снимок raw.
 Официальные AWS ядро/affine/порядок признаков и бюджеты сохраняются.
+
+Системная очистка агрегата хранит технический резерв `model_history_v1`:
+не менее 512 последних позиций событийной сетки, больше при необходимости
+конфигураций моделей. Это не настройка глубины прогрева и не выбор 512 пригодных
+строк через разрывы. Unknown/null и уже очищенные окна сохраняют свой смысл.
+Дополнительно проверяются все связанные модели, включая stopped, requested,
+starting, отстающие и восстанавливающиеся. Непрочитанный хвост после consumed
+может удерживать историю значительно длиннее резерва; evaluated его не заменяет.
+
+Опубликованная незавершённая попытка удерживает исходные базовые окна своего
+сохранённого плана и cutoff. Новый хвост агрегата не сдвигает этот план.
+Освободить базовые payload после подготовки можно только при строгой проверке
+владельца, конфигурации, сетки, качества, hash и всего самодостаточного batch.
+Сохранённый affine у первого входа применяется ко всем `ml_input` этого batch.
+Непроверяемый checkpoint или попытка запрещает новое автоматическое удаление;
+неуспех обслуживания не превращается в ошибку или автоматический запуск модели.
+Перед публикацией нового плана сервис повторно проверяет identity и наличие
+базовых закрытых окон под тем же mutex, что используют управление и очистка.
+
+Физическая очистка ищет оставшиеся тяжёлые membership и outcome через частичные
+индексы, начиная с начала оставшихся записей. Сохранённый UUID курсора описывает
+прогресс и не исключает позднюю запись с меньшим UUID. Статистика выражения
+`compacted` позволяет обычному PostgreSQL ANALYZE оценить оставшуюся долю outcome;
+обслуживание агрегата само ANALYZE не запускает. Завершение ручной очистки и
+пробуждение отложенной автоматической очистки фиксируются одной транзакцией.
+Автоматическая порция outcome ограничена 1000 строками с учётом построчных DB
+проверок и общего бюджета хода 1 с; ручная порция сохраняет предел 5000 строк.
 
 Пауза агрегата сохраняет разрешение, модель и курсор, отменяя stale candidates.
 Unpause фиксирует recovery aggregate_resume по уже наступившим close deadlines;
@@ -46,6 +73,12 @@ Outcome становится тонким; для карточки сохран�
 проекции last_consumed/last_evaluated, а не скрытая копия удалённого ряда.
 Очистка защищает диапазоны всех связанных моделей, как описано в
 [контракте агрегатов](aggregates.md#пауза-и-ручная-очистка).
+Автоматическая очистка также сохраняет checkpoint, inputs/hash, курсоры,
+самостоятельные находки и последние проекции. Сначала атомарно исчезают payload
+и его snapshot, а закрытое окно получает cleared; затем небольшими порциями
+освобождаются тяжёлые membership/outcome данные. Постоянные пары membership ID
+остаются, поэтому прежние участники не становятся late и закрытые окна не
+рассчитываются повторно. Пауза и очистка сами не возобновляют stopped-модель.
 
 Адресные регрессии нового пути:
 
@@ -65,7 +98,11 @@ python -B scripts/agent_test_profiles.py backend-db --rcf --pytest tests/ml/even
 
 В форме выбирается активный агрегат в одном поле с серверным поиском по имени
 по всему каталогу. Показываются первые 10 совпадений; поиск уточняется после
-паузы 250 мс. Источник различает одинаковые имена. Выбранный агрегат сохраняется
+паузы 250 мс. Источник различает одинаковые имена. Прежний остановленный расчёт,
+пауза и незавершённая очистка видны с объяснением недоступности выбора; отдельного
+серверного фильтра по этим признакам нет. Для прежнего расчёта нужна новая
+событийная копия, для паузы/очистки — завершение действия в карточке агрегата.
+Выбранный агрегат сохраняется
 при новом поиске и ошибке загрузки. Сохранение
 создаёт конфигурацию без запуска. Обычный прогрев выбран по умолчанию;
 ускоренный задаёт целый шаг от 1 секунды до длительности окна. Дополнительные
@@ -77,6 +114,25 @@ python -B scripts/agent_test_profiles.py backend-db --rcf --pytest tests/ml/even
 фактическое покрытие прогрева, UTC-расписание в выбранном поясе, backlog/lag
 и происхождение восстановления. Неизвестные значения не заменяются нулями.
 Постоянная 🔥 означает только подтверждённый ускоренный прогрев.
+
+Состояние агрегата показывается независимо от готовности и разрешения модели:
+событийный процесс либо прежний остановленный расчёт, отдельно пауза.
+При паузе сохраняются модель и позиция. Остановленный вручную детектор
+не запускается при продолжении агрегата и требует своего явного start.
+У retired карточки доступны прежние результаты с исходным основанием времени;
+терминальное состояние не объявляется удалением активного агрегата.
+
+У последнего потреблённого/оценённого окна видны time_basis и origin,
+границы событийного либо прежнего технического окна, номинальный конец
+scheduled_at и отдельный close_not_before_at. Следующие номинальный конец
+и срок закрытия также показаны раздельно. Штатное ожидание online-срока
+end+min(duration,300 секунд) не выдаётся за вычислительное отставание.
+Очередь и задержка берутся из DTO сервера; пояс меняет только подписи.
+Recovery aggregate_resume объясняется как продолжение агрегата после паузы,
+отдельно от manual_resume детектора и аварийного восстановления.
+Cleanup/retired/deadline имеют отдельные безопасные объяснения.
+После очистки point payload последние проекции карточки читаются из detector
+DTO и не исчезают вместе со строками агрегатного ряда.
 
 Запуск — отдельное действие; остановка требует подтверждения и сохраняет
 модель/курсор для последующего восполнения. Подтверждение содержит имя и UUID;
@@ -100,6 +156,16 @@ smoke-профилей; команды, подготовка истории и �
 [инструкции проверок](agent-test-profiles.md). Находки и их интерфейс остаются
 отдельным пользовательским сценарием этапа.
 
+Браузерный сценарий очистки проверяет защиту всех связанных детекторов,
+их явную остановку и удаление до восьми разрешённых старых payload.
+Количество не растёт вместе с длительностью предшествующих визуальных проверок:
+keep_last=K−min(8,maximum_delete), не меньше minimum_keep.
+Проверяются succeeded, точное уменьшение total, 410 очищенного окна после
+обновления и нового продвижения worker, сохранность последних проекций моделей.
+Этот UI smoke не измеряет скорость массовой очистки. Контрактные UI mocks
+используют явно доступный событийный агрегат и не наследуют временную паузу
+или cleanup fence из предыдущего live-сценария.
+
 ## HTTP управления и диагностики
 
 Все маршруты имеют префикс `/api/v1/detectors`. Они используют серверную
@@ -109,22 +175,36 @@ smoke-профилей; команды, подготовка истории и �
 каждом запросе, в том числе при повторе ранее принятой команды. API работает
 без JRE/JPype/JAR и не вызывает модель, подготовку истории или worker по HTTP.
 
-| Метод | Успех / DTO | Право |
-| --- | --- | --- |
-| `POST /detectors` | 201 `DetectorCommandReceipt` | `detectors.write` |
-| `GET /detectors` | 200 `DetectorPage` | `detectors.read` |
-| `GET /detectors/{id}` | 200 `DetectorCard` | `detectors.read` |
+| Метод                        | Успех / DTO                  | Право             |
+| ---------------------------- | ---------------------------- | ----------------- |
+| `POST /detectors`            | 201 `DetectorCommandReceipt` | `detectors.write` |
+| `GET /detectors`             | 200 `DetectorPage`           | `detectors.read`  |
+| `GET /detectors/{id}`        | 200 `DetectorCard`           | `detectors.read`  |
 | `POST /detectors/{id}/start` | 202 `DetectorCommandReceipt` | `detectors.write` |
-| `POST /detectors/{id}/stop` | 200 `DetectorCommandReceipt` | `detectors.write` |
+| `POST /detectors/{id}/stop`  | 200 `DetectorCommandReceipt` | `detectors.write` |
 
 Примеры JSON создания (подставьте UUID сохранённого активного агрегата):
 
 ```json
-{"aggregate_id":"00000000-0000-4000-8000-000000000100","name":"Число событий"}
+{
+  "aggregate_id": "00000000-0000-4000-8000-000000000100",
+  "name": "Число событий"
+}
 ```
 
 ```json
-{"aggregate_id":"00000000-0000-4000-8000-000000000100","name":"Ускоренный прогрев","accelerated":true,"step_seconds":60,"config":{"trees":100,"sample_size":256,"output_after":256,"seed":42}}
+{
+  "aggregate_id": "00000000-0000-4000-8000-000000000100",
+  "name": "Ускоренный прогрев",
+  "accelerated": true,
+  "step_seconds": 60,
+  "config": {
+    "trees": 100,
+    "sample_size": 256,
+    "output_after": 256,
+    "seed": 42
+  }
+}
 ```
 
 Во втором примере длительность агрегата должна быть не меньше 60 секунд.
@@ -195,34 +275,37 @@ states, включая created/stopped/failed/terminated, без исключе�
 
 `DetectorSummary` содержит:
 
-| Поля | Смысл / null |
-| --- | --- |
-| id/name, aggregate_id/aggregate_name/aggregate_state, source_id/source_name, created_at | UUID и сохранённые имена; aggregate_state=active/archived/deleted |
-| execution_state, model_state | Раздельные перечисления из таблицы состояний; running не подтверждает health процесса |
-| accelerated, accelerated_used | Настройка и provenance успешного ускоренного прогрева; used означает 🔥, без оценки опасности |
-| reason | `{code,message,factor}` либо null; factor только известный ресурсный фактор/null, русское сообщение по allowlist |
-| last_consumed, last_evaluated | Отдельные `DetectorWindow` либо null до соответствующего перехода |
-| backlog, lag_seconds | Число наступивших окон от следующей границы / задержка этой границы; null до подтверждённой границы оценки, даже при начатом прогреве |
+| Поля                                                                                    | Смысл / null                                                                                                                     |
+| --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| id/name, aggregate_id/aggregate_name/aggregate_state, source_id/source_name, created_at | UUID и сохранённые имена; aggregate_state=active/archived/deleted                                                                |
+| aggregate_semantic_basis/aggregate_execution_mode/aggregate_paused                      | event_time/availability_v1, current/retired и отдельный признак паузы; не новые lifecycle states                                 |
+| execution_state, model_state                                                            | Раздельные перечисления из таблицы состояний; running не подтверждает health процесса                                            |
+| accelerated, accelerated_used                                                           | Настройка и provenance успешного ускоренного прогрева; used означает 🔥, без оценки опасности                                    |
+| reason                                                                                  | `{code,message,factor}` либо null; factor только известный ресурсный фактор/null, русское сообщение по allowlist                 |
+| last_consumed, last_evaluated                                                           | Отдельные `DetectorWindow` либо null до соответствующего перехода                                                                |
+| backlog, lag_seconds                                                                    | Число наступивших окон / задержка от следующего close deadline; null до подтверждённой границы оценки, даже при начатом прогреве |
 
 DetectorWindow: точный целый index, kind=evaluated/skipped, safe reason/null,
-start_utc/end_utc/scheduled_at, aggregation_started_at/aggregation_completed_at,
+start_utc/end_utc/scheduled_at, time_basis (event_time либо прежние availability_at/
+backend_processed_at_historical), origin (online/initial_history/legacy),
+close_not_before_at (UTC/null), aggregation_started_at/aggregation_completed_at,
 evaluation_started_at/evaluation_completed_at (null для skipped), late.
 Skipped продвигает только consumed, поэтому last_evaluated может относиться
 к более раннему окну либо отсутствовать. Точные индексы/config не приводятся к float.
 
 `DetectorCard` добавляет:
 
-| Поля | Смысл / null |
-| --- | --- |
-| config | dimensions/trees/sample_size/output_after/seed, целые неизменяемые значения |
-| feature_keys/feature_names | Полные закреплённые списки в серверном порядке |
-| anchor_utc/duration_seconds/step_seconds | Неизменяемое UTC-расписание и шаг прогрева |
-| revision/execution_generation/updated_at | Сохранённые revision, поколение и время |
-| start_request_id/start_requested_at/execution_started_at/stopped_at | Текущая идентичность запроса и сохранённые даты; null до появления соответствующего факта |
-| last_failure | `{reason,at,start_request_id}` либо null; прошлый failure не подменяет reason текущего запуска |
-| warmup | Сводка активной сохранённой попытки либо null, когда попытки ещё нет или её batch пуст |
-| recovery | Последний диапазон `{reason,first_index,last_index,started_at}` либо null; reason=crash_recovery/manual_resume |
-| next_scheduled_at/next_close_not_before_at/waiting_for_point | Конец следующего окна / его close deadline с учётом intentional archive / отсутствие готовой точки; null до границы оценки |
+| Поля                                                                | Смысл / null                                                                                                                    |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| config                                                              | dimensions/trees/sample_size/output_after/seed, целые неизменяемые значения                                                     |
+| feature_keys/feature_names                                          | Полные закреплённые списки в серверном порядке                                                                                  |
+| anchor_utc/duration_seconds/step_seconds                            | Неизменяемое UTC-расписание и шаг прогрева                                                                                      |
+| revision/execution_generation/updated_at                            | Сохранённые revision, поколение и время                                                                                         |
+| start_request_id/start_requested_at/execution_started_at/stopped_at | Текущая идентичность запроса и сохранённые даты; null до появления соответствующего факта                                       |
+| last_failure                                                        | `{reason,at,start_request_id}` либо null; прошлый failure не подменяет reason текущего запуска                                  |
+| warmup                                                              | Сводка активной сохранённой попытки либо null, когда попытки ещё нет или её batch пуст                                          |
+| recovery                                                            | Последний диапазон `{reason,first_index,last_index,started_at}` либо null; reason=crash_recovery/manual_resume/aggregate_resume |
+| next_scheduled_at/next_close_not_before_at/waiting_for_point        | Конец следующего окна / его close deadline с учётом intentional archive / отсутствие готовой точки; null до границы оценки      |
 
 Warmup содержит cutoff, step_seconds, required_windows (минимум ModelConfig),
 planned_windows, materialized_windows, feature_valid_windows, eligible_windows,
@@ -329,14 +412,14 @@ cold/warm init/restore/process/checkpoint timings. Worker heartbeat содерж
 не загружает. Существующие backend-зависимости остаются под прежними
 ограничениями `pyproject.toml`; фиксация ML не является полным lockfile backend.
 
-| Компонент | Версия / назначение |
-| --- | --- |
-| AWS core, parkservices | 4.4.0, официальный тег `4.4.0-java` |
-| AWS testutils | 4.4.0, опубликованная compile-зависимость parkservices |
-| Eclipse Temurin JRE | 17.0.17+10, Linux amd64, digest в manifest и Dockerfile |
-| JPype1 | 1.6.0, CPython 3.12 manylinux2014 x86_64 wheel |
-| packaging | 25.0, зависимость JPype |
-| Jackson annotations/core/databind | 2.18.3, структурированный JSON mapper-state |
+| Компонент                         | Версия / назначение                                     |
+| --------------------------------- | ------------------------------------------------------- |
+| AWS core, parkservices            | 4.4.0, официальный тег `4.4.0-java`                     |
+| AWS testutils                     | 4.4.0, опубликованная compile-зависимость parkservices  |
+| Eclipse Temurin JRE               | 17.0.17+10, Linux amd64, digest в manifest и Dockerfile |
+| JPype1                            | 1.6.0, CPython 3.12 manylinux2014 x86_64 wheel          |
+| packaging                         | 25.0, зависимость JPype                                 |
+| Jackson annotations/core/databind | 2.18.3, структурированный JSON mapper-state             |
 
 AWS, JPype и Jackson поставляются под Apache-2.0; packaging — Apache-2.0
 или BSD-2-Clause; OpenJDK — GPL-2.0 с Classpath Exception. Содержимое JAR,
@@ -351,6 +434,12 @@ preprocessor, predictor-corrector и last descriptor. Jackson читает ко�
 config/settings, порядком ключей, rule hash, affine-параметрами, preceding history,
 update count и подтверждённой границей входа. Проверка предшествует загрузке
 Java-state. Повреждение/несовместимость дают отказ без создания нового леса.
+
+При исполнении содержимое codec восстанавливает и проверяет закреплённый JVM mapper;
+его работа не дублируется полным Python-разбором дерева. Перед автоматическим
+освобождением истории JVM не запускается: отдельная полная нейтральная проверка
+дополнительно доказывает пригодность буферов, ссылок sampler/point store и дерева
+в общем бюджете maintenance. Непроверяемое содержимое сохраняет историю.
 Checksum использует канонические JSON-числа: целочисленная экспоненциальная
 запись и её развёрнутая JSONB-форма имеют один digest. После чтения сохранённые
 ML-координаты возвращаются в float перед сравнением float32-представлений;
@@ -394,7 +483,7 @@ Bounded history сохраняется в checkpoint и восстанавлив
 ## Конфигурация, качество и прогрев
 
 Config фиксирует dimension, trees, sampleSize, outputAfter и seed; sampleSize>=2,
-outputAfter>=sampleSize. Ресурсная оценка dimensions*trees*sampleSize*256 байт
+outputAfter>=sampleSize. Ресурсная оценка dimensions*trees*sampleSize\*256 байт
 ограничена 256 MiB с запасом для JVM/Python. Фиксированного порога в пять нет.
 ModelConfig.settings закрепляет FLOAT_32, internal shingling, unit weights,
 centerOfMass=false, sequence indexes=false, boundingBoxCacheFraction=1,
@@ -414,7 +503,7 @@ null, nonfinite, invalid_count и reason отвергают весь векто�
 Cutoff — конец последнего доступного сохранённого canonical окна.
 N_model=max(2*sampleSize,outputAfter+1), по умолчанию 512. Обычный шаг=duration;
 ускоренный — целые секунды 0<step<=duration. Ускоренный план имеет
-max(N_model,1+ceil(7*duration/step)) окон и охват >=8*duration; перекрытия
+max(N_model,1+ceil(7*duration/step)) окон и охват >=8\*duration; перекрытия
 не объявляются независимыми периодами. План не пересекает anchor и не зависит
 от TimeZone. Недостаточная история даёт waiting, превышение бюджета — причину
 без усечения. Бюджеты: 4096 окон, 30 с подготовки всего batch,
@@ -431,6 +520,11 @@ REPEATABLE READ вне lifecycle-lock; каждый SQL получает ост�
 сохраняет план и весь batch. Inputs содержат точные FeatureResult, quality/evidence,
 границы/основание, affine и ML-вход. DB-trigger запрещает менять inputs после
 подготовки. Прогрев читает только snapshots: удаление событий не меняет обучение.
+Identity, владелец, cutoff и план попытки неизменяемы в БД. Prepared/waiting/ready
+не возвращаются в preparing; явный повтор неудавшегося запуска создаёт новую
+попытку. Поэтому обслуживание сравнивает сохранённую identity/revision и
+лёгкие status/hash без загрузки или повторного хеширования input/plan JSON
+под блокировками управления.
 
 Во время прогрева findings не создаются. Успех требует пригодной изменчивой
 истории и готовности официального леса. Evaluation начинается с end>cutoff;
@@ -469,6 +563,17 @@ Skip продвигает consumed; evaluated и лес сохраняются. 
 working indices даёт ожидание; прыжок разрешён только по сохранённому intentional
 archive range. Архив запрещает переходы, resume сохраняет модель. Удаление
 атомарно останавливает всех связанных детекторов, сохраняя историю.
+Терминальное окно `calculation_status=uncomputed` не является дырой: детектор
+сохраняет `skipped` с причиной `execution_budget_exceeded` и атомарно продвигает
+consumed. В этом переходе даже восстановление модели не требуется; train, score
+и Finding не вызываются. Checkpoint и последняя evaluated projection сохраняются.
+Для такого skipped-окна время начала в публичной сводке берётся из сохранённого
+начала попытки, поскольку snapshot reference отсутствует; граница снимка не
+выдумывается.
+Обычный прогрев и ускоренный прогрев по пересекающемуся basis отвергают такое
+окно с `warmup_window_uncomputed`; восстановление значений из raw в обход
+терминального отказа запрещено. Нормальный вычисленный ноль остаётся пригодным
+числовым значением при выполнении прежних проверок качества.
 Ошибка/rollback/конфликт/неизвестный исход commit отбрасывают кандидата;
 ручной повтор начинает с нового чтения БД и подтверждённого checkpoint.
 
@@ -514,15 +619,15 @@ REPEATABLE READ batch при конкурентном удалении собы�
 Готовность модели (`waiting/warming/ready/error`, окончательный `stopped` после
 удаления агрегата) отделена от `execution_state`:
 
-| Значение | Смысл |
-| --- | --- |
-| `created` | Создан без разрешения; worker не готовит историю и не обучает |
-| `requested` | Долговечный запрос пользователя, ещё не принятый worker |
-| `starting` | Worker принял запрос; готовит модель или проверяет checkpoint |
-| `running` | Запуск подтверждён атомарно с checkpoint |
-| `stopped` | Ручная остановка; checkpoint, курсор и история сохранены |
-| `failed` | Подтверждённый неуспех/прерванный запуск; нужен ручной start |
-| `terminated` | Агрегат удалён; start запрещён окончательно |
+| Значение     | Смысл                                                                                                      |
+| ------------ | ---------------------------------------------------------------------------------------------------------- |
+| `created`    | Создан без разрешения; worker не готовит историю и не обучает                                              |
+| `requested`  | Долговечный запрос пользователя, ещё не принятый worker                                                    |
+| `starting`   | Worker принял запрос; готовит модель или проверяет checkpoint                                              |
+| `running`    | Запуск подтверждён атомарно с checkpoint                                                                   |
+| `stopped`    | Ручная остановка; checkpoint, курсор и история сохранены                                                   |
+| `failed`     | Подтверждённый неуспех/прерванный запуск; нужен ручной start                                               |
+| `terminated` | Агрегат удалён либо прежний расчёт необратимо остановлен; причина различается, start запрещён окончательно |
 
 Миграция 0019 сохраняет старые checkpoints, inputs, outcomes и findings, но не
 выдаёт прежним детекторам разрешение. Start фиксирует UUID запроса,
@@ -586,7 +691,9 @@ State читает один REPEATABLE READ snapshot: модель, execution st
 ожидание точки. Отсутствие первой оценки даёт null. Стабильные коды и русские
 объяснения находятся в detection/execution.py: history_insufficient,
 history_quality, resource_limit, checkpoint_invalid, start_interrupted,
-working_point_pending, aggregate_inactive, aggregate_deleted, manual_stop,
+working_point_pending, waiting_close_deadline, aggregate_paused,
+cleanup_in_progress, aggregate_time_semantics_retired,
+aggregate_inactive, aggregate_deleted, manual_stop,
 temporary_unavailable. Неподтверждённый отказ БД не объявляется сохранённым.
 Для ресурсной ошибки last_failure.details.factor сохраняет только известный
 фактор бюджета (например model_seconds, checkpoint_bytes, operator_cost или

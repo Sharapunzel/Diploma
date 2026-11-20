@@ -2,8 +2,10 @@ from collections.abc import Generator
 
 from fastapi import Request
 from sqlalchemy import MetaData, create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from .db_deadline import DeadlineQueuePool, install_deadline_hooks
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -20,7 +22,10 @@ class Base(DeclarativeBase):
 
 class Database:
     def __init__(self, database_url: str):
-        self.engine: Engine = create_engine(database_url, pool_pre_ping=True)
+        url = make_url(database_url)
+        options = {"poolclass": DeadlineQueuePool} if url.get_backend_name() == "postgresql" and url.get_driver_name() == "psycopg" else {}
+        self.engine: Engine = create_engine(database_url, pool_pre_ping=True, **options)
+        install_deadline_hooks(self.engine)
         self.session_factory = sessionmaker(
             bind=self.engine,
             class_=Session,

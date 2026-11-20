@@ -46,7 +46,10 @@ export async function inspectAggregateScreen(page: Page, name: string) {
       }
       if (name === "diagnostics")
         await page
-          .getByRole("heading", { name: "Предварительный расчёт", exact: true })
+          .getByRole("heading", {
+            name: "Предварительный расчёт — результат не сохранён",
+            exact: true,
+          })
           .evaluate((el) => el.scrollIntoView({ block: "start" }));
       if (
         (await dialog.count()) &&
@@ -76,6 +79,7 @@ export async function inspectAggregateScreen(page: Page, name: string) {
       await page.screenshot({
         path: test.info().outputPath(`${name}-${theme}-${width}.png`),
         fullPage: false,
+        animations: "disabled",
       });
       if (
         (await dialog.count()) &&
@@ -89,6 +93,7 @@ export async function inspectAggregateScreen(page: Page, name: string) {
         await page.screenshot({
           path: test.info().outputPath(`${name}-${theme}-${width}-formula.png`),
           fullPage: false,
+          animations: "disabled",
         });
       }
       if (name === "diagnostics") {
@@ -98,6 +103,7 @@ export async function inspectAggregateScreen(page: Page, name: string) {
         await page.screenshot({
           path: test.info().outputPath(`${name}-${theme}-${width}-values.png`),
           fullPage: false,
+          animations: "disabled",
         });
       }
       if (["create", "copy", "saved-card"].includes(name)) {
@@ -109,23 +115,17 @@ export async function inspectAggregateScreen(page: Page, name: string) {
             .info()
             .outputPath(`${name}-${theme}-${width}-features.png`),
           fullPage: false,
+          animations: "disabled",
         });
       }
     }
   }
-  await page.setViewportSize({ width: 800, height: 600 });
-  await page.evaluate(() => {
-    document.documentElement.style.zoom = "2";
-  });
   try {
-    const dialog = page.getByRole("dialog");
-    if (await dialog.count()) {
-      await expect
-        .poll(async () => {
-          const box = await dialog.boundingBox();
-          return !!box && box.x >= 0 && box.x + box.width <= 801;
-        })
-        .toBe(true);
+    for (const theme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme: theme });
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      await page.setViewportSize({ width: 1280, height: 360 });
+      const dialog = page.getByRole("dialog");
       if (name === "primary-modal" || name === "derived-modal") {
         await expect
           .poll(async () => {
@@ -137,22 +137,86 @@ export async function inspectAggregateScreen(page: Page, name: string) {
               !!box &&
               !!footer &&
               box.y >= 12 &&
-              box.y + box.height <= 588 &&
-              footer.y + footer.height <= 588
+              box.y + box.height <= 348 &&
+              footer.y >= 12 &&
+              footer.y + footer.height <= 348
             );
           })
           .toBe(true);
+        await dialog
+          .getByRole("heading", { name: "1. Настройки признака", exact: true })
+          .scrollIntoViewIfNeeded();
       }
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () => document.documentElement.scrollWidth <= innerWidth,
+          ),
+        )
+        .toBe(true);
+      await page.screenshot({
+        path: test.info().outputPath(`${name}-${theme}-short-360.png`),
+        fullPage: false,
+        animations: "disabled",
+      });
+      if (name === "primary-modal" || name === "derived-modal") {
+        await dialog
+          .getByRole("heading", { name: "4. Итоговая формула", exact: true })
+          .scrollIntoViewIfNeeded();
+        await page.screenshot({
+          path: test
+            .info()
+            .outputPath(`${name}-${theme}-short-360-formula.png`),
+          fullPage: false,
+          animations: "disabled",
+        });
+      }
+
+      await page.setViewportSize({ width: 800, height: 600 });
+      await page.evaluate(() => {
+        document.documentElement.style.zoom = "2";
+      });
+      if (await dialog.count()) {
+        await expect
+          .poll(async () => {
+            const box = await dialog.boundingBox();
+            return !!box && box.x >= 0 && box.x + box.width <= 801;
+          })
+          .toBe(true);
+        if (name === "primary-modal" || name === "derived-modal") {
+          await expect
+            .poll(async () => {
+              const box = await dialog.boundingBox();
+              const footer = await dialog
+                .getByRole("button", { name: "Отмена", exact: true })
+                .boundingBox();
+              return (
+                !!box &&
+                !!footer &&
+                box.y >= 12 &&
+                box.y + box.height <= 588 &&
+                footer.y + footer.height <= 588
+              );
+            })
+            .toBe(true);
+        }
+      }
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () => document.documentElement.scrollWidth <= innerWidth,
+          ),
+        )
+        .toBe(true);
+      await page.screenshot({
+        path: test.info().outputPath(`${name}-${theme}-zoom-200.png`),
+        fullPage: false,
+        animations: "disabled",
+      });
+      await page.evaluate(() => {
+        document.documentElement.style.zoom = "";
+      });
     }
-    await expect
-      .poll(() =>
-        page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
-      )
-      .toBe(true);
-    await page.screenshot({
-      path: test.info().outputPath(`${name}-zoom-200.png`),
-      fullPage: false,
-    });
   } finally {
     await page.evaluate(() => {
       document.documentElement.style.zoom = "";

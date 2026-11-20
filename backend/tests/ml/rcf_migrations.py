@@ -16,9 +16,11 @@ def test_detector_upgrade_check_downgrade_upgrade():
     engine = create_engine(url)
     try:
         with engine.connect() as connection:
-            before = connection.execute(text("SELECT id,checkpoint,active_attempt_id,consumed_index,execution_state,execution_generation FROM logs.detectors ORDER BY id")).all()
+            before = connection.execute(text("SELECT id,checkpoint,active_attempt_id,consumed_index,execution_state,execution_generation,last_consumed_projection,last_evaluated_projection FROM logs.detectors ORDER BY id")).all()
             counts = connection.execute(text("SELECT (SELECT count(*) FROM logs.detector_warmups),(SELECT count(*) FROM logs.detector_outcomes),(SELECT count(*) FROM logs.findings)")).one()
             aggregates = connection.scalar(text("SELECT count(*) FROM logs.aggregates"))
+            retention = connection.execute(text("SELECT aggregate_id,policy_version,status,history_revision,auto_cleared_total,pending_closure_id,pending_phase,pending_cursor,last_cleared_at FROM logs.aggregate_retention_state ORDER BY aggregate_id")).all()
+            assert len(retention) == aggregates
         if aggregates:
             refused=subprocess.run([sys.executable,"-B","-m","alembic","downgrade","0018_detector_core"],env=env,capture_output=True,text=True,check=False)
             assert refused.returncode!=0 and "explicit data-preserving migration" in refused.stderr
@@ -26,9 +28,11 @@ def test_detector_upgrade_check_downgrade_upgrade():
             for command in (["downgrade","0017_capture_writer_guard"],["upgrade","head"]):
                 subprocess.run([sys.executable,"-B","-m","alembic",*command],env=env,check=True)
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT id,checkpoint,active_attempt_id,consumed_index,execution_state,execution_generation FROM logs.detectors ORDER BY id")).all()==before
+            assert connection.execute(text("SELECT id,checkpoint,active_attempt_id,consumed_index,execution_state,execution_generation,last_consumed_projection,last_evaluated_projection FROM logs.detectors ORDER BY id")).all()==before
             assert connection.execute(text("SELECT (SELECT count(*) FROM logs.detector_warmups),(SELECT count(*) FROM logs.detector_outcomes),(SELECT count(*) FROM logs.findings)")).one()==counts
-            assert connection.scalar(text("SELECT version_num FROM alembic_version"))=="0021_event_time"
+            assert connection.execute(text("SELECT aggregate_id,policy_version,status,history_revision,auto_cleared_total,pending_closure_id,pending_phase,pending_cursor,last_cleared_at FROM logs.aggregate_retention_state ORDER BY aggregate_id")).all()==retention
+            assert connection.scalar(text("SELECT count(*) FROM pg_statistic_ext WHERE stxnamespace='logs'::regnamespace AND stxname='st_outcome_retention_compacted'")) == 1
+            assert connection.scalar(text("SELECT version_num FROM alembic_version"))=="0024_aggregate_execution_budget"
     finally:
         engine.dispose()
     subprocess.run([sys.executable,"-B","-m","alembic","check"],env=env,check=True)

@@ -7,6 +7,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    FetchedValue,
     ForeignKey,
     Index,
     Integer,
@@ -42,6 +43,8 @@ class ParsedLog(Base):
             name="processing_after_receipt",
         ),
         Index("ix_parsed_logs_source_processed", "source_id", "backend_processed_at"),
+        Index("ix_parsed_logs_source_event_time", "source_id", "event_time_utc", "id",
+            postgresql_where=text("event_time_reason IS NULL")),
         Index("ix_parsed_logs_connection_id", "connection_id"),
         Index("ix_parsed_logs_normalizer_id", "normalizer_id"),
         Index("ix_parsed_logs_fluent_collected", "fluent_bit_collected_at"),
@@ -95,6 +98,10 @@ class ParsedLog(Base):
     )
     raw: Mapped[str] = mapped_column(Text, nullable=False)
     ecs_data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    event_time_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), server_default=FetchedValue(), server_onupdate=FetchedValue())
+    event_time_reason: Mapped[str | None] = mapped_column(
+        Text, server_default=FetchedValue(), server_onupdate=FetchedValue())
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("CURRENT_TIMESTAMP"),

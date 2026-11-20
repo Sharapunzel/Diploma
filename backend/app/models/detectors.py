@@ -137,6 +137,8 @@ class DetectorOutcome(Base):
     __tablename__ = "detector_outcomes"
     __table_args__ = (
         Index("uq_detector_outcome_input", "detector_id", "working_point_id", unique=True),
+        Index("ix_outcome_retention_remaining", "working_point_id", "id",
+            postgresql_where=text("(data ->> 'compacted')::boolean IS DISTINCT FROM true")),
         CheckConstraint("kind IN ('evaluated','skipped')", name="kind_valid"),
         {"schema": "logs"},
     )

@@ -51,6 +51,7 @@ export type Context = {
   api: AggregatesApi;
   source: string;
   aggregateLeaves?: boolean;
+  inputsSeparate?: boolean;
 };
 export const InvalidContext = createContext<
   (id: string, invalid: boolean) => void
@@ -418,14 +419,14 @@ export function ConditionControl({
     >
       <h4>
         {path === "where"
-          ? "Общий отбор событий"
+          ? "Отбор событий для всего агрегата"
           : path === "feature.where"
             ? "Отбор событий признака"
             : "Отбор событий этого входа"}{" "}
       </h4>
       <p className={styles.notice}>
         {path === "where"
-          ? "Для всех признаков. Индивидуальный отбор задаётся в окне признака."
+          ? "Сначала окно по ECS @timestamp, затем это условие для всех признаков. Например, event.category=authentication; отдельный счётчик может дополнительно отбирать event.action=logon."
           : "Сначала отбор событий, затем агрегация и формула. Это не порог числового результата."}
       </p>
       {object(value) ? (
@@ -453,11 +454,13 @@ export function AggregateLeaf({
   context,
   path,
   onChange,
+  hideOperation = false,
 }: {
   value: JsonObject;
   context: Context;
   path: string;
   onChange: (v: JsonObject) => void;
+  hideOperation?: boolean;
 }) {
   const catalog = context.operators.filter(
     (o) => o.kind === "feature" && !["derive", "formula"].includes(o.name),
@@ -465,19 +468,21 @@ export function AggregateLeaf({
   const op = catalog.find((o) => o.name === value.op);
   return (
     <div className={styles.node}>
-      <OperationSelect
-        label="Агрегирующая операция"
-        name={`${nodeLabel(path)}: агрегация`}
-        value={String(value.op)}
-        options={catalog}
-        onChange={(name) =>
-          onChange({
-            ...defaultNode(catalog.find((o) => o.name === name)!),
-            ...(value.where != null ? { where: value.where } : {}),
-          })
-        }
-      />
-      {op?.parameters.includes("field") && (
+      {!hideOperation && (
+        <OperationSelect
+          label="Агрегирующая операция"
+          name={`${nodeLabel(path)}: агрегация`}
+          value={String(value.op)}
+          options={catalog}
+          onChange={(name) =>
+            onChange({
+              ...defaultNode(catalog.find((o) => o.name === name)!),
+              ...(value.where != null ? { where: value.where } : {}),
+            })
+          }
+        />
+      )}
+      {!context.inputsSeparate && op?.parameters.includes("field") && (
         <FieldPicker
           context={context}
           operation={op.name}

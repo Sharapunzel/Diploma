@@ -1,12 +1,14 @@
 """PostgreSQL queries for immutable aggregates and their snapshots."""
 
 from datetime import UTC
+from time import monotonic
 from uuid import UUID
 
 from sqlalchemy import Text, func, select, update
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.orm.attributes import set_committed_value
 
+from ...aggregation.event_time import EventTimeBudgetError
 from ...aggregation.rules import Limits
 from ...models import (
     Aggregate,
@@ -16,44 +18,68 @@ from ...models import (
     Source,
     WorkingWindowPoint,
 )
+from .aggregate_attempts import SqlAlchemyAggregateAttemptQueries
 from .aggregate_cleanup import SqlAlchemyAggregateCleanupQueries
 from .aggregate_discovery import SqlAlchemyAggregateDiscovery
 from .aggregate_event_time import SqlAlchemyEventTimeQueries
 from .aggregate_field_catalog import SqlAlchemyFieldCatalogQueries
 from .aggregate_overlap import SqlAlchemyAggregateOverlapQueries
+from .aggregate_retention import SqlAlchemyAggregateRetentionQueries
 
 
 class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries, SqlAlchemyEventTimeQueries,
                                    SqlAlchemyAggregateDiscovery, SqlAlchemyAggregateCleanupQueries,
-                                   SqlAlchemyAggregateOverlapQueries):
+                                   SqlAlchemyAggregateOverlapQueries, SqlAlchemyAggregateRetentionQueries,
+                                   SqlAlchemyAggregateAttemptQueries):
     def __init__(self, session: Session):
         self.session = session
 
     def now(self):
         return self.session.scalar(select(func.clock_timestamp()))
 
+    def execution_now(self):
+        """Operational UTC anchor, independent of synthetic event release clocks."""
+        return self.session.scalar(select(func.clock_timestamp()))
+
     def source(self, source_id):
         return self.session.get(Source, source_id)
 
     def read_budget(self, milliseconds):
-        for setting in ("statement_timeout", "lock_timeout"):
-            self.session.execute(select(func.set_config(setting, str(milliseconds), True)))
+        deadline = monotonic() + milliseconds / 1000
+        with self.session.no_autoflush:
+            # Checkout/network wait itself is a separate infrastructure bound.
+            # It must never give the next statement a stale full allowance.
+            self.session.connection()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise EventTimeBudgetError("operation_seconds")
+            milliseconds = max(1, int(remaining * 1000))
+            self.session.execute(select(
+                func.set_config("statement_timeout", str(milliseconds), True),
+                func.set_config("lock_timeout", str(milliseconds), True)))
 
-    def limits(self, limits: Limits, preview: bool):
-        timeout = limits.preview_timeout_ms if preview else limits.working_timeout_ms
-        self.session.execute(select(func.set_config("statement_timeout", str(timeout), True)))
-        self.session.execute(select(func.set_config("work_mem", f"{limits.work_mem_mb}MB", True)))
+    def limits(self, limits: Limits, preview: bool, budget=None):
+        if budget is None:
+            timeout = limits.preview_timeout_ms if preview else limits.working_timeout_ms
+            self.session.execute(select(func.set_config("statement_timeout", str(timeout), True)))
+            self.session.execute(select(func.set_config("work_mem", f"{limits.work_mem_mb}MB", True)))
+            self.session.execute(select(func.set_config("jit", "off", True)))
+            return
         # Large guarded JSON expressions otherwise trigger LLVM compilation
-        # even for a one-row window. Keep latency bounded by query work rather
-        # than compiling hundreds of transient expression functions per point.
-        self.session.execute(select(func.set_config("jit", "off", True)))
+        # even for a one-row window.
+        with self.session.no_autoflush:
+            self.read_budget(budget.milliseconds())
+            budget.check()
+            self.session.execute(select(func.set_config("work_mem", f"{limits.work_mem_mb}MB", True),
+                func.set_config("jit", "off", True)))
+            budget.check()
 
     def _base(self, source_id, start, end, basis):
         if basis != "event_time":
             raise ValueError("legacy_calculation_removed")
         from .aggregate_event_time import classified_events
         events = classified_events(source_id, self.now())
-        query = select(events.c.ecs_data).where(events.c.reason.is_(None))
+        query = select(events.c.ecs_data).where(events.c.static_reason.is_(None), events.c.eligible)
         if start is not None:
             query = query.where(events.c.event_time >= start.astimezone(UTC).replace(tzinfo=None))
         if end is not None:
@@ -82,6 +108,7 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries, SqlAlchemyEve
         self.session.flush()
         self.session.add(aggregate)
         self.session.flush()
+        self.add_retention_state(aggregate, aggregate.created_at)
 
     def get(self, aggregate_id):
         return self.session.get(Aggregate, aggregate_id)
@@ -133,12 +160,16 @@ class SqlAlchemyAggregateRepository(SqlAlchemyFieldCatalogQueries, SqlAlchemyEve
         return items[0] if items else None
 
 
-    def due(self, limit=100):
-        return list(self.session.scalars(select(Aggregate.id).join(AggregateSchedule,
+    def due(self, limit=100, exclude_ids=()):
+        query = select(Aggregate.id).join(AggregateSchedule,
             Aggregate.schedule_id == AggregateSchedule.id).where(
-                (Aggregate.execution_mode == "current") & (Aggregate.state != "deleted")
-                | AggregateSchedule.active_cleanup_id.is_not(None)
-            ).order_by(Aggregate.last_error_at.asc().nullsfirst(), Aggregate.id).limit(limit)))
+                AggregateSchedule.active_cleanup_id.is_not(None)
+                | ((Aggregate.execution_mode == "current") & (Aggregate.state == "active")
+                   & AggregateSchedule.paused.is_(False))
+            )
+        if exclude_ids:
+            query = query.where(Aggregate.id.not_in(exclude_ids))
+        return list(self.session.scalars(query.order_by(Aggregate.last_error_at.asc().nullsfirst(), Aggregate.id).limit(limit)))
 
     def record_error(self, aggregate_id: UUID, code: str | None):
         self.session.execute(update(Aggregate).where(Aggregate.id == aggregate_id).values(last_error=code, last_error_at=func.clock_timestamp()))

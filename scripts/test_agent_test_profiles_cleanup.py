@@ -154,3 +154,83 @@ def test_failed_builder_removes_only_its_new_untagged_image(monkeypatch):
     profiles.compare_inventory(before, inventory({}), "diploma_t21_test")
     assert removed == ["sha256:buildkit"]
     assert present == set(before["images"])
+
+
+def test_rebuilt_compose_image_without_tag_is_removed_only_by_exact_project_identity(monkeypatch):
+    project = "diploma_t21_image_test"
+    previous, candidate = "sha256:previous", "sha256:rebuilt"
+    before = {"images": [previous + " user/preserved:latest"]}
+    # A prior image can also lose its tag; its original ID remains protected.
+    present = [previous + " <none>:<none>", candidate + " <none>:<none>"]
+    calls = []
+
+    def command(args, **_kwargs):
+        calls.append(args)
+        if args == ["docker", "image", "inspect", candidate]:
+            return json.dumps([{"Id": candidate, "Config": {"Labels": {
+                "com.docker.compose.project": project, "com.docker.compose.service": "detector-worker"}}}])
+        if args == ["docker", "ps", "-a", "--filter", f"ancestor={candidate}", "--format", "{{.ID}}"]:
+            return ""
+        if args == ["docker", "image", "rm", candidate]:
+            present.remove(candidate + " <none>:<none>")
+            return ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(profiles, "inventory", lambda _env: {"images": list(present)})
+    monkeypatch.setattr(profiles, "command", command)
+    profiles.remove_new_images(before, {}, project, "smoke-development")
+    assert present == [previous + " <none>:<none>"]
+    assert calls == [
+        ["docker", "image", "inspect", candidate],
+        ["docker", "ps", "-a", "--filter", f"ancestor={candidate}", "--format", "{{.ID}}"],
+        ["docker", "image", "rm", candidate],
+    ]
+
+
+@pytest.mark.parametrize("reason", ["foreign", "prefix", "missing", "null_labels", "null_config", "unknown", "wrong_id", "empty_project", "foreign_tag"])
+def test_new_dangling_image_refuses_unproven_or_foreign_ownership(monkeypatch, reason):
+    project, candidate = "diploma_t21_image_test", "sha256:candidate"
+    labels = {"com.docker.compose.project": project}
+    if reason in {"foreign", "prefix"}:
+        labels["com.docker.compose.project"] = "foreign" if reason == "foreign" else project + "_other"
+    elif reason == "missing":
+        labels = {}
+    elif reason == "null_labels":
+        labels = None
+    details = [{"Id": "sha256:another" if reason == "wrong_id" else candidate,
+        "Config": None if reason == "null_config" else {"Labels": labels}}]
+    if reason == "unknown":
+        details = []
+    if reason == "empty_project":
+        project = ""
+    calls = []
+
+    def command(args, **_kwargs):
+        calls.append(args)
+        assert args == ["docker", "image", "inspect", candidate]
+        return json.dumps(details)
+
+    tag = "user/unrelated:latest" if reason == "foreign_tag" else "<none>:<none>"
+    monkeypatch.setattr(profiles, "inventory", lambda _env: {"images": [candidate + " " + tag]})
+    monkeypatch.setattr(profiles, "command", command)
+    with pytest.raises(RuntimeError, match="unclear ownership"):
+        profiles.remove_new_images({"images": []}, {}, project, "smoke-development")
+    assert len(calls) == (0 if reason in {"empty_project", "foreign_tag"} else 1)
+
+
+def test_owned_new_dangling_image_still_refuses_attached_container(monkeypatch):
+    project, candidate = "diploma_t21_image_test", "sha256:attached"
+    calls = []
+
+    def command(args, **_kwargs):
+        calls.append(args)
+        if args == ["docker", "image", "inspect", candidate]:
+            return json.dumps([{"Id": candidate, "Config": {"Labels": {"com.docker.compose.project": project}}}])
+        assert args == ["docker", "ps", "-a", "--filter", f"ancestor={candidate}", "--format", "{{.ID}}"]
+        return "attached-container"
+
+    monkeypatch.setattr(profiles, "inventory", lambda _env: {"images": [candidate + " <none>:<none>"]})
+    monkeypatch.setattr(profiles, "command", command)
+    with pytest.raises(RuntimeError, match="still attached"):
+        profiles.remove_new_images({"images": []}, {}, project, "smoke-development")
+    assert len(calls) == 2

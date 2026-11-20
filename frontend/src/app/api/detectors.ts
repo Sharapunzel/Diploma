@@ -34,6 +34,12 @@ export type DetectorWindow = {
   evaluation_started_at: string | null;
   evaluation_completed_at: string | null;
   late: boolean;
+  time_basis:
+    | "event_time"
+    | "availability_at"
+    | "backend_processed_at_historical";
+  origin: "initial_history" | "online" | "legacy";
+  close_not_before_at: string | null;
 };
 export type DetectorSummary = {
   id: string;
@@ -41,6 +47,9 @@ export type DetectorSummary = {
   aggregate_id: string;
   aggregate_name: string;
   aggregate_state: "active" | "archived" | "deleted";
+  aggregate_semantic_basis: "event_time" | "availability_v1";
+  aggregate_execution_mode: "current" | "retired";
+  aggregate_paused: boolean;
   source_id: string;
   source_name: string;
   created_at: string;
@@ -96,12 +105,13 @@ export type DetectorCard = DetectorSummary & {
   } | null;
   warmup: Warmup | null;
   recovery: {
-    reason: "crash_recovery" | "manual_resume";
+    reason: "crash_recovery" | "manual_resume" | "aggregate_resume";
     first_index: Json;
     last_index: Json;
     started_at: string;
   } | null;
   next_scheduled_at: string | null;
+  next_close_not_before_at: string | null;
   waiting_for_point: boolean | null;
 };
 export type Action = "create" | "start" | "stop";
@@ -203,6 +213,13 @@ function windowDto(v: unknown) {
   for (const k of ["evaluation_started_at", "evaluation_completed_at"])
     nullable(r[k], date);
   bool(r.late);
+  member(r.time_basis, [
+    "event_time",
+    "availability_at",
+    "backend_processed_at_historical",
+  ]);
+  member(r.origin, ["initial_history", "online", "legacy"]);
+  nullable(r.close_not_before_at, date);
 }
 function summary(v: unknown) {
   const r = record(v);
@@ -212,6 +229,9 @@ function summary(v: unknown) {
   member(r.execution_state, executionStates);
   member(r.model_state, models);
   member(r.aggregate_state, ["active", "archived", "deleted"]);
+  member(r.aggregate_semantic_basis, ["event_time", "availability_v1"]);
+  member(r.aggregate_execution_mode, ["current", "retired"]);
+  bool(r.aggregate_paused);
   bool(r.accelerated);
   bool(r.accelerated_used);
   nullable(r.reason, reason);
@@ -260,6 +280,7 @@ export function decodeCard(body: string, id: string): DetectorCard {
     "execution_started_at",
     "stopped_at",
     "next_scheduled_at",
+    "next_close_not_before_at",
   ])
     nullable(r[k], date);
   nullable(r.waiting_for_point, bool);
@@ -271,7 +292,7 @@ export function decodeCard(body: string, id: string): DetectorCard {
   });
   nullable(r.recovery, (v) => {
     const f = record(v);
-    member(f.reason, ["crash_recovery", "manual_resume"]);
+    member(f.reason, ["crash_recovery", "manual_resume", "aggregate_resume"]);
     integer(f.first_index);
     integer(f.last_index);
     date(f.started_at);

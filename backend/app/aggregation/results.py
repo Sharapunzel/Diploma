@@ -27,9 +27,14 @@ class AggregateStatistics:
     features: Mapping[str, FeatureStatistics]
 
 
-def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, duration: int = 1) -> dict:
+def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, duration: int = 1,
+                     check_budget=None) -> dict:
+    check = check_budget or (lambda: None)
+    check()
     results: dict[str, FeatureResult] = {}
+    ordered, frequencies = {}, {}
     for feature in compiled.calculation_features:
+        check()
         if feature.op == "derive":
             result = evaluate_expression(feature.expr, results, duration, compiled.plan is not None)
         else:
@@ -37,7 +42,12 @@ def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, du
             value = raw.value
             if value is not None and not raw.invalid_count:
                 if feature.op in {"median", "percentile"}:
-                    values = sorted(value)
+                    identity = id(value)
+                    if identity not in ordered:
+                        check()
+                        ordered[identity] = sorted(value)
+                        check()
+                    values = ordered[identity]
                     with localcontext() as context:
                         context.prec = 100
                         position = Decimal(str(feature.percentile if feature.op == "percentile" else .5)) * (len(values) - 1)
@@ -47,7 +57,16 @@ def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, du
                             value = Decimal(str(value)) + (Decimal(str(values[index + 1])) - Decimal(str(value))) * (position - index)
                 elif feature.op in {"mode_count", "mode_share"}:
                     ecs_type = compiled.fields[feature.field].type
-                    frequency = max(Counter(scalar_key(item, ecs_type) for item in value).values())
+                    identity = (id(value), ecs_type)
+                    if identity not in frequencies:
+                        def checked_values(value=value, ecs_type=ecs_type):
+                            for offset in range(0, len(value), 256):
+                                check()
+                                yield from (scalar_key(item, ecs_type) for item in value[offset:offset + 256])
+                        counts = Counter(checked_values())
+                        check()
+                        frequencies[identity] = max(counts.values())
+                    frequency = frequencies[identity]
                     value = frequency if feature.op == "mode_count" else Decimal(frequency) / len(value)
             reason = "invalid_input_type" if raw.invalid_count else "no_values" if value is None else None
             if reason:
@@ -64,6 +83,7 @@ def interpret_result(statistics: AggregateStatistics, compiled: CompiledRule, du
             result = FeatureResult(value=value, reason=reason, valid_count=raw.valid_count,
                                    invalid_count=raw.invalid_count)
         results[feature.key] = result
+    check()
     return {"observed_rows": statistics.observed_rows, "event_count": statistics.event_count,
             "observed_width": statistics.observed_width,
             "event_time_min": statistics.event_time_min, "event_time_max": statistics.event_time_max,

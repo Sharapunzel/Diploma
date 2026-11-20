@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from subprocess import SubprocessError
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -27,6 +27,49 @@ def runtime_card(identity, card):
         **{key: card.get(key) for key in (
         "aggregate_id", "source_id", "execution_state", "execution_started_at",
         "backlog", "next_scheduled_at", "last_consumed", "last_evaluated")}}
+
+
+def archive_point(response, aggregate_id, index, previous=None):
+    body = response.json()
+    if response.status_code == 409:
+        assert body["code"] == "canonical_point_not_ready", body
+        assert previous is None, "A confirmed canonical closure became not-ready"
+        return None
+    if response.status_code == 200:
+        assert body["aggregate_id"] == aggregate_id and body["payload_state"] == "present", body
+        point_id, metadata = body["id"], body
+        assert previous is None or not previous["cleared"], "A cleared canonical payload reappeared"
+        if previous is not None:
+            assert body == previous["point"], "Late arrival changed a saved archive payload"
+        result = {"id": point_id, "point": body, "cleared": False}
+    else:
+        assert response.status_code == 410 and body["code"] == "aggregate_point_cleared", body
+        metadata = body["details"]
+        assert metadata["clear_reason"] == "automatic" and metadata["clear_policy_version"] == "model_history_v1", body
+        assert metadata["cleared_at"] is not None, body
+        point_id = metadata["origin_point_id"]
+        result = {"id": point_id, "point": None, "cleared": True}
+    assert UUID(point_id) and metadata["window_index"] == index, body
+    assert metadata["origin"] == "initial_history" and metadata["time_basis"] == "event_time", body
+    assert previous is None or point_id == previous["id"], "Canonical identity changed"
+    return result
+
+
+def fresh_online_suffix(items):
+    latest = [point for point in items if point["origin"] == "online"][:16]
+    if len(latest) != 16:
+        return None
+    tail = latest[0]["window_index"]
+    if any(point["window_index"] != tail - offset or point["payload_state"] != "present"
+            or point["time_basis"] != "event_time" or point["completeness"] != "complete"
+            for offset, point in enumerate(latest)):
+        return None
+    return latest
+
+
+def exact_late_growth(current, previous):
+    assert current <= previous + 1, "Unexpected extra late arrivals during the controlled single-record check"
+    return current == previous + 1
 
 
 def aggregate_event_time_smoke(compose, env, production, command, lifecycle):
@@ -115,15 +158,35 @@ def aggregate_event_time_smoke(compose, env, production, command, lifecycle):
             def points(identity):
                 return request("GET", f"aggregates/{identity}/points?limit=100")["items"]
 
-            wait(lambda: all(sum(p["origin"] == "initial_history" for p in points(a)) == 16 for a in ids))
-            old = next(p for p in points(ids[0]) if p["window_index"] == 0)
+            archives = {identity: {} for identity in ids}
+
+            def archive_ready():
+                for identity in ids:
+                    for index in range(16):
+                        if index not in archives[identity]:
+                            proof = archive_point(client.get(
+                                f"/api/v1/aggregates/{identity}/points/by-index/{index}"), identity, index)
+                            if proof is not None:
+                                archives[identity][index] = proof
+                return all(len(archive) == 16 for archive in archives.values())
+
+            wait(archive_ready)
+            old = archives[ids[0]][0]
             write(1, seeded["anchor"])
             wait(lambda: request("GET", f"aggregates/{ids[0]}")["diagnostics"]["late_count"] >= 1)
-            assert request("GET", f"aggregates/{ids[0]}/points/by-index/0") == old
+            old = archive_point(client.get(f"/api/v1/aggregates/{ids[0]}/points/by-index/0"), ids[0], 0, old)
+            archive_point(client.get(f"/api/v1/aggregates/{ids[0]}/points/{old['id']}"), ids[0], 0, old)
             # Fresh online history is continuous; the unknown archive-to-now tail
             # is never silently spliced into a model batch.
-            wait(lambda: all(sum(p["origin"] == "online" and p["completeness"] == "complete"
-                for p in points(a)) >= 16 for a in ids), seconds=120)
+            wait(lambda: all(fresh_online_suffix(points(identity)) for identity in ids), seconds=120)
+            retained = fresh_online_suffix(points(ids[0]))
+            assert retained is not None
+            immutable = retained[-1]
+            late_before = request("GET", f"aggregates/{ids[0]}")["diagnostics"]["late_count"]
+            write(1, immutable["start_utc"])
+            wait(lambda: exact_late_growth(request("GET", f"aggregates/{ids[0]}")["diagnostics"]["late_count"], late_before))
+            assert request("GET", f"aggregates/{ids[0]}/points/by-index/{immutable['window_index']}") == immutable
+            assert request("GET", f"aggregates/{ids[0]}/points/{immutable['id']}") == immutable
             detectors = []
             for aggregate, accelerated in ((ids[0], False), (ids[0], True), (ids[1], False)):
                 body = {"aggregate_id": aggregate, "name": "Runtime RCF", "accelerated": accelerated,

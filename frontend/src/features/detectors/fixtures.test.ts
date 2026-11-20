@@ -32,6 +32,9 @@ describe("detector DTO", () => {
       evaluation_started_at: null,
       evaluation_completed_at: null,
       late: false,
+      time_basis: "event_time",
+      origin: "online",
+      close_not_before_at: "2026-11-10T00:00:02Z",
     };
     const body = JSON.stringify({
       ...fixture(),
@@ -49,6 +52,8 @@ describe("detector DTO", () => {
     expect(c.last_consumed?.kind).toBe("skipped");
     expect(c.last_evaluated?.kind).toBe("evaluated");
     expect(exact(c.last_evaluated?.index)).toBe("0");
+    expect(c.last_consumed?.time_basis).toBe("event_time");
+    expect(c.last_consumed?.close_not_before_at).toBe("2026-11-10T00:00:02Z");
   });
   it("preserves int64 and large counters in cards/receipts without rounding", () => {
     for (const seed of ["-9223372036854775808", "9223372036854775807"]) {
@@ -83,6 +88,11 @@ describe("detector DTO", () => {
   it("checks enums, dimensions, nullable fields and target identity", () => {
     for (const change of [
       { execution_state: "healthy" },
+      { aggregate_semantic_basis: "processing" },
+      { aggregate_execution_mode: "paused" },
+      { aggregate_paused: "true" },
+      { aggregate_paused: undefined },
+      { next_close_not_before_at: undefined },
       { warmup: {} },
       { last_consumed: {} },
       { feature_names: [] },
@@ -108,5 +118,65 @@ describe("detector DTO", () => {
         }),
       ).total,
     ).toBe(101);
+  });
+  it("reads retired provenance and aggregate-resume without relabelling old windows", () => {
+    const window = {
+      index: 4,
+      kind: "evaluated",
+      reason: null,
+      start_utc: at,
+      end_utc: at,
+      scheduled_at: at,
+      aggregation_started_at: at,
+      aggregation_completed_at: at,
+      evaluation_started_at: at,
+      evaluation_completed_at: at,
+      late: false,
+      time_basis: "availability_at",
+      origin: "legacy",
+      close_not_before_at: at,
+    };
+    const old = {
+      ...fixture(),
+      aggregate_semantic_basis: "availability_v1",
+      aggregate_execution_mode: "retired",
+      execution_state: "terminated",
+      last_evaluated: window,
+      recovery: {
+        reason: "aggregate_resume",
+        first_index: 4,
+        last_index: 6,
+        started_at: at,
+      },
+    };
+    const card = decodeCard(JSON.stringify(old), id);
+    expect(card.aggregate_execution_mode).toBe("retired");
+    expect(card.last_evaluated?.time_basis).toBe("availability_at");
+    expect(card.last_evaluated?.origin).toBe("legacy");
+    expect(card.recovery?.reason).toBe("aggregate_resume");
+    for (const change of [
+      { time_basis: undefined },
+      { origin: undefined },
+      { close_not_before_at: undefined },
+      { close_not_before_at: "2026-11-10T00:00:00" },
+      { time_basis: "browser" },
+      { origin: "historical" },
+    ])
+      expect(() =>
+        decodeCard(
+          JSON.stringify({ ...old, last_evaluated: { ...window, ...change } }),
+          id,
+        ),
+      ).toThrow();
+  });
+  it.each([
+    ["waiting_close_deadline", "штатное ожидание"],
+    ["aggregate_paused", "сам не запустится"],
+    ["cleanup_in_progress", "Модель и позиция"],
+    ["aggregate_time_semantics_retired", "отдельный детектор"],
+  ])("explains %s independently of server text", (code, expected) => {
+    expect(reasonText({ code, message: "private", factor: null })).toContain(
+      expected,
+    );
   });
 });

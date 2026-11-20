@@ -39,6 +39,9 @@ function card() {
     aggregate_id: config.aggregate,
     aggregate_name: "Агрегат ".repeat(20),
     aggregate_state: "active",
+    aggregate_semantic_basis: "event_time",
+    aggregate_execution_mode: "current",
+    aggregate_paused: false,
     source_id: config.source,
     source_name: "Источник",
     created_at: config.anchor,
@@ -74,13 +77,64 @@ function card() {
     warmup: null,
     recovery: null,
     next_scheduled_at: null,
+    next_close_not_before_at: null,
     waiting_for_point: null,
+  };
+}
+function availableAggregate(aggregate: Record<string, unknown>) {
+  // This is a contract UI mock. A previous live operation must not alter the
+  // mocked create/search scenario through its real paused/cleanup state.
+  return {
+    ...aggregate,
+    semantic_basis: "event_time",
+    execution_mode: "current",
+    paused: false,
+    active_cleanup_id: null,
+    execution_policy: {
+      policy_version: "window_execution_v1",
+      soft_latency_seconds: 5,
+      hard_budget_seconds: Math.min(
+        30,
+        (4 * Number(aggregate.duration_seconds)) / 5,
+      ),
+    },
+    last_execution: null,
+    auto_cleanup: {
+      policy_version: "model_history_v1",
+      status: "scheduled",
+      reason: null,
+      checked_at: null,
+      next_check_at: new Date().toISOString(),
+      reserve_windows: null,
+      keep_from_index: null,
+      protected_from_index: null,
+      auto_cleared_total: 0,
+      history_revision: 0,
+      last_cleared_at: null,
+      retained_from_index: null,
+      retained_to_index: null,
+      protected_total: null,
+      protected_by: [],
+    },
   };
 }
 test("mock creation retains frozen exact payload/key across navigation and waits for explicit replay", async ({
   page,
 }) => {
   const requests: { key: string; body: string }[] = [];
+  await page.route("**/api/v1/aggregates?**", async (route) => {
+    const response = await route.fetch();
+    expect(response.ok()).toBeTruthy();
+    const catalog = await response.json();
+    return route.fulfill({
+      json: {
+        ...catalog,
+        items: catalog.items.map((aggregate: Record<string, unknown>) =>
+          availableAggregate(aggregate),
+        ),
+      },
+    });
+  });
   await page.route("**/api/v1/detectors", async (route) => {
     if (route.request().method() !== "POST") return route.continue();
     requests.push({
@@ -378,7 +432,7 @@ test("mock single aggregate combobox searches beyond fifty and keeps selection, 
     `/api/v1/aggregates/${config.aggregate}`,
   );
   expect(response.ok()).toBeTruthy();
-  const aggregate = await response.json();
+  const aggregate = availableAggregate(await response.json());
   const catalog = Array.from({ length: 61 }, (_, index) => ({
     ...aggregate,
     id: `00000000-0000-4000-8000-${String(1000 + index).padStart(12, "0")}`,

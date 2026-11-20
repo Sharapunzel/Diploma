@@ -163,29 +163,33 @@ it("loads user filters from the server and keeps OIDC tab independent", async ()
 
 it("requires confirmation before disabling a user and does not send on cancel", async () => {
   const request = mount();
-  expect(await screen.findByText("Bob")).toBeDefined();
-  await userEvent.click(screen.getByRole("button", { name: "Отключить" }));
+  const row = (await screen.findByText("Bob")).closest("tr")!;
+  const disable = within(row).getByRole("button", { name: "Отключить" });
+  const mutations = () =>
+    request.mock.calls.filter(([path]) => path.endsWith("/deactivate"));
+  fireEvent.click(disable);
   const dialog = await screen.findByRole("dialog", {
     name: "Отключить пользователя",
   });
-  expect(
-    request.mock.calls.some(([path]) => path.includes("/deactivate")),
-  ).toBe(false);
-  await userEvent.click(within(dialog).getByRole("button", { name: "Отмена" }));
-  expect(
-    request.mock.calls.some(([path]) => path.includes("/deactivate")),
-  ).toBe(false);
-  await userEvent.click(screen.getByRole("button", { name: "Отключить" }));
-  await userEvent.click(
+  expect(mutations()).toHaveLength(0);
+  fireEvent.click(within(dialog).getByRole("button", { name: "Отмена" }));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("dialog", { name: "Отключить пользователя" }),
+    ).toBeNull(),
+  );
+  expect(mutations()).toHaveLength(0);
+  fireEvent.click(disable);
+  fireEvent.click(
     within(
       await screen.findByRole("dialog", { name: "Отключить пользователя" }),
     ).getByRole("button", { name: "Отключить" }),
   );
-  await waitFor(() =>
-    expect(
-      request.mock.calls.some(([path]) => path.includes("/deactivate")),
-    ).toBe(true),
-  );
+  await waitFor(() => expect(mutations()).toHaveLength(1));
+  expect(mutations()[0]).toEqual([
+    "/users/user-2/deactivate",
+    expect.objectContaining({ method: "POST" }),
+  ]);
 });
 
 it("confirms an OIDC mapping that grants Administrator before posting", async () => {
@@ -364,21 +368,20 @@ it("checks state after an unknown mutation result without resending it", async (
     }
     return Promise.resolve(undefined);
   });
-  await screen.findByText("Bob");
-  await userEvent.click(screen.getByRole("button", { name: "Отключить" }));
+  const row = (await screen.findByText("Bob")).closest("tr")!;
+  fireEvent.click(within(row).getByRole("button", { name: "Отключить" }));
   const dialog = await screen.findByRole("dialog", {
     name: "Отключить пользователя",
   });
-  await userEvent.click(
-    within(dialog).getByRole("button", { name: "Отключить" }),
-  );
-  expect(await screen.findByText(/Запрос мог быть выполнен/)).toBeDefined();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Отключить" }));
+  const feedback = await screen.findByText(/Запрос мог быть выполнен/);
+  const alert = feedback.closest<HTMLElement>('[role="alert"]')!;
   expect(mutationCalls).toBe(1);
   const previousReads = reads;
-  await userEvent.click(
-    screen.getByRole("button", { name: "Проверить состояние" }),
+  fireEvent.click(
+    within(alert).getByRole("button", { name: "Проверить состояние" }),
   );
-  await waitFor(() => expect(reads).toBeGreaterThan(previousReads));
+  await waitFor(() => expect(reads).toBe(previousReads + 1));
   expect(mutationCalls).toBe(1);
 });
 

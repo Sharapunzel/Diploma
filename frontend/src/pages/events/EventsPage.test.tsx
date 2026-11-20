@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import {
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -13,7 +14,10 @@ import { ApiError } from "../../app/api/client";
 import { EventsPage, inputValue } from "./EventsPage";
 
 function renderSearchPage(
-  search: (call: number) => Promise<unknown> = async () => ({
+  search: (
+    call: number,
+    options?: RequestInit,
+  ) => Promise<unknown> = async () => ({
     items: [],
     has_more: false,
     next_cursor: null,
@@ -35,7 +39,7 @@ function renderSearchPage(
   };
   stores.session.state = "authenticated";
   let searchCalls = 0;
-  const request = vi.fn(async (path: string) => {
+  const request = vi.fn(async (path: string, options?: RequestInit) => {
     if (path.startsWith("/sources?"))
       return {
         items: [
@@ -59,7 +63,7 @@ function renderSearchPage(
         limit: 100,
         offset: 0,
       };
-    if (path.endsWith("/search")) return search(++searchCalls);
+    if (path.endsWith("/search")) return search(++searchCalls, options);
     throw new Error(`Unexpected request ${path}`);
   });
   stores.api.request = request as typeof stores.api.request;
@@ -75,6 +79,24 @@ async function chooseLocalSource(user: ReturnType<typeof userEvent.setup>) {
   await user.click(await screen.findByRole("combobox", { name: "Источник" }));
   await user.click(await screen.findByText(/Synthetic local/));
   await screen.findByRole("table");
+}
+
+async function selectOption(combobox: HTMLElement, label: string | RegExp) {
+  fireEvent.mouseDown(combobox);
+  fireEvent.click(
+    await screen.findByText(label, {
+      selector: ".ant-select-item-option-content",
+      exact: true,
+    }),
+  );
+}
+
+async function selectLocalFixtureSource() {
+  await selectOption(
+    await screen.findByRole("combobox", { name: "Источник" }),
+    /Synthetic local/,
+  );
+  return screen.findByRole("table");
 }
 
 it("applies a search only after the server responds successfully", async () => {
@@ -99,7 +121,7 @@ it("applies a search only after the server responds successfully", async () => {
 });
 
 it("keeps the filter draft and previous results after an indexed server rejection", async () => {
-  const { stores, user } = renderSearchPage(async (call) => {
+  const { stores } = renderSearchPage(async (call, options) => {
     if (call === 1)
       return {
         items: [
@@ -114,41 +136,39 @@ it("keeps the filter draft and previous results after an indexed server rejectio
         has_more: false,
         next_cursor: null,
       };
+    expect(JSON.parse(String(options?.body)).filters).toEqual([
+      { field: "message", operator: "contains", value: "short" },
+    ]);
     throw new ApiError(422, "event_filter_invalid", null, null, { index: 0 });
   });
-  await chooseLocalSource(user);
-  await screen
-    .findByRole("table")
-    .then((table) => within(table).findByText("previous result"));
-  await user.click(screen.getByRole("button", { name: "Фильтры и поля" }));
-  const dialog = screen.getByRole("dialog", { name: "Фильтры и поля" });
-  await user.click(
-    within(dialog).getByRole("button", { name: "Добавить условие" }),
+  const table = await selectLocalFixtureSource();
+  await within(table).findByText("previous result");
+  fireEvent.click(screen.getByRole("button", { name: "Фильтры и поля" }));
+  const dialog = within(
+    await screen.findByRole("dialog", { name: "Фильтры и поля" }),
   );
-  await user.click(
-    within(dialog).getByRole("combobox", { name: "Поле условия" }),
+  const addCondition = dialog.getByRole("button", { name: "Добавить условие" });
+  await waitFor(() => expect(addCondition).toHaveProperty("disabled", false));
+  fireEvent.click(addCondition);
+  await selectOption(
+    dialog.getByRole("combobox", { name: "Поле условия" }),
+    "message",
   );
-  const messageOptions = await screen.findAllByText("message", { exact: true });
-  await user.click(messageOptions[messageOptions.length - 1]);
-  await user.click(
-    within(dialog).getByRole("combobox", { name: "Оператор условия" }),
+  await selectOption(
+    dialog.getByRole("combobox", { name: "Оператор условия" }),
+    "Содержит",
   );
-  const containsOptions = await screen.findAllByText("Содержит", {
-    exact: true,
-  });
-  await user.click(containsOptions[containsOptions.length - 1]);
-  await user.type(within(dialog).getByPlaceholderText("Значение"), "short");
-  await user.click(within(dialog).getByRole("button", { name: "Искать" }));
+  const value = dialog.getByPlaceholderText("Значение");
+  fireEvent.change(value, { target: { value: "short" } });
+  fireEvent.click(dialog.getByRole("button", { name: "Искать" }));
+  const condition = dialog.getByRole("button", {
+    name: "Убрать",
+  }).parentElement!;
   expect(
-    await within(dialog).findByText(/Источник отклонил это условие/),
+    await within(condition).findByText(/Источник отклонил это условие/),
   ).not.toBeNull();
-  expect(within(dialog).getByPlaceholderText("Значение")).toHaveProperty(
-    "value",
-    "short",
-  );
-  expect(
-    within(screen.getByRole("table")).getByText("previous result"),
-  ).not.toBeNull();
+  expect(value).toHaveProperty("value", "short");
+  expect(within(table).getByText("previous result")).not.toBeNull();
   expect(screen.getByText("Условий: 0")).not.toBeNull();
   stores.dispose();
 });
@@ -196,7 +216,7 @@ it("keeps the applied search when the filter dialog closes without applying", as
   stores.dispose();
 });
 
-it("confirms four exact deletion scopes and never sends on cancellation", async () => {
+async function mountDeletionPage(failure?: "network" | "invalid") {
   const stores = new AppStores();
   stores.session.data = {
     authenticated: true,
@@ -212,8 +232,8 @@ it("confirms four exact deletion scopes and never sends on cancellation", async 
     csrf_token: "csrf",
   };
   stores.session.state = "authenticated";
-  const changes: { path: string; body?: unknown }[] = [];
-  let failure: "network" | "invalid" | null = null;
+  const mutations: { path: string; method?: string; body: unknown }[] = [];
+  const searches: { timestamp_from: string; timestamp_to: string }[] = [];
   const request = vi.fn(async (path: string, options?: RequestInit) => {
     if (path.startsWith("/sources?"))
       return {
@@ -233,7 +253,11 @@ it("confirms four exact deletion scopes and never sends on cancellation", async 
       return { items: [], total: 0, limit: 50, offset: 0 };
     if (path.includes("/fields"))
       return { items: [], total: 0, limit: 100, offset: 0 };
-    if (path.endsWith("/search"))
+    if (path.endsWith("/search")) {
+      const { timestamp_from, timestamp_to } = JSON.parse(
+        String(options?.body),
+      );
+      searches.push({ timestamp_from, timestamp_to });
       return {
         items: [
           {
@@ -248,16 +272,18 @@ it("confirms four exact deletion scopes and never sends on cancellation", async 
         has_more: false,
         next_cursor: null,
       };
+    }
     if (
-      path.includes("/events/opaque-id") ||
+      path === "/events/sources/local/events/opaque-id" ||
       path === "/parsed-logs/actions/delete"
     ) {
-      if (failure === "network") throw new ApiError(0, "network_error");
-      if (failure === "invalid") return {};
-      changes.push({
+      mutations.push({
         path,
+        method: options?.method,
         body: options?.body ? JSON.parse(String(options.body)) : undefined,
       });
+      if (failure === "network") throw new ApiError(0, "network_error");
+      if (failure === "invalid") return {};
       return path === "/parsed-logs/actions/delete"
         ? { deleted_count: 2 }
         : undefined;
@@ -270,106 +296,135 @@ it("confirms four exact deletion scopes and never sends on cancellation", async 
       <EventsPage />
     </StoresProvider>,
   );
-  const user = userEvent.setup();
-  await user.click(await screen.findByRole("combobox", { name: "Источник" }));
-  await user.click(await screen.findByText(/Synthetic local/));
-  const table = await screen.findByRole("table");
-  await user.click(within(table).getByRole("button", { name: "Удалить" }));
-  expect(changes).toHaveLength(0);
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Отмена" }),
+  const table = await selectLocalFixtureSource();
+  await waitFor(() => expect(searches).toHaveLength(1));
+  return { stores, mutations, searches, table };
+}
+
+async function openDeletionPanel() {
+  fireEvent.click(screen.getByRole("button", { name: "Удаление событий" }));
+  return within(
+    await screen.findByRole("region", { name: "Область удаления" }),
   );
-  expect(changes).toHaveLength(0);
-  await user.click(within(table).getByRole("button", { name: "Удалить" }));
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Удалить" }),
+}
+
+async function confirmDeletion(title: string) {
+  const dialog = await screen.findByRole("dialog", { name: title });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Удалить" }));
+}
+
+it("confirms exact deletion of one event and never sends on cancellation", async () => {
+  const { stores, mutations, table } = await mountDeletionPage();
+  const remove = await within(table).findByRole("button", { name: "Удалить" });
+  fireEvent.click(remove);
+  const confirmation = within(
+    await screen.findByRole("dialog", { name: "Удалить событие" }),
   );
-  await waitFor(() => expect(changes).toHaveLength(1));
-  expect(changes[0]).toEqual({
-    path: "/events/sources/local/events/opaque-id",
-    body: undefined,
-  });
-  await user.click(screen.getByRole("button", { name: "Удаление событий" }));
-  await user.click(
-    screen.getByRole("button", { name: "Удалить события источника" }),
-  );
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Удалить" }),
-  );
-  await waitFor(() => expect(changes).toHaveLength(2));
-  expect(changes[1].body).toEqual({ source_id: "local" });
-  await user.click(screen.getByRole("button", { name: "Удаление событий" }));
-  await user.click(
-    screen.getByRole("button", { name: "Взять период применённого поиска" }),
-  );
-  await user.click(
-    screen.getByRole("button", { name: "Удалить источник за период" }),
-  );
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Удалить" }),
-  );
-  await waitFor(() => expect(changes).toHaveLength(3));
-  expect(changes[2].body).toEqual({
-    source_id: "local",
-    timestamp_from: expect.any(String),
-    timestamp_to: expect.any(String),
-  });
-  expect(
-    (changes[2].body as { timestamp_from: string }).timestamp_from.startsWith(
-      "2025-",
-    ),
-  ).toBe(false);
-  await user.click(screen.getByRole("button", { name: "Удаление событий" }));
-  await user.click(
-    screen.getByRole("button", { name: "Удалить все локальные за период" }),
-  );
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Удалить" }),
-  );
-  await waitFor(() => expect(changes).toHaveLength(4));
-  expect(changes[3].body).toEqual({
-    timestamp_from: expect.any(String),
-    timestamp_to: expect.any(String),
-  });
-  expect(await screen.findByText("Удалено событий: 2.")).not.toBeNull();
-  failure = "network";
-  await user.click(screen.getByRole("button", { name: "Удаление событий" }));
-  await user.click(
-    screen.getByRole("button", { name: "Удалить события источника" }),
-  );
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Удалить" }),
-  );
-  expect(
-    await screen.findByText("Результат удаления неизвестен"),
-  ).not.toBeNull();
-  expect(screen.queryByRole("dialog")).toBeNull();
-  await user.click(screen.getByRole("button", { name: "Удаление событий" }));
-  expect(
-    screen
-      .getByRole("button", { name: "Удалить события источника" })
-      .hasAttribute("disabled"),
-  ).toBe(true);
-  await user.click(screen.getByRole("button", { name: "Обновить события" }));
+  expect(mutations).toHaveLength(0);
+  fireEvent.click(confirmation.getByRole("button", { name: "Отмена" }));
   await waitFor(() =>
     expect(
-      screen
-        .getByRole("button", { name: "Удалить события источника" })
-        .hasAttribute("disabled"),
-    ).toBe(false),
+      screen.queryByRole("dialog", { name: "Удалить событие" }),
+    ).toBeNull(),
   );
-  failure = "invalid";
-  await user.click(
-    screen.getByRole("button", { name: "Удалить события источника" }),
+  expect(mutations).toHaveLength(0);
+  fireEvent.click(remove);
+  await confirmDeletion("Удалить событие");
+  await waitFor(() =>
+    expect(mutations).toEqual([
+      {
+        path: "/events/sources/local/events/opaque-id",
+        method: "DELETE",
+        body: undefined,
+      },
+    ]),
   );
-  await user.click(
-    within(screen.getByRole("dialog")).getByRole("button", { name: "Удалить" }),
-  );
-  expect(
-    await screen.findByText("Результат удаления неизвестен"),
-  ).not.toBeNull();
   stores.dispose();
 }, 60_000);
+
+it.each([
+  {
+    scope: "whole source",
+    action: "Удалить события источника",
+    title: "Удалить источник целиком",
+    source: true,
+    period: false,
+  },
+  {
+    scope: "source period",
+    action: "Удалить источник за период",
+    title: "Удалить события за период",
+    source: true,
+    period: true,
+  },
+  {
+    scope: "all local in period",
+    action: "Удалить все локальные за период",
+    title: "Удалить события за период",
+    source: false,
+    period: true,
+  },
+])(
+  "confirms exact deletion of $scope",
+  async ({ action, title, source, period }) => {
+    const { stores, mutations, searches } = await mountDeletionPage();
+    const panel = await openDeletionPanel();
+    if (period) {
+      fireEvent.click(
+        panel.getByRole("button", { name: "Взять период применённого поиска" }),
+      );
+    }
+    const expected = {
+      ...(source ? { source_id: "local" } : {}),
+      ...(period ? searches[0] : {}),
+    };
+    fireEvent.click(panel.getByRole("button", { name: action }));
+    await confirmDeletion(title);
+    expect(await screen.findByText("Удалено событий: 2.")).not.toBeNull();
+    expect(mutations).toEqual([
+      { path: "/parsed-logs/actions/delete", method: "POST", body: expected },
+    ]);
+    stores.dispose();
+  },
+  60_000,
+);
+
+it.each(["network", "invalid"] as const)(
+  "keeps deletion fenced after a %s response until an explicit read",
+  async (failure) => {
+    const { stores, mutations, searches } = await mountDeletionPage(failure);
+    const name = "Удалить события источника";
+    const panel = await openDeletionPanel();
+    fireEvent.click(panel.getByRole("button", { name }));
+    await confirmDeletion("Удалить источник целиком");
+    const feedback = await screen.findByText("Результат удаления неизвестен");
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Удалить источник целиком" }),
+      ).toBeNull(),
+    );
+    const opened = await openDeletionPanel();
+    const remove = opened.getByRole("button", { name });
+    expect(remove).toHaveProperty("disabled", true);
+    expect(mutations).toEqual([
+      {
+        path: "/parsed-logs/actions/delete",
+        method: "POST",
+        body: { source_id: "local" },
+      },
+    ]);
+    const previousReads = searches.length;
+    const alert = feedback.closest<HTMLElement>('[role="alert"]')!;
+    fireEvent.click(
+      within(alert).getByRole("button", { name: "Обновить события" }),
+    );
+    await waitFor(() => expect(remove).toHaveProperty("disabled", false));
+    expect(searches).toHaveLength(previousReads + 1);
+    expect(mutations).toHaveLength(1);
+    stores.dispose();
+  },
+  60_000,
+);
 
 it("validates numeric precision, list limits and external date formats", () => {
   const integer = { name: "event.code", type: "long", operators: ["eq", "in"] };

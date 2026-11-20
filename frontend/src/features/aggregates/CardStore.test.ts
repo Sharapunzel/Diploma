@@ -4,6 +4,7 @@ import type { AggregatesApi, Point, Operator } from "../../app/api/aggregates";
 import { exact, parseAggregate } from "../../app/api/aggregateJson";
 import { ApiError } from "../../app/api/client";
 import { CardStore } from "./CardStore";
+import { pointFixture } from "../../app/api/aggregateTestData";
 
 const start = "2026-01-01T00:00:00Z";
 it("treats an empty operator response as a retryable failure", async () => {
@@ -19,6 +20,7 @@ it("treats an empty operator response as a retryable failure", async () => {
   store.dispose();
 });
 const point: Point = {
+  ...pointFixture(),
   id: "historical-1",
   aggregate_id: "aggregate",
   kind: "historical",
@@ -95,7 +97,9 @@ it("shows only the confirmed selected historical window and clears it when its d
   expect(exact(store.historicalResult!.features![0].value)).toBe(
     "9007199254740993",
   );
-  expect(store.success).toContain("выбранного окна");
+  expect(store.success).toBe(
+    "Сохранённое окно загружено. Новый расчёт не выполнялся.",
+  );
   store.clearHistoricalResult();
   expect(store.historicalResult).toBeNull();
   expect(store.success).toBe("");
@@ -158,4 +162,17 @@ it("discards a response after the aggregate scope is disposed", async () => {
   expect(signal.aborted).toBe(true);
   expect(store.historicalResult).toBeNull();
   expect(store.success).toBe("");
+});
+it("reads canonical history without resolving an unrelated unknown command", async () => {
+  const { store, historical } = setup();
+  runInAction(() => {
+    store.commandOutcome = "unknown";
+  });
+  expect(store.canMutate).toBe(false);
+  await store.history(start);
+  expect(historical).toHaveBeenCalledTimes(1);
+  expect(store.historicalResult?.id).toBe(point.id);
+  expect(store.commandOutcome).toBe("unknown");
+  expect(store.canMutate).toBe(false);
+  store.dispose();
 });

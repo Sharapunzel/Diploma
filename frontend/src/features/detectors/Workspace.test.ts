@@ -145,7 +145,17 @@ describe("draft and list", () => {
     const api = service();
     const aggregates = {
       list: vi.fn().mockResolvedValue({
-        items: [{ id, state: "active", duration_seconds: 2 }],
+        items: [
+          {
+            id,
+            state: "active",
+            duration_seconds: 2,
+            semantic_basis: "event_time",
+            execution_mode: "current",
+            paused: false,
+            active_cleanup_id: null,
+          },
+        ],
         total: 101,
       }),
     };
@@ -206,6 +216,10 @@ describe("draft and list", () => {
       name: "Выбранный агрегат",
       source_name: "Источник A",
       duration_seconds: 2,
+      semantic_basis: "event_time",
+      execution_mode: "current",
+      paused: false,
+      active_cleanup_id: null,
     };
     const aggregates = {
       list: vi
@@ -253,4 +267,41 @@ describe("draft and list", () => {
     expect(aggregates.list).toHaveBeenCalledTimes(count);
     s.dispose();
   });
+  it.each([
+    { execution_mode: "retired" },
+    { paused: true },
+    { active_cleanup_id: id },
+  ])(
+    "preserves an unavailable aggregate selection without creating a model: %o",
+    async (change) => {
+      const api = service();
+      const selected = {
+        id,
+        state: "active",
+        duration_seconds: 2,
+        semantic_basis: "event_time",
+        execution_mode: "current",
+        paused: false,
+        active_cleanup_id: null,
+        ...change,
+      };
+      const s = new DraftStore(
+        api as unknown as DetectorsApi,
+        {
+          list: vi.fn().mockResolvedValue({ items: [selected], total: 1 }),
+        } as unknown as AggregatesApi,
+      );
+      try {
+        await s.catalog();
+        s.change("aggregateId", id);
+        s.change("name", "Модель");
+        await s.submit();
+        expect(s.selected?.id).toBe(id);
+        expect(s.errors.aggregateId).toContain("без паузы");
+        expect(api.command).not.toHaveBeenCalled();
+      } finally {
+        s.dispose();
+      }
+    },
+  );
 });

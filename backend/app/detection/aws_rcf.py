@@ -10,12 +10,13 @@ from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
+from .checkpoint import MAX_BYTES, validate_execution_checkpoint
 from .contracts import DetectionError, ModelConfig, canonical, digest
 from .numeric import Affine
+from .runtime_identity import validate_runtime
 
 _lock = threading.Lock()
 _pid = None
-MAX_BYTES = 64 * 1024**2
 
 
 def runtime():
@@ -45,6 +46,7 @@ def runtime():
             raise DetectionError("runtime_version_mismatch")
         identity = {"manifest": digest(manifest), "jre": version, "jpype": jpype.__version__,
                     "aws": "4.4.0", "format": 1}
+        validate_runtime(identity)
         return jpype, identity
 
 
@@ -150,27 +152,8 @@ class AwsModelFactory:
 
     def restore(self, checkpoint, config, keys, rule_hash):
         # Validate envelope and identity before feeding anything into Java.
-        if len(canonical(checkpoint).encode()) > MAX_BYTES:
-            raise DetectionError("resource_budget:checkpoint_bytes")
+        body, transform = validate_execution_checkpoint(checkpoint, config, keys, rule_hash)
         try:
-            body = checkpoint["body"]
-            if checkpoint["sha256"] != digest(body):
-                raise DetectionError("checkpoint_checksum")
-            if body["config"] != config or body["keys"] != keys or body["rule_hash"] != rule_hash:
-                raise DetectionError("checkpoint_config_mismatch")
-            if body["settings"] != ModelConfig(**config).settings:
-                raise DetectionError("checkpoint_settings_mismatch")
-            if body["runtime"]["format"] != 1:
-                raise DetectionError("checkpoint_version")
-            forest = body["mapper"]["forestState"]
-            if (forest["dimensions"] != config["dimensions"]
-                    or forest["numberOfTrees"] != config["trees"]
-                    or forest["sampleSize"] != config["sample_size"]
-                    or forest["outputAfter"] != config["output_after"]
-                    or forest["shingleSize"] != 1
-                    or body["mapper"]["forestMode"] != "STANDARD"
-                    or body["mapper"]["transformMethod"] != "NONE"):
-                raise DetectionError("checkpoint_mapper_config")
             jpype, identity = runtime()
             if identity != body["runtime"]:
                 raise DetectionError("checkpoint_runtime_mismatch")
@@ -183,16 +166,6 @@ class AwsModelFactory:
                                    jpype.JLong(config["seed"]))
             if int(model.getForest().getTotalUpdates()) != body["updates"]:
                 raise DetectionError("checkpoint_updates")
-            affine = body["affine"]
-            if (affine["algorithm"] != "min_range_decimal_float32_v1"
-                    or len(affine["center"]) != len(keys) or len(affine["scale"]) != len(keys)):
-                raise DetectionError("checkpoint_affine")
-            transform = Affine(tuple(Decimal(x) for x in affine["center"]),
-                               tuple(Decimal(x) for x in affine["scale"]))
-            if (any(not x.is_finite() for x in transform.center)
-                    or any(not x.is_finite() or x <= 0 for x in transform.scale)
-                    or len(body["history"]) > config["sample_size"]):
-                raise DetectionError("checkpoint_affine_history")
             return AwsModel(ModelConfig(**config), keys, rule_hash, transform,
                             body["history"], model, identity)
         except DetectionError:

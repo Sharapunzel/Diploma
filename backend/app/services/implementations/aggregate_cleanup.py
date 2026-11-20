@@ -14,6 +14,7 @@ from .aggregate_protection import AggregateProtectionService
 class AggregateCleanupService:
     def __init__(self, repository, uow):
         self.repository, self.uow = repository, uow
+        self.current_operation_budget = None
 
     def _target(self, aggregate_id, budget, lock=False):
         self.repository.read_budget(budget.milliseconds())
@@ -35,6 +36,8 @@ class AggregateCleanupService:
                 plan = AggregateProtectionService(self.repository).plan(aggregate, schedule, detectors, keep_last, budget)
                 if schedule.active_cleanup_id:
                     plan.update(can_cleanup=False, reason="cleanup_in_progress")
+                elif plan["can_cleanup"] and plan["planned_delete"] and self.repository.retention_state(aggregate_id) is None:
+                    plan.update(can_cleanup=False, reason="retention_state_missing")
                 return CleanupProtection(**plan)
         except EventTimeBudgetError as error:
             raise DomainError("cleanup_protection_unavailable", "Не удалось проверить все зависимости очистки", 409,
@@ -70,6 +73,8 @@ class AggregateCleanupService:
                 if not plan["can_cleanup"]:
                     raise DomainError(plan["reason"], "Очистка заблокирована зависимыми детекторами", 409,
                         CleanupProtection(**plan).model_dump(mode="json"))
+                if plan["planned_delete"] and self.repository.retention_state(aggregate_id, lock=True) is None:
+                    raise DomainError("retention_state_missing", "Состояние истории недоступно; очистка пока невозможна", 409)
                 cleanup_id = uuid4()
                 self.repository.read_budget(budget.milliseconds())
                 cutoff = self.repository.cleanup_tail(aggregate_id, keep_last) if plan["planned_delete"] else None
@@ -96,6 +101,7 @@ class AggregateCleanupService:
             else:
                 raise DomainError("invalid_aggregate_command", "Неизвестная команда", 422)
             schedule.execution_generation += 1
+            self.repository.revoke_window_attempt(schedule.id, budget)
             receipt = AggregateCommandReceipt(operation_id=uuid4(), aggregate_id=aggregate_id, action=action,
                 recorded_at=self.repository.now(), execution_generation=schedule.execution_generation,
                 cleanup_operation_id=cleanup_id)
@@ -127,6 +133,7 @@ class AggregateCleanupService:
 
     def advance(self, aggregate_id, operation_id):
         budget = OperationBudget(5)
+        self.current_operation_budget = budget
         try:
             _aggregate, schedule = self._target(aggregate_id, budget, True)
             operation = self.repository.cleanup_operation(aggregate_id, operation_id, True)
@@ -141,6 +148,8 @@ class AggregateCleanupService:
             # One bounded dependency portion per turn leaves enough time for
             # its atomic progress commit and fairly serves other aggregates.
             if points:
+                if self.repository.retention_state(aggregate_id) is None:
+                    raise DomainError("retention_state_missing", "Состояние истории недоступно; очистка пока невозможна", 409)
                 closure = points[0]
                 if self.repository.compact_point(closure, budget):
                     operation.deleted_points += 1
@@ -148,6 +157,12 @@ class AggregateCleanupService:
             else:
                 operation.status, operation.completed_at = "succeeded", self.repository.now()
                 schedule.active_cleanup_id = None
+                # Publish fence release and pending auto-GC wake atomically.
+                # A failed/retried manual operation retains its fence and does
+                # not make the blocked maintenance task spin on every turn.
+                state = self.repository.retention_state(aggregate_id, lock=True)
+                if state is not None and state.pending_closure_id is not None:
+                    state.next_check_at = operation.completed_at
             self.repository.read_budget(min(1000, budget.milliseconds()))
             self.uow.commit()
             return {"state": operation.status, "deleted_points": operation.deleted_points}
@@ -155,6 +170,7 @@ class AggregateCleanupService:
             self.uow.rollback()
             # A failed operation retains both its boundary and execution fence.
             failure_budget = OperationBudget(5)
+            self.current_operation_budget = failure_budget
             _, schedule = self._target(aggregate_id, failure_budget, True)
             operation = self.repository.cleanup_operation(aggregate_id, operation_id, True)
             if operation and schedule.active_cleanup_id == operation_id and operation.status != "succeeded":

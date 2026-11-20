@@ -4,8 +4,162 @@ import type { Preview } from "../../app/api/aggregates";
 import { parseAggregate, type JsonObject } from "../../app/api/aggregateJson";
 import { BudgetView } from "./BudgetView";
 import { FeatureTable, ResultView } from "./ResultView";
+import {
+  previewFixture,
+  executionFixture,
+  executionPolicyFixture,
+} from "../../app/api/aggregateTestData";
 
 afterEach(cleanup);
+
+it("updates draft thresholds without inventing a measured duration", () => {
+  const view = render(
+    <BudgetView duration="5" budget={{ estimated_rows: 0 }} />,
+  );
+  const thresholds = within(
+    screen.getByRole("region", { name: "Пороги расчёта" }),
+  );
+  expect(thresholds.getByText("4 с")).toBeTruthy();
+  expect(thresholds.getByText("5 с")).toBeTruthy();
+  expect(
+    screen.getByText(
+      /Ещё не измерено. Оценка ресурсов не является прогнозом времени/,
+    ),
+  ).toBeTruthy();
+  expect(
+    screen.getByText("Записей в окне:").parentElement?.textContent,
+  ).toContain("0");
+  view.rerender(<BudgetView duration="300" />);
+  expect(thresholds.getByText("30 с")).toBeTruthy();
+  expect(thresholds.queryByText("4 с")).toBeNull();
+});
+
+it("does not reuse a previous policy when an explicit draft duration is invalid", () => {
+  const view = render(
+    <BudgetView duration="" policy={executionPolicyFixture()} />,
+  );
+  const thresholds = within(
+    screen.getByRole("region", { name: "Пороги расчёта" }),
+  );
+  expect(
+    thresholds.getByText("Укажите корректную длительность окна"),
+  ).toBeTruthy();
+  expect(thresholds.queryByText("30 с")).toBeNull();
+  view.rerender(<BudgetView policy={executionPolicyFixture()} />);
+  expect(thresholds.getByText("30 с")).toBeTruthy();
+  view.rerender(<BudgetView duration="5" policy={executionPolicyFixture()} />);
+  expect(thresholds.getByText("4 с")).toBeTruthy();
+  expect(thresholds.queryByText("30 с")).toBeNull();
+});
+
+it("labels a precommit measurement without presenting unknown ACK latency as zero", () => {
+  render(
+    <BudgetView
+      duration={300}
+      execution={executionFixture({
+        origin: "online",
+        window_index: 0,
+        measured_through: "before_commit",
+        elapsed_seconds: 6,
+      })}
+    />,
+  );
+  const actual = within(
+    screen.getByRole("region", { name: "Последний фактический расчёт" }),
+  );
+  expect(actual.getByText("Рассчитано")).toBeTruthy();
+  expect(actual.getByText("6 с")).toBeTruthy();
+  expect(
+    actual.getByText(
+      /до сохранения результата; запись и её подтверждение не включены/,
+    ),
+  ).toBeTruthy();
+  expect(
+    actual.getByText(/Полная online-задержка.*Ещё не измерено/),
+  ).toBeTruthy();
+  expect(actual.getByText(/Мягкий ориентир: Ещё не измерено/)).toBeTruthy();
+  expect(actual.queryByText("Не превышен")).toBeNull();
+});
+
+it("does not turn a soft exceedance into an uncomputed result", () => {
+  render(
+    <BudgetView
+      duration={300}
+      execution={executionFixture({
+        origin: "online",
+        window_index: 0,
+        elapsed_seconds: 1,
+        online_latency_seconds: 7,
+        soft_latency_exceeded: true,
+      })}
+    />,
+  );
+  const actual = within(
+    screen.getByRole("region", { name: "Последний фактический расчёт" }),
+  );
+  expect(actual.getByText("Рассчитано")).toBeTruthy();
+  expect(
+    actual.getByText(
+      /Превышен; вычисленные значения сохраняют прежнюю пригодность/,
+    ),
+  ).toBeTruthy();
+  expect(actual.queryByText("Не рассчитано")).toBeNull();
+});
+
+it("does not imply available numeric data when an uncomputed window also exceeds the soft target", () => {
+  render(
+    <BudgetView
+      duration={300}
+      execution={executionFixture({
+        calculation_status: "uncomputed",
+        calculation_reason: "execution_budget_exceeded",
+        origin: "online",
+        window_index: 0,
+        measured_through: "finalization",
+        elapsed_seconds: 31,
+        online_latency_seconds: 40,
+        soft_latency_exceeded: true,
+      })}
+    />,
+  );
+  const actual = within(
+    screen.getByRole("region", { name: "Последний фактический расчёт" }),
+  );
+  expect(actual.getByText("Не рассчитано")).toBeTruthy();
+  expect(actual.getByText(/Превышен; исход окна указан выше/)).toBeTruthy();
+  expect(actual.queryByText(/вычисленные значения сохраняют/)).toBeNull();
+});
+
+it("separates a mutable out-of-process preview from received quality and delivery", () => {
+  render(
+    <ResultView
+      result={previewFixture({
+        in_process: false,
+        snapshot_metadata: {
+          delivery_coverage: "not_attested",
+          facts: { exclusions: { event_time_fallback: 2 } },
+        },
+      })}
+      zone="UTC"
+    />,
+  );
+  expect(
+    screen.getByRole("heading", {
+      name: "Предварительный расчёт — результат не сохранён",
+    }),
+  ).toBeTruthy();
+  expect(screen.getByText(/Диагностика вне процесса/)).toBeTruthy();
+  expect(
+    screen.getByText("Полученный снимок без известных нарушений"),
+  ).toBeTruthy();
+  expect(
+    screen.getByText(/доставка всех журналов не подтверждена/),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("list", { name: "Исключения времени снимка" }).textContent,
+  ).toContain("2");
+  expect(screen.queryByText("Полнота подтверждена")).toBeNull();
+});
 
 it("keeps exact output values and missing values distinct in the styled preview", () => {
   const result = parseAggregate(`{

@@ -1,16 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Button, Input, Radio, Select, Spin } from "antd";
+import { Button, Input, Radio, Spin } from "antd";
 import { observer } from "mobx-react-lite";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { DraftStore } from "../../features/aggregates/DraftStore";
 import { useAggregateScope } from "../../features/aggregates/useAggregateScope";
 import { useDraftGuard } from "../../features/aggregates/useDraftGuard";
-import { browserZone } from "../../features/aggregates/time";
+import { browserZone, selectedWindow } from "../../features/aggregates/time";
 import {
   timezoneError,
   validInstant,
 } from "../../features/aggregates/processValidation";
-import { timeBases } from "../../features/aggregates/labels";
 import { ResourcesApi } from "../../app/api/resources";
 import { useStores } from "../../app/providers/StoresProvider";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
@@ -62,6 +61,19 @@ export const AggregateCreatePage = observer(() => {
     ]),
   ].join(" ");
   const budget = store.preview?.budget ?? store.validation?.budget;
+  let windowInfo = null;
+  let windowError = "";
+  if (store.window && store.boundary) {
+    try {
+      windowInfo = selectedWindow(
+        store.window,
+        store.validation?.anchor_utc ?? store.boundary,
+        Number(store.duration),
+      );
+    } catch (error) {
+      windowError = error instanceof Error ? error.message : "Проверьте окно.";
+    }
+  }
   const create = () =>
     void store.create().then((aggregate) => {
       if (aggregate)
@@ -176,7 +188,7 @@ export const AggregateCreatePage = observer(() => {
                 />
               </div>
               <CalendarTime
-                label="Исходная граница"
+                label="Начало истории и сетка окон"
                 zoned
                 required
                 value={store.boundary}
@@ -190,6 +202,13 @@ export const AggregateCreatePage = observer(() => {
             </div>
             <p className={styles.notice}>
               Исходный пояс расписания: {store.timezone}.
+            </p>
+            <p className={styles.notice}>
+              События относятся к окну по исходному ECS @timestamp. Дата
+              загрузки не переносит их на другую дату. Граница задаёт начало
+              автоматической истории. Текущее окно закрывается после конца плюс
+              min(длительность, 300 секунд); завершённая старая история
+              рассчитывается сразу.
             </p>
           </fieldset>
           {!processReady && (
@@ -235,8 +254,8 @@ export const AggregateCreatePage = observer(() => {
               2. Выходной вектор и полное правило{" "}
             </h3>
             <p className={styles.notice}>
-              Включённые признаки образуют выходной вектор. Остальные доступны
-              как зависимости формул.
+              Включённые признаки образуют выходной вектор. Вспомогательные
+              признаки остаются доступны как зависимости формул.
             </p>
             <Radio.Group
               aria-label="Режим правила"
@@ -259,7 +278,7 @@ export const AggregateCreatePage = observer(() => {
             />
             {store.mode === "json" ? (
               <div className={styles.field}>
-                <FieldLabel help="Полное правило: выходные признаки, внутренние определения и условия отбора. Имя, источник и расписание задаются отдельно.">
+                <FieldLabel help="Полное правило: выходные и вспомогательные признаки, условия отбора. Имя, источник и расписание задаются отдельно.">
                   Полное правило JSON
                 </FieldLabel>
                 <Input.TextArea
@@ -307,34 +326,19 @@ export const AggregateCreatePage = observer(() => {
                 disabled={creating || !processReady}
                 onChange={(v) => store.setField("window", v)}
               />
-              <div className={styles.field}>
-                <FieldLabel help="В рабочем режиме событие относится к окну по времени, когда запись успешно сохранена и её изменения подтверждены базой данных. Время возникновения события ECS @timestamp может быть раньше. Ретроспективный режим использует время обработки и не подтверждает полноту рабочего окна.">
-                  Отбор событий по времени
-                </FieldLabel>
-                <Select
-                  aria-label="Отбор событий по времени"
-                  value={store.timeBasis}
-                  disabled={creating || !processReady}
-                  onChange={(v) => store.setField("timeBasis", v)}
-                  options={[
-                    {
-                      value: "availability_at",
-                      label: timeBases.availability_at,
-                    },
-                    {
-                      value: "backend_processed_at_historical",
-                      label: timeBases.backend_processed_at_historical,
-                    },
-                  ]}
-                />
-              </div>
             </div>
-            {store.timeBasis !== "availability_at" && (
-              <AggregateNotice
-                type="warning"
-                message="Ретроспективный расчёт по времени обработки не доказывает полноту рабочего окна и не разрешает сохранение исторической точки."
-              />
+            {windowInfo && (
+              <p aria-label="Выбранное окно предварительного расчёта">
+                [<Time value={windowInfo.start} zone={zone} />,{" "}
+                <Time value={windowInfo.end} zone={zone} />
+                ).{" "}
+                {windowInfo.inProcess
+                  ? "Окно процесса."
+                  : "Диагностика вне процесса: до начала автоматической истории."}{" "}
+                {!windowInfo.completed && "Окно ещё не завершено."}
+              </p>
             )}
+            {windowError && <p role="alert">{windowError}</p>}
             {store.localError && (
               <AggregateNotice
                 type="error"
@@ -378,6 +382,8 @@ export const AggregateCreatePage = observer(() => {
                   !processReady ||
                   !store.validation ||
                   !validInstant(store.window) ||
+                  !!windowError ||
+                  !windowInfo?.completed ||
                   store.busy
                 }
                 onClick={() => void store.runPreview()}
@@ -417,7 +423,11 @@ export const AggregateCreatePage = observer(() => {
                 showBudget={false}
               />
             )}
-            {budget && <BudgetView budget={budget} />}
+            <BudgetView
+              budget={budget}
+              duration={store.duration}
+              execution={store.lastExecution}
+            />
           </fieldset>
         </>
       )}

@@ -1,0 +1,2203 @@
+{
+  "body": {
+    "affine": {
+      "algorithm": "min_range_decimal_float32_v1",
+      "center": [
+        "0",
+        "0"
+      ],
+      "scale": [
+        "10",
+        "14"
+      ]
+    },
+    "boundary": "warmup",
+    "config": {
+      "dimensions": 2,
+      "output_after": 8,
+      "sample_size": 8,
+      "seed": 42,
+      "trees": 20
+    },
+    "history": [
+      {
+        "exact": [
+          "1",
+          "5"
+        ],
+        "ml": [
+          0.10000000149011612,
+          0.3571428656578064
+        ]
+      },
+      {
+        "exact": [
+          "8",
+          "5"
+        ],
+        "ml": [
+          0.800000011920929,
+          0.3571428656578064
+        ]
+      },
+      {
+        "exact": [
+          "4",
+          "11"
+        ],
+        "ml": [
+          0.4000000059604645,
+          0.7857142686843872
+        ]
+      },
+      {
+        "exact": [
+          "0",
+          "6"
+        ],
+        "ml": [
+          0,
+          0.4285714328289032
+        ]
+      },
+      {
+        "exact": [
+          "7",
+          "7"
+        ],
+        "ml": [
+          0.699999988079071,
+          0.5
+        ]
+      },
+      {
+        "exact": [
+          "3",
+          "14"
+        ],
+        "ml": [
+          0.30000001192092896,
+          1
+        ]
+      },
+      {
+        "exact": [
+          "10",
+          "10"
+        ],
+        "ml": [
+          1,
+          0.7142857313156128
+        ]
+      },
+      {
+        "exact": [
+          "6",
+          "12"
+        ],
+        "ml": [
+          0.6000000238418579,
+          0.8571428656578064
+        ]
+      }
+    ],
+    "keys": [
+      "count",
+      "bytes"
+    ],
+    "mapper": {
+      "forestMode": "STANDARD",
+      "forestState": {
+        "boundingBoxCacheFraction": 1,
+        "centerOfMassEnabled": false,
+        "compact": true,
+        "compactRandomCutTreeStates": [
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                12
+              ],
+              "cutValueData": "Pka5GD7Fsns/F2d0PyZKuD8/HKU+9cjLPwt8Mg==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                18
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                43
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 2105822618180708525,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                82
+              ],
+              "cutValueData": "P3HmdT9AJmA+tcYfPwxLOD7sFNc+uqxLP3AsrQ==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                11
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                14
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -7073109992500519323,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                10
+              ],
+              "cutValueData": "P0cZEj67XYU/aChcPy14vz6WTuk/DMNfPvVKZg==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                41
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                11
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 5361717341184688022,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                100
+              ],
+              "cutValueData": "PxaTeT07LHo/O8+UPfbryz98xZQ/YxL4PsIdjQ==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                21
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                7
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -7305537690262824500,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                116
+              ],
+              "cutValueData": "PSpyUD7yxTk+0rLjPxVA5z9qWcg/O24WPqbrkw==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                34
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                15
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -7830713840182702123,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                112
+              ],
+              "cutValueData": "Porhqz02R+0/OJCDPw6osj8tsn4/RNjqP2/C2g==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                5
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                45
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 5799710363603987975,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                6,
+                41
+              ],
+              "cutValueData": "PydWYT8gx1g+zPtYP2Vfbj8LUbI/c9n0",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                6,
+                6
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                6,
+                21
+              ],
+              "root": 0,
+              "size": 6,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 8091724559737821113,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                6,
+                28
+              ],
+              "cutValueData": "PxFwbj3TXJg/HG4/P3UJ1z9QR8k+6Imx",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                6,
+                9
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                6,
+                7
+              ],
+              "root": 0,
+              "size": 6,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -1553942456730901022,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                121
+              ],
+              "cutValueData": "PzrPNT8pAv0+HhWMPxAcIj6jDTg+2+adPs9MIw==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                15
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                18
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -3395240599915248461,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                22
+              ],
+              "cutValueData": "Pne/vT7h+YA/ez2APNCeSz8Uodc/A+tHPybtfA==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                7
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                49
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -4262177369255523894,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                6,
+                3
+              ],
+              "cutValueData": "Pw7SJj7nuFM/B+Y7PqKJkT9Q3OI+7w5G",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                6,
+                5
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                6,
+                13
+              ],
+              "root": 0,
+              "size": 6,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -1208132128801461009,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                25
+              ],
+              "cutValueData": "PwRfQT8EE9I/QvO2PsrE5j70BxE+0ed0PkCa5w==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                7
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                11
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 1053256139401121778,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                112
+              ],
+              "cutValueData": "P1EZCD67tSs9qvOkPt7aND6qloY/H3XrPyy6aQ==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                7
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                14
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 567416978807330058,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                17
+              ],
+              "cutValueData": "Pw7L9j8binI/XNTCP1mbhz9Xcw8+/LKaPwlgWg==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                21
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                19
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 1031020065857609987,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                6,
+                58
+              ],
+              "cutValueData": "PxHmwj7xX04/H85zP17FDz9qYxg/F21M",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                6,
+                5
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                6,
+                7
+              ],
+              "root": 0,
+              "size": 6,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 3454733981784863721,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                116
+              ],
+              "cutValueData": "PgM5JD8adfM/G5LNP2zIsj9+dZM+xDNNPvekUw==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                10
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                39
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 269269699511370871,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                105
+              ],
+              "cutValueData": "Pyv7oD8g1VM/F4IiPtWZ5D7c+oY/UycwP37f2g==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                23
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                33
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -4405168467245526076,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                68
+              ],
+              "cutValueData": "PylaFz7ynRs/CzQBPqivqD9lUy087M6YPyGI+w==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                15
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                33
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 1618492741635139938,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                89
+              ],
+              "cutValueData": "P2thGT4XHBg/NHEKPyo4Tz7kZts+29ovPtnWcw==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                21
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                14
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": 943912897142068008,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          },
+          {
+            "auxiliaryData": null,
+            "boundingBoxCacheFraction": 1,
+            "centerOfMassEnabled": false,
+            "dimensions": 2,
+            "hasAuxiliaryData": false,
+            "id": 0,
+            "maxSize": 8,
+            "nodeStoreState": {
+              "canonicalAndNotALeaf": true,
+              "capacity": 7,
+              "compressed": true,
+              "cutDimension": [
+                0,
+                1,
+                7,
+                51
+              ],
+              "cutValueData": "Ps7T+z6aSyw+TYhzPtcSAz9nE5w/QMZXPwMboA==",
+              "leafFreeIndexPointer": 0,
+              "leafFreeIndexes": null,
+              "leafMass": null,
+              "leafPointIndex": null,
+              "leftIndex": [
+                0,
+                1,
+                7,
+                9
+              ],
+              "nodeFreeIndexPointer": 0,
+              "nodeFreeIndexes": null,
+              "partialTreeStateEnabled": true,
+              "precision": "FLOAT_32",
+              "rightIndex": [
+                0,
+                1,
+                7,
+                45
+              ],
+              "root": 0,
+              "size": 7,
+              "version": "3.0"
+            },
+            "outputAfter": 1,
+            "partialTreeState": true,
+            "root": 0,
+            "seed": -5375594617395667088,
+            "staticSeed": 0,
+            "storeSequenceIndexesEnabled": false,
+            "version": "3.0",
+            "weight": 0
+          }
+        ],
+        "compactSamplerStates": [
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              5,
+              15,
+              8,
+              206348637
+            ],
+            "randomSeed": 4330580385608422981,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.412958,
+              -1.6544092,
+              -2.7301638,
+              -1.9659169,
+              -2.8864474,
+              -3.5810916,
+              -4.493168,
+              -2.615564
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              4,
+              15,
+              8,
+              365803447
+            ],
+            "randomSeed": 1881956716521959156,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -0.75611925,
+              -0.9092648,
+              -1.0787781,
+              -1.8141189,
+              -1.355295,
+              -1.3743253,
+              -1.8573428,
+              -2.4684112
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              1,
+              15,
+              8,
+              98513415,
+              11
+            ],
+            "randomSeed": 8425228841173471921,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.4873719,
+              -2.5664585,
+              -1.5353829,
+              -2.9435246,
+              -3.5996912,
+              -1.6662331,
+              -3.50609,
+              -3.470395
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              4,
+              15,
+              8,
+              302495736
+            ],
+            "randomSeed": -3182586933625435233,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.2218063,
+              -1.4401742,
+              -1.4627242,
+              -1.63348,
+              -2.3689852,
+              -3.2952356,
+              -1.661195,
+              -2.178119
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              1,
+              15,
+              8,
+              83415015,
+              14
+            ],
+            "randomSeed": 8368972217041509678,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.4043845,
+              -1.8511249,
+              -1.927721,
+              -2.3509374,
+              -3.8728654,
+              -2.8444185,
+              -2.2005765,
+              -4.124568
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              2,
+              15,
+              8,
+              1420503052
+            ],
+            "randomSeed": 4415016031039562912,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -2.0206485,
+              -2.0920932,
+              -2.079588,
+              -2.3364468,
+              -2.8556843,
+              -2.7522743,
+              -3.6908143,
+              -2.7053003
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              2,
+              15,
+              8,
+              1408630272
+            ],
+            "randomSeed": -280256882663902295,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.422369,
+              -1.7737491,
+              -1.4805797,
+              -2.3072193,
+              -2.705375,
+              -2.997806,
+              -2.8335443,
+              -5.033951
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              3,
+              15,
+              8,
+              36873938
+            ],
+            "randomSeed": 6277514952615672324,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -0.8458374,
+              -0.9806402,
+              -1.5987303,
+              -1.0033482,
+              -1.1703839,
+              -1.7571634,
+              -2.4760783,
+              -2.6151533
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              0,
+              14,
+              8,
+              68797332,
+              11
+            ],
+            "randomSeed": 6104734202533302602,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.0851818,
+              -1.0985931,
+              -1.4495386,
+              -1.5783052,
+              -1.9255676,
+              -2.086488,
+              -1.7920401,
+              -1.9758971
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              5,
+              15,
+              8,
+              145369618
+            ],
+            "randomSeed": 6158057891238949424,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.3112627,
+              -1.8129408,
+              -1.3730054,
+              -2.1656363,
+              -5.5996203,
+              -2.0548496,
+              -1.6780534,
+              -2.356035
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              3,
+              15,
+              8,
+              772512360
+            ],
+            "randomSeed": 5558401812201129764,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.7492396,
+              -1.9604014,
+              -3.248713,
+              -2.6678317,
+              -3.7608085,
+              -3.4725642,
+              -8.81489,
+              -6.020757
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              5,
+              15,
+              8,
+              196742234
+            ],
+            "randomSeed": 4128941981249157713,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.1729506,
+              -1.4573014,
+              -2.520903,
+              -2.0326576,
+              -2.1001987,
+              -3.0855238,
+              -2.8596346,
+              -2.4617283
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              0,
+              14,
+              8,
+              133137188,
+              14
+            ],
+            "randomSeed": 2474276710520157150,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.6817175,
+              -1.814853,
+              -2.3488243,
+              -2.544229,
+              -3.6035736,
+              -2.9611626,
+              -5.59721,
+              -2.9645884
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              4,
+              14,
+              8,
+              102925216
+            ],
+            "randomSeed": -3945921664803049931,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.6459091,
+              -1.9454494,
+              -3.4673853,
+              -2.5424967,
+              -2.9652379,
+              -4.799311,
+              -4.177686,
+              -2.8952932
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              2,
+              15,
+              8,
+              1453280311
+            ],
+            "randomSeed": -2510803080383987674,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.3927443,
+              -1.8428314,
+              -1.5190393,
+              -2.6973872,
+              -2.4598699,
+              -2.9371777,
+              -3.9561853,
+              -3.7146432
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              3,
+              15,
+              8,
+              771195758
+            ],
+            "randomSeed": -54245837517800953,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.3250333,
+              -2.0526352,
+              -2.647518,
+              -2.3972447,
+              -3.755733,
+              -3.817203,
+              -3.0636814,
+              -4.1852074
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              2,
+              15,
+              8,
+              1204954219
+            ],
+            "randomSeed": 629994017208922976,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.3288141,
+              -1.6761272,
+              -2.2499301,
+              -1.6812071,
+              -5.8688445,
+              -2.8242269,
+              -2.2590086,
+              -3.98402
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              2,
+              15,
+              8,
+              1446039563
+            ],
+            "randomSeed": -6434566001030552175,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -2.442885,
+              -2.447172,
+              -2.5123396,
+              -3.2404606,
+              -4.8003926,
+              -3.6411917,
+              -3.6116133,
+              -4.408806
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              6,
+              15,
+              8,
+              90578436
+            ],
+            "randomSeed": -4467375710750098755,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -2.3968654,
+              -2.5980098,
+              -3.3975804,
+              -2.8475425,
+              -4.4335494,
+              -3.4331234,
+              -4.1199965,
+              -4.1125755
+            ]
+          },
+          {
+            "capacity": 8,
+            "compressed": true,
+            "initialAcceptFraction": 1,
+            "maxSequenceIndex": 15,
+            "pointIndex": [
+              1,
+              15,
+              8,
+              94508780,
+              14
+            ],
+            "randomSeed": 928758122344012406,
+            "sequenceIndex": null,
+            "sequenceIndexOfMostRecentTimeDecayUpdate": 0,
+            "size": 8,
+            "storeSequenceIndicesEnabled": false,
+            "timeDecay": 0.125,
+            "version": "2.0",
+            "weight": [
+              -1.3925167,
+              -1.5745976,
+              -2.2973058,
+              -1.7105287,
+              -1.6568003,
+              -4.0266395,
+              -3.0489342,
+              -2.4042122
+            ]
+          }
+        ],
+        "compressed": true,
+        "currentlySampling": true,
+        "dimensions": 2,
+        "executionContext": {
+          "mode": null,
+          "parallelExecutionEnabled": false,
+          "threadPoolSize": 0
+        },
+        "internalShinglingEnabled": true,
+        "numberOfTrees": 20,
+        "outputAfter": 8,
+        "partialTreeState": true,
+        "pointStoreState": {
+          "capacity": 161,
+          "compressed": true,
+          "currentStoreCapacity": 16,
+          "dimensions": 2,
+          "directLocationMap": false,
+          "duplicateRefs": [],
+          "dynamicResizingEnabled": true,
+          "indexCapacity": 16,
+          "internalShingle": [
+            0.6000000238418579,
+            0.8571428656578064
+          ],
+          "internalShinglingEnabled": true,
+          "lastTimeStamp": 16,
+          "locationList": [
+            0,
+            15,
+            16,
+            106181136,
+            231451015,
+            254
+          ],
+          "pointData": "AAAAAAAAAAA/MzMzPltttz6ZmZo/W223P4AAAD82224/GZmaP4AAAD5MzM0/AAAAP2ZmZj7bbbc/AAAAP0kkkj3MzM0+tttuP0zMzT62224+zMzNP0kkkgAAAAA+2223PzMzMz8AAAA+mZmaP4AAAD+AAAA/NttuPxmZmj9bbbc=",
+          "precision": "FLOAT_32",
+          "refCount": [
+            2,
+            17,
+            16,
+            110461712,
+            248293752,
+            249
+          ],
+          "reverseAvailable": false,
+          "reverseLocationList": null,
+          "rotationEnabled": false,
+          "shingleSize": 1,
+          "startOfFreeSegment": 32,
+          "version": "3.0"
+        },
+        "precision": "FLOAT_32",
+        "sampleSize": 8,
+        "saveCoordinatorStateEnabled": true,
+        "saveSamplerStateEnabled": true,
+        "saveTreeStateEnabled": true,
+        "shingleSize": 1,
+        "storeSequenceIndexesEnabled": false,
+        "timeDecay": 0.125,
+        "totalUpdates": 16,
+        "version": "4.0"
+      },
+      "ignoreSimilar": false,
+      "ignoreSimilarFactor": 0,
+      "inHighScoreRegion": false,
+      "lastAnomalyAttribution": null,
+      "lastAnomalyPoint": null,
+      "lastAnomalyScore": 0,
+      "lastAnomalyTimeStamp": 0,
+      "lastDescriptorState": {
+        "anomalyGrade": 0,
+        "attribution": {
+          "high": null,
+          "low": null
+        },
+        "correctionMode": "NONE",
+        "currentInput": null,
+        "expectedPoint": null,
+        "inputTimeStamp": 0,
+        "internalTimeStamp": 0,
+        "lastReset": 0,
+        "lastScore": 0,
+        "point": null,
+        "postDeviations": null,
+        "postShift": null,
+        "relativeIndex": 0,
+        "scale": null,
+        "score": 0,
+        "shift": null,
+        "strategy": "EXPECTED_INVERSE_DEPTH",
+        "threshold": 0,
+        "transformDecay": 0
+      },
+      "lastExpectedPoint": null,
+      "lastRelativeIndex": 0,
+      "lastReset": 0,
+      "lastScore": 0,
+      "numberOfAttributors": 0,
+      "predictorCorrectorState": {
+        "autoAdjust": false,
+        "baseDimension": 2,
+        "deviationStates": null,
+        "ignoreDrift": false,
+        "ignoreNearExpected": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "lastDescriptor": {
+          "anomalyGrade": 0,
+          "attribution": {
+            "high": null,
+            "low": null
+          },
+          "correctionMode": "NONE",
+          "currentInput": [
+            0.6000000238418579,
+            0.8571428656578064
+          ],
+          "expectedPoint": null,
+          "inputTimeStamp": 15,
+          "internalTimeStamp": 15,
+          "lastReset": 0,
+          "lastScore": 0,
+          "point": [
+            0.6000000238418579,
+            0.8571428656578064
+          ],
+          "postDeviations": null,
+          "postShift": null,
+          "relativeIndex": 0,
+          "scale": [
+            1,
+            1
+          ],
+          "score": 0.8406733772949829,
+          "shift": [
+            0,
+            0
+          ],
+          "strategy": "EXPECTED_INVERSE_DEPTH",
+          "threshold": 1.5,
+          "transformDecay": 0
+        },
+        "lastScore": [
+          0,
+          0
+        ],
+        "lastStrategy": "EXPECTED_INVERSE_DEPTH",
+        "modeInformation": null,
+        "noiseFactor": 1,
+        "numberOfAttributors": 5,
+        "randomSeed": 42,
+        "runLength": 0,
+        "samplingSuppport": 0.1,
+        "thresholderStates": [
+          {
+            "absoluteScoreFraction": 0,
+            "absoluteThreshold": 0.8,
+            "attributionEnabled": false,
+            "autoThreshold": false,
+            "count": 8,
+            "deviationStates": [
+              {
+                "count": 8,
+                "discount": 0.125,
+                "sum": 4.936559267744995,
+                "sumSquared": 4.730264067885701,
+                "weight": 5.251128673553467
+              },
+              {
+                "count": 8,
+                "discount": 0.01,
+                "sum": 7.190965216752326,
+                "sumSquared": 6.823277463497899,
+                "weight": 7.72553055720799
+              },
+              {
+                "count": 4,
+                "discount": 0.0625,
+                "sum": 0.3933943338613583,
+                "sumSquared": 0.04448266346597947,
+                "weight": 3.640380859375
+              }
+            ],
+            "elasticity": 0,
+            "horizon": 0.5,
+            "inAnomaly": false,
+            "initialThreshold": 1.5,
+            "lowerThreshold": 0.9,
+            "minimumScores": 10,
+            "primaryDeviationState": null,
+            "randomseed": 0,
+            "secondaryDeviationState": null,
+            "thresholdDeviationState": null,
+            "upperThreshold": 0,
+            "upperZfactor": 0,
+            "zfactor": 3
+          },
+          {
+            "absoluteScoreFraction": 0,
+            "absoluteThreshold": 0.8,
+            "attributionEnabled": false,
+            "autoThreshold": false,
+            "count": 0,
+            "deviationStates": [
+              {
+                "count": 0,
+                "discount": 0.125,
+                "sum": 0,
+                "sumSquared": 0,
+                "weight": 0
+              },
+              {
+                "count": 0,
+                "discount": 0.125,
+                "sum": 0,
+                "sumSquared": 0,
+                "weight": 0
+              },
+              {
+                "count": 0,
+                "discount": 0.0625,
+                "sum": 0,
+                "sumSquared": 0,
+                "weight": 0
+              }
+            ],
+            "elasticity": 0,
+            "horizon": 0.5,
+            "inAnomaly": false,
+            "initialThreshold": 1.5,
+            "lowerThreshold": 0.9,
+            "minimumScores": 10,
+            "primaryDeviationState": null,
+            "randomseed": 0,
+            "secondaryDeviationState": null,
+            "thresholdDeviationState": null,
+            "upperThreshold": 0,
+            "upperZfactor": 0,
+            "zfactor": 3
+          }
+        ],
+        "version": "3.8"
+      },
+      "preprocessorStates": [
+        {
+          "clipFactor": 100,
+          "dataQualityState": null,
+          "dataQualityStates": [
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 7.05546330383001,
+              "sumSquared": 7.05546330383001,
+              "weight": 7.05546330383001
+            }
+          ],
+          "defaultFill": null,
+          "deviationStates": [
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 3.7724648511062457,
+              "sumSquared": 2.7210580468473324,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 4.626020074473489,
+              "sumSquared": 3.448506066412434,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 0.1467907628040882,
+              "sumSquared": 1.9817854040472005,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 0.31873183582699444,
+              "sumSquared": 0.741711741373512,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 2.220009134558394,
+              "sumSquared": 0.714479972637359,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 1.8189886015461363,
+              "sumSquared": 0.49145414340205235,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.0125,
+              "sum": 0.9502832950639905,
+              "sumSquared": 0.23139774876164318,
+              "weight": 14.584049552310557
+            },
+            {
+              "count": 16,
+              "discount": 0.0125,
+              "sum": 1.0383590412611232,
+              "sumSquared": 0.18024580328643192,
+              "weight": 14.584049552310557
+            },
+            {
+              "count": 16,
+              "discount": 0.0125,
+              "sum": 6.906455271199037,
+              "sumSquared": 3.494029432375863,
+              "weight": 14.584049552310557
+            },
+            {
+              "count": 16,
+              "discount": 0.0125,
+              "sum": 4.352198665056723,
+              "sumSquared": 1.4268240818946274,
+              "weight": 14.584049552310557
+            }
+          ],
+          "dimensions": 2,
+          "fastForward": false,
+          "forestMode": "STANDARD",
+          "imputationMethod": "PREVIOUS",
+          "initialTimeStamps": null,
+          "initialValues": null,
+          "inputLength": 2,
+          "internalTimeStamp": 16,
+          "lastShingledInput": [
+            0.6000000238418579,
+            0.8571428656578064
+          ],
+          "lastShingledPoint": [
+            0.6000000238418579,
+            0.8571428656578064
+          ],
+          "normalizeTime": false,
+          "numberOfImputed": 0,
+          "previousTimeStamps": [
+            15
+          ],
+          "shingleSize": 1,
+          "startNormalization": 7,
+          "stopNormalization": 2147483647,
+          "timeDecay": 0.125,
+          "timeStampDeviationState": null,
+          "timeStampDeviationStates": [
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 66.40526241064072,
+              "sumSquared": 822.9000425934792,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 7.656391084194183,
+              "sumSquared": 22.087965548038483,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.125,
+              "sum": 26.05384143544029,
+              "sumSquared": 124.00032875797139,
+              "weight": 7.05546330383001
+            },
+            {
+              "count": 16,
+              "discount": 0.0125,
+              "sum": 10.083719771045775,
+              "sumSquared": 11.92761418365179,
+              "weight": 14.584049552310557
+            },
+            {
+              "count": 16,
+              "discount": 0.0125,
+              "sum": 16.832147775042763,
+              "sumSquared": 34.67976929391701,
+              "weight": 14.584049552310557
+            }
+          ],
+          "transformMethod": "NONE",
+          "useImputedFraction": 0.5,
+          "valuesSeen": 16,
+          "version": "4.1",
+          "weights": [
+            1,
+            1,
+            1
+          ]
+        }
+      ],
+      "previousIsPotentialAnomaly": false,
+      "randomSeed": 0,
+      "scoringStrategy": "EXPECTED_INVERSE_DEPTH",
+      "thresholderState": null,
+      "transformMethod": "NONE",
+      "triggerFactor": 0,
+      "version": "3.8"
+    },
+    "rule_hash": "e398e17d95e958eb23fd765da58c116fb144908bf9d08c15b10e6a858be7b26c",
+    "runtime": {
+      "aws": "4.4.0",
+      "format": 1,
+      "jpype": "1.6.0",
+      "jre": "17.0.17+10",
+      "manifest": "92208724157eaebae035a4d8b50bc0b83df243918f5cc0bac7c7e12a268ea169"
+    },
+    "settings": {
+      "absoluteThreshold": 0.8,
+      "alertOnce": false,
+      "anomalyRate": 0.01,
+      "autoAdjust": false,
+      "boundingBoxCacheFraction": 1,
+      "centerOfMassEnabled": false,
+      "forestMode": "STANDARD",
+      "initialAcceptFraction": 1,
+      "initialThreshold": 1.5,
+      "internalShinglingEnabled": true,
+      "nearExpectedIgnore": "release_defaults",
+      "parallelExecutionEnabled": false,
+      "precision": "FLOAT_32",
+      "scoreDifferencing": 0.5,
+      "scoringStrategy": "EXPECTED_INVERSE_DEPTH",
+      "shingleSize": 1,
+      "startNormalization": 7,
+      "stopNormalization": 2147483647,
+      "storeSequenceIndexesEnabled": false,
+      "timeDecay": 0.125,
+      "transformDecay": 0.125,
+      "transformMethod": "NONE",
+      "version": 1,
+      "weights": [
+        1,
+        1
+      ],
+      "zFactor": 3
+    },
+    "updates": 16
+  },
+  "sha256": "4b2629644ca4bc5e2bec26b7574619ad197f77735ec8d09d2e6ebb2556008abf"
+}

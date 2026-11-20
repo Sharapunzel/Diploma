@@ -11,7 +11,15 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from event_time_fixtures import delete_aggregate
+from fastapi import Depends
+from fastapi.testclient import TestClient
+from psycopg.errors import SerializationFailure
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import DBAPIError
+
 from app.aggregate_composition import build_aggregate_service
+from app.aggregation.worker_admission import FOREGROUND_BURST
 from app.config import Settings
 from app.core.errors import DomainError
 from app.core.security import hash_password
@@ -37,12 +45,6 @@ from app.schemas.aggregates import (
     HistoricalRequest,
 )
 from app.services.implementations.aggregate_worker import AggregateWorker
-from event_time_fixtures import delete_aggregate
-from fastapi import Depends
-from fastapi.testclient import TestClient
-from psycopg.errors import SerializationFailure
-from sqlalchemy import delete, func, select
-from sqlalchemy.exc import DBAPIError
 
 
 @pytest.fixture(scope="module")
@@ -95,11 +97,18 @@ def service(session, catalog):
 
 def request(source_id, now=None, duration=1):
     now = now or datetime.now(UTC)
-    anchor = (now - timedelta(seconds=20)).replace(microsecond=0)
+    anchor = (now - timedelta(seconds=max(20, duration + 1))).replace(microsecond=0)
     return AggregatePreviewRequest(source_id=source_id,
         aggregate_rule={"features": [{"key": "n", "name": "Count", "op": "count"}]},
         schedule={"boundary": anchor, "timezone": "UTC", "duration_seconds": duration},
         window_start_utc=anchor, time_basis="event_time")
+
+
+@pytest.mark.parametrize("duration", [1, 60])
+def test_request_fixture_uses_a_completed_preview_window(duration):
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    body = request(uuid4(), now=now, duration=duration)
+    assert body.window_start_utc + timedelta(seconds=duration) <= now
 
 
 def create(database, catalog, source_id, key=None, duration=1, clock_shift=0):
@@ -305,6 +314,48 @@ def test_worker_error_isolation_and_interruptible_wait(database, catalog, source
     assert not thread.is_alive()
 
 
+def test_worker_due_excludes_admitted_targets_and_preserves_success_rotation(database, catalog, source):
+    identities = {create(database, catalog, source, key=str(uuid4()))[0].id for _ in range(3)}
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        original = [identity for identity in api.due(1000) if identity in identities]
+        assert len(original) == 3
+        admitted = original[:2]
+        remaining = api.due(1000, exclude_ids=admitted)
+        assert not set(admitted) & set(remaining)
+        assert [identity for identity in remaining if identity in identities] == original[2:]
+        api.record_worker_error(original[0], None)
+        rotated = [identity for identity in api.due(1000) if identity in identities]
+        assert rotated == [*original[1:], original[0]]
+
+
+def test_idle_scan_and_history_turns_report_real_online_backlog_without_new_wait(database, catalog, source):
+    card, _ = create(database, catalog, source, clock_shift=3)
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        # Exercise the forced background phases with genuinely overdue online
+        # work; ordinary active phases now close that work first.
+        session.get(AggregateSchedule, card.schedule_id).turn = FOREGROUND_BURST
+        session.commit()
+        scan = api.advance(card.id)
+        session.get(AggregateSchedule, card.schedule_id).turn = 2 * (FOREGROUND_BURST + 1) - 1
+        session.commit()
+        history = api.advance(card.id)
+        assert scan == {"state": "scanned", "records": 0, "work_available": True}
+        assert history == {"state": "history_waiting", "work_available": True}
+        assert api.advance(card.id)["state"] == "closed"
+
+    waiting, _ = create(database, catalog, source, duration=60)
+    with database.session_factory() as session:
+        api = service(session, catalog)
+        assert api.advance(waiting.id) == {"state": "scanned", "records": 0, "work_available": False}
+        for _ in range(FOREGROUND_BURST + 1):
+            assert api.advance(waiting.id) == {"state": "history_waiting", "work_available": False}
+        assert api.advance(waiting.id) == {"state": "scanned", "records": 0, "work_available": False}
+        assert api.card(waiting.id).next_index == waiting.next_index
+        assert api.points(waiting.id, 50, 0)["total"] == 0
+
+
 def test_failed_point_write_rolls_back_manifest_closure_payload_and_cursor(database, catalog, source, monkeypatch):
     card, _ = create(database, catalog, source, clock_shift=3)
     with database.session_factory() as session:
@@ -360,9 +411,11 @@ def test_worker_one_error_does_not_block_other_aggregate(database, catalog):
     seen = []
     def build(session, _):
         api = service(session, catalog)
-        api.repository.due = lambda limit: ids
+        api.repository.due = lambda limit, exclude_ids=(): [identity for identity in ids if identity not in exclude_ids][:limit]
+        api.maintenance_due = lambda *_, **__: []
         api.repository.record_error = lambda *_: None
-        def advance(aggregate_id):
+        def advance(aggregate_id, *, execution_started):
+            assert execution_started is not None
             seen.append(aggregate_id)
             if aggregate_id == ids[0]:
                 raise DomainError("aggregate_timeout", "synthetic", 503)
@@ -378,13 +431,15 @@ def test_worker_one_error_does_not_block_other_aggregate(database, catalog):
 def test_worker_uses_only_declared_service_scenarios(database, catalog):
     ids, seen, errors = [uuid4(), uuid4()], [], []
 
-    def advance(aggregate_id):
+    def advance(aggregate_id, *, execution_started):
+        assert execution_started is not None
         seen.append(aggregate_id)
         if aggregate_id == ids[0]:
             raise DomainError("aggregate_timeout", "synthetic", 503)
 
     # No repository or unit of work is exposed by this implementation.
-    api = SimpleNamespace(due=lambda limit: ids, advance=advance,
+    api = SimpleNamespace(due=lambda limit, exclude_ids=(): [identity for identity in ids if identity not in exclude_ids][:limit],
+                          maintenance_due=lambda *_, **__: [], advance=advance,
                           record_worker_error=lambda *args: errors.append(args))
     worker = AggregateWorker(database.session_factory, lambda *_: api, catalog, Event())
     worker.tick()
@@ -395,14 +450,23 @@ def test_worker_uses_only_declared_service_scenarios(database, catalog):
 @pytest.mark.parametrize("result,idle", [
     ({"state": "waiting_close_deadline"}, True), ({"state": "history_waiting"}, True),
     ({"state": "scanned", "records": 499}, True), ({"state": "scanned", "records": 500}, False),
+    ({"state": "history_waiting", "work_available": True}, False),
+    ({"state": "scanned", "records": 0, "work_available": True}, False),
     ({"state": "closed"}, False),
 ])
 def test_worker_backs_off_idle_turns_but_keeps_full_pages_and_closes_ready(database, catalog, monkeypatch, result, idle):
     from app.services.implementations import aggregate_worker as module
     identity, calls, clock = uuid4(), [], [100.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    api = SimpleNamespace(due=lambda _: [identity], record_worker_error=lambda *_: None,
-        advance=lambda target: (calls.append(target), result)[1])
+
+    def advance(target, *, execution_started):
+        assert execution_started == clock[0]
+        calls.append(target)
+        return result
+
+    api = SimpleNamespace(due=lambda _, exclude_ids=(): [] if identity in exclude_ids else [identity],
+        maintenance_due=lambda *_, **__: [], record_worker_error=lambda *_: None,
+        advance=advance)
     worker = AggregateWorker(database.session_factory, lambda *_: api, catalog, Event())
     worker.tick()
     worker.tick()
@@ -416,9 +480,11 @@ def test_worker_slow_aggregate_does_not_hold_unrelated_one(database, catalog):
     ids, release, second = [uuid4(), uuid4()], Event(), Event()
     def build(session, _):
         api = service(session, catalog)
-        api.repository.due = lambda limit: ids
+        api.repository.due = lambda limit, exclude_ids=(): [identity for identity in ids if identity not in exclude_ids][:limit]
+        api.maintenance_due = lambda *_, **__: []
         api.repository.record_error = lambda *_: None
-        def advance(aggregate_id):
+        def advance(aggregate_id, *, execution_started):
+            assert execution_started is not None
             if aggregate_id == ids[0]:
                 assert release.wait(3)
             else:
@@ -456,7 +522,7 @@ def test_definition_and_schedule_are_immutable_but_copy_creates_new_uuid(databas
 def test_preview_budget_refuses_before_calculation(database, catalog, source):
     with database.session_factory() as session:
         api = service(session, catalog)
-        api.repository.snapshot_events = lambda *_: ([], [], 100001, 256)
+        api.repository.snapshot_events = lambda *_, **__: ([], [], 100001, 256)
         api.repository.event_source_rows = lambda *_: 100001
         api.repository.event_statistics = lambda *_: pytest.fail("over-budget preview was calculated")
         with pytest.raises(DomainError) as error:
@@ -510,7 +576,7 @@ def test_exact_materialization_budget_refuses_before_query(database, catalog, so
         **({'percentile': .5} if op == 'percentile' else {})}]})
     with database.session_factory() as session:
         api = service(session, catalog)
-        api.repository.snapshot_events = lambda *_: ([], [], 10000, 10000)
+        api.repository.snapshot_events = lambda *_, **__: ([], [], 10000, 10000)
         api.repository.event_source_rows = lambda *_: 10000
         api.repository.event_statistics = lambda *_: pytest.fail('over-budget exact materialization reached SQL')
         with pytest.raises(DomainError) as error:
@@ -566,7 +632,7 @@ def test_array_literal_budget_refuses_preview_and_atomic_point(database, catalog
     with database.session_factory() as session:
         api = service(session, catalog)
         api.budget_limits = replace(api.budget_limits, cost=1000)
-        api.repository.snapshot_events = lambda *_: ([], [], 1, 22000)
+        api.repository.snapshot_events = lambda *_, **__: ([], [], 1, 22000)
         api.repository.event_source_rows = lambda *_: 1
         api.repository.event_statistics = lambda *_: pytest.fail('array budget did not stop calculation')
         for action in [lambda: api.preview(body), lambda: close_one(api, card.id)]:

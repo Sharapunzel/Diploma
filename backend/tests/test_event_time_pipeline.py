@@ -7,6 +7,9 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
+from event_time_fixtures import delete_aggregate
+from sqlalchemy import delete, func, select
+
 from app.aggregate_composition import build_aggregate_service
 from app.core.errors import DomainError
 from app.db import Database
@@ -26,8 +29,6 @@ from app.models import (
 )
 from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from app.schemas.aggregates import AggregatePreviewRequest, CreateAggregateRequest
-from event_time_fixtures import delete_aggregate
-from sqlalchemy import delete, func, select
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -222,11 +223,17 @@ def test_pause_fences_snapshot_computed_before_command(context, monkeypatch):
         assert build_aggregate_service(session, catalog).point_at(card.id, 0).event_count == 1
 
 
-def test_unknown_closure_commit_keeps_one_payload_manifest_and_position(context):
+def test_unknown_closure_commit_keeps_one_payload_manifest_and_position(context, monkeypatch):
+    from app.services.implementations.aggregate_snapshot import AggregateSnapshotService
     database, catalog, _, _ = context
     anchor = (datetime.now(UTC) - timedelta(days=2)).replace(microsecond=0)
     write_event(context, (anchor + timedelta(seconds=1)).isoformat())
     card, _ = create(context, anchor)
+    build, reads = AggregateSnapshotService.build, []
+    def counted(*args, **kwargs):
+        reads.append(1)
+        return build(*args, **kwargs)
+    monkeypatch.setattr(AggregateSnapshotService, "build", counted)
     with database.session_factory() as session:
         api = build_aggregate_service(session, catalog)
         commit, add = api.uow.commit, api.repository.add_event_point
@@ -243,8 +250,9 @@ def test_unknown_closure_commit_keeps_one_payload_manifest_and_position(context)
 
         api.repository.add_event_point, api.uow.commit = added, unknown_commit
         api.advance(card.id)  # discovery precedes this history turn
-        with pytest.raises(RuntimeError, match="synthetic acknowledgement loss"):
-            api.advance(card.id)
+        resolved = api.advance(card.id)
+        assert resolved["state"] == "closed" and resolved["point_id"] == candidate[0]
+        assert resolved["calculation_status"] == "computed" and reads == [1]
     turns(context, card.id, 12)
     with database.session_factory() as session:
         api = build_aggregate_service(session, catalog)
@@ -367,11 +375,12 @@ def test_paused_prepared_start_survives_takeover_without_reauthorizing_stopped_m
 
 
 def test_http_commands_permissions_strict_keep_and_same_key_replay(context):
+    from fastapi.testclient import TestClient
+
     from app.config import Settings
     from app.core.security import hash_password
     from app.main import create_app
     from app.models import User
-    from fastapi.testclient import TestClient
 
     database, catalog, _, _ = context
     card, _ = create(context, datetime.now(UTC) - timedelta(days=1))

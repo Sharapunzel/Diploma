@@ -56,7 +56,10 @@ class SqlAlchemyAggregateDiscovery:
                 continue
             closed = closures.get(index)
             if closed:
-                if (closed.origin_point_id, row["event_id"]) not in members:
+                # An unsuccessful attempt has no complete manifest. Absence
+                # from it cannot establish that an event arrived too late.
+                if (closed.calculation_status == "computed"
+                        and (closed.origin_point_id, row["event_id"]) not in members):
                     late.append({"closure_id": closed.origin_point_id, "event_id": row["event_id"],
                         "event_time": row["event_time"], "detected_at": reference,
                         "reason": "event_not_in_closing_snapshot"})
@@ -87,9 +90,15 @@ class SqlAlchemyAggregateDiscovery:
         if late:
             self.read_budget(budget.milliseconds())
             self.session.execute(insert(AggregateLateEvent).values(late).on_conflict_do_nothing())
-        for key, span in spans.items():
+        existing = {}
+        if spans:
             self.read_budget(budget.milliseconds())
-            old = self.session.get(AggregateHistorySpan, (aggregate.id, key))
+            existing = {span.cohort_key: span for span in self.session.scalars(
+                select(AggregateHistorySpan).where(AggregateHistorySpan.aggregate_id == aggregate.id,
+                    AggregateHistorySpan.cohort_key.in_(spans)))}
+        for key, span in spans.items():
+            budget.check()
+            old = existing.get(key)
             if old is None:
                 self.session.add(AggregateHistorySpan(aggregate_id=aggregate.id, cohort_key=key,
                     next_index=span["first_index"], **span))
@@ -103,6 +112,9 @@ class SqlAlchemyAggregateDiscovery:
                 old.coordinates = {**old.coordinates,
                     "first_offset": min(old.coordinates["first_offset"], span["coordinates"]["first_offset"]),
                     "last_offset": max(old.coordinates["last_offset"], span["coordinates"]["last_offset"])}
+        if spans:
+            self.read_budget(budget.milliseconds())
+            self.session.flush()
         if page:
             schedule.scan_after = page[-1]["event_id"]
         if len(page) < 500:
@@ -139,4 +151,4 @@ class SqlAlchemyAggregateDiscovery:
                 AggregateClosure.origin_point_id == AggregateLateEvent.closure_id).where(
                 AggregateClosure.aggregate_id == aggregate_id)).one()
         return {"exclusions": exclusions, "late_count": count, "late_start": first,
-                "late_end": last, "late_reason": "event_not_in_closing_snapshot" if count else None}
+            "late_end": last, "late_reason": "event_not_in_closing_snapshot" if count else None}

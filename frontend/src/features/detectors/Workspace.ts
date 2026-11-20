@@ -283,8 +283,15 @@ export class DraftStore {
     this.errors = {};
     if (!this.name.trim() || [...this.name.trim()].length > 200)
       this.errors.name = "Имя: от 1 до 200 символов после удаления пробелов.";
-    if (!this.selected || this.selected.state !== "active")
-      this.errors.aggregateId = "Выберите активный сохранённый агрегат.";
+    if (
+      !this.selected ||
+      this.selected.state !== "active" ||
+      this.selected.execution_mode !== "current" ||
+      this.selected.paused ||
+      this.selected.active_cleanup_id
+    )
+      this.errors.aggregateId =
+        "Выберите активный событийный агрегат без паузы и незавершённой очистки. Для прежнего расчёта нужна новая копия.";
     const read = (key: string, value: string, min?: bigint, max?: bigint) => {
       try {
         return strictInteger(value, min, max);

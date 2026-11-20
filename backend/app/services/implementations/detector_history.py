@@ -16,6 +16,8 @@ from ...repositories.protocols.detectors import DetectorRepository
 
 
 def input_snapshot(point, basis="event_time"):
+    if point.get("calculation_status", "computed") != "computed":
+        raise DetectionError("warmup_window_uncomputed")
     return {"point_id": str(point["id"]) if point.get("id") else None,
             "start": point["start_utc"].isoformat(), "end": point["end_utc"].isoformat(),
             "features": point["features"], "completeness": point["completeness"],
@@ -35,22 +37,36 @@ class DetectorHistoryService:
         with self.uow.read_snapshot():
             self.aggregates.read_budget(max(1, int((deadline-time.monotonic())*1000)))
             last = self.aggregates.canonical_last_index(context["schedule"]["id"])
-        if last is None:
-            raise DetectionError("insufficient_history")
-        d, s = context["detector"], context["schedule"]
-        try:
-            plan = warmup_indices(last, s["duration_seconds"], d["step_seconds"],
-                d["config"]["sample_size"], d["config"]["output_after"], d["accelerated"])
-        except EventTimeBudgetError as error:
-            raise DetectionError("resource_budget:warmup_windows") from error
-        if not plan["complete"]:
-            raise DetectionError("insufficient_history")
+            if last is None:
+                raise DetectionError("insufficient_history")
+            d, s = context["detector"], context["schedule"]
+            try:
+                plan = warmup_indices(last, s["duration_seconds"], d["step_seconds"],
+                    d["config"]["sample_size"], d["config"]["output_after"], d["accelerated"])
+            except EventTimeBudgetError as error:
+                raise DetectionError("resource_budget:warmup_windows") from error
+            if not plan["complete"]:
+                raise DetectionError("insufficient_history")
+            self.aggregates.read_budget(max(1, int((deadline-time.monotonic())*1000)))
+            closures = self.aggregates.warmup_closures(s["id"], plan["base_first"], plan["base_last"])
+            if len(closures) != plan["base_last"] - plan["base_first"] + 1:
+                raise DetectionError("warmup_canonical_coverage_missing")
         cutoff = s["anchor_utc"] + timedelta(seconds=plan["cutoff_seconds"])
         return {"cutoff": cutoff.isoformat(),
             "first_start": (s["anchor_utc"] + timedelta(seconds=plan["starts"][0])).isoformat(),
             "count": plan["count"], "step": d["step_seconds"], "duration": s["duration_seconds"],
             "coverage_seconds": s["duration_seconds"] + (plan["count"]-1)*d["step_seconds"],
-            "evaluation_start_index": max(s["online_start_index"], last+1)}
+            "evaluation_start_index": max(s["online_start_index"], last+1), "base_closures": closures}
+
+    def revalidate_plan(self, context, plan, deadline):
+        """Called while schedule -> detector locks still protect publication."""
+        anchor, duration = context["schedule"]["anchor_utc"], plan["duration"]
+        first = (datetime.fromisoformat(plan["first_start"]) - anchor) // timedelta(seconds=duration)
+        last = (datetime.fromisoformat(plan["cutoff"]) - anchor) // timedelta(seconds=duration) - 1
+        self.aggregates.read_budget(max(1, int((deadline-time.monotonic())*1000)))
+        actual = self.aggregates.warmup_closures(context["schedule"]["id"], first, last)
+        if len(actual) != last-first+1 or ("base_closures" in plan and actual != plan["base_closures"]):
+            raise StaleCandidate("warmup_plan_payload_changed")
 
     def materialize(self, context, attempt, deadline):
         budget = OperationBudget(max(0, deadline-time.monotonic()))
@@ -88,7 +104,7 @@ class DetectorHistoryService:
                         start, end, list(range(first,last+1)), compiled, budget)
                     estimate(compiled, statistics.observed_rows, statistics.observed_rows,
                         plan["duration"], self.limits, False, statistics.observed_width)
-                    values = interpret_result(statistics, compiled, plan["duration"])
+                    values = interpret_result(statistics, compiled, plan["duration"], check_budget=check_budget)
                     values.pop("observed_width")
                     values.pop("observed_rows")
                     inputs.append(input_snapshot({"start_utc": start,"end_utc": end, **values,

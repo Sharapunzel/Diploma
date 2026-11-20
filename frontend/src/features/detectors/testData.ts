@@ -7,6 +7,9 @@ export function fixture() {
     aggregate_id: id,
     aggregate_name: "Агрегат",
     aggregate_state: "active",
+    aggregate_semantic_basis: "event_time",
+    aggregate_execution_mode: "current",
+    aggregate_paused: false,
     source_id: id,
     source_name: "Источник",
     created_at: at,
@@ -42,6 +45,7 @@ export function fixture() {
     warmup: null,
     recovery: null,
     next_scheduled_at: null,
+    next_close_not_before_at: null,
     waiting_for_point: null,
   };
 }

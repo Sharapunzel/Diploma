@@ -330,6 +330,13 @@ def field_support_reason(field: EcsField, catalog: EcsCatalog) -> str | None:
 
 def compile_rule(rule: AggregateRule, catalog: EcsCatalog,
                  limits: Limits = Limits()) -> CompiledRule:
+    from .compilation_cache import compile_cached
+
+    return compile_cached(rule, catalog, limits, _compile_rule)
+
+
+def _compile_rule(rule: AggregateRule, catalog: EcsCatalog,
+                 limits: Limits = Limits()) -> CompiledRule:
     canonical = rule.model_dump(exclude_none=True)
     try:
         payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"),

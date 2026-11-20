@@ -17,12 +17,17 @@ from .services.implementations.aggregates import AggregateService
 from .services.implementations.wal_guard import CaptureGuard
 
 
-def build_aggregate_service(session: Session, catalog: EcsCatalog) -> AggregateService:
+def aggregate_limits() -> Limits:
     limits = Limits(**{name: int(os.environ["AGGREGATE_" + name.upper()])
                        for name in Limits.__dataclass_fields__
                        if "AGGREGATE_" + name.upper() in os.environ})
     if any(value <= 0 for value in vars(limits).values()) or limits.work_mem_mb > 32:
         raise ValueError("invalid aggregate resource limits")
+    return limits
+
+
+def build_aggregate_service(session: Session, catalog: EcsCatalog) -> AggregateService:
+    limits = aggregate_limits()
     return AggregateService(SqlAlchemyAggregateRepository(session),
         SqlAlchemyWorkingWindowRepository(session), SqlAlchemyCoverageEvidenceRepository(session),
         CaptureGuard(SqlAlchemyCaptureStateRepository(session), PostgreSQLReplicationSlotAdapter(session)),

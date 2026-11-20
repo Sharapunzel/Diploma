@@ -1,6 +1,8 @@
 """Explicit, configurable startup budgets, not a throughput guarantee."""
 
+from .plan import shared_input_columns
 from .rules import CompiledRule, Limits, RuleError
+from .time_policy import execution_policy
 
 
 def estimate(compiled: CompiledRule, rows: int, source_rows: int, duration: int,
@@ -23,8 +25,11 @@ def estimate(compiled: CompiledRule, rows: int, source_rows: int, duration: int,
     # treating a megabyte record as one scalar. Legacy estimates stay stable.
     input_units = (row_width + 255) // 256 if compiled.extended_input else 1
     memory += 4 * row_width if compiled.extended_input and rows else 0
-    if compiled.extended_input and compiled.rule.where is not None:
-        memory += min(rows * (row_width + 16), limits.work_mem_mb * 1024**2)
+    previous_buffer = (min(rows * (row_width + 16), limits.work_mem_mb * 1024**2)
+        if compiled.extended_input and compiled.rule.where is not None else 0)
+    shared_buffers = (2 * min(rows * (row_width + 32 * len(compiled.fields) + 16),
+        limits.work_mem_mb * 1024**2) if shared_input_columns(compiled) <= 1664 else 0)
+    memory += max(previous_buffer, shared_buffers)
     cost = rows * compiled.weight * input_units
     estimate = {"estimated_rows": rows, "source_rows": source_rows,
                 "operator_weight": compiled.weight, "cost": cost,
@@ -36,7 +41,7 @@ def estimate(compiled: CompiledRule, rows: int, source_rows: int, duration: int,
                 "work_mem_mb_per_operation": limits.work_mem_mb,
                 "rcf_preliminary_bytes": width * 100 * 256 * 8,
                 "window_seconds": duration,
-                "time_guarantee": False}
+                "time_guarantee": False, "execution_policy": execution_policy(duration)}
     checks = [(preview and rows > limits.preview_rows, "preview_rows", "Сузьте окно"),
               (statement_columns > 1664, "statement_width",
                f"План требует {statement_columns} колонок при пределе PostgreSQL 1664; разделите базовые признаки между агрегатами"),

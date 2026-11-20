@@ -1,5 +1,7 @@
 """Remove only a fixture-owned aggregate graph, retaining other tests' data."""
 
+from sqlalchemy import delete, select, update
+
 from app.models import (
     Aggregate,
     AggregateCleanupOperation,
@@ -8,6 +10,7 @@ from app.models import (
     AggregateHistorySpan,
     AggregateLateEvent,
     AggregateMembership,
+    AggregateRetentionState,
     AggregateSchedule,
     AggregateSnapshot,
     AggregateTimeExclusion,
@@ -20,7 +23,6 @@ from app.models import (
     HistoricalAggregatePoint,
     WorkingWindowPoint,
 )
-from sqlalchemy import delete, select, update
 
 
 def delete_aggregate(session, identity):
@@ -36,6 +38,7 @@ def delete_aggregate(session, identity):
         session.execute(delete(DetectorWarmup).where(DetectorWarmup.detector_id.in_(detector_ids)))
         session.execute(delete(Detector).where(Detector.id.in_(detector_ids)))
     closure_ids = select(AggregateClosure.origin_point_id).where(AggregateClosure.aggregate_id == identity)
+    session.execute(delete(AggregateRetentionState).where(AggregateRetentionState.aggregate_id == identity))
     for model in (AggregateMembership, AggregateSnapshot, AggregateLateEvent):
         session.execute(delete(model).where(model.closure_id.in_(closure_ids)))
     session.execute(delete(AggregateClosure).where(AggregateClosure.aggregate_id == identity))

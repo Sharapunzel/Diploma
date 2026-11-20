@@ -1,12 +1,11 @@
 """Fresh candidate models over an injected runtime; no mutable forest cache."""
 
 import json
-import os
 import sys
 import time
-from pathlib import Path
 
-from .contracts import DetectionError, ModelConfig, canonical, digest
+from .checkpoint import validate_execution_checkpoint
+from .contracts import DetectionError, canonical, digest
 from .model_rpc import ModelTransport
 from .numeric import NumericQualityError
 
@@ -22,20 +21,12 @@ def checked_response(response):
 class CandidateModel:
     def __init__(self, checkpoint, config, keys, rule_hash, cancel=None, transport=None):
         try:
-            if len(canonical(checkpoint).encode()) > 64 * 1024**2:
-                raise DetectionError("resource_budget:checkpoint_bytes")
-            manifest = json.loads((Path(os.environ.get("RCF_CLASSPATH", "/opt/rcf"))
-                                   / "manifest.json").read_text())
-            expected_runtime = {"manifest": digest(manifest), "jre": "17.0.17+10",
-                                "jpype": "1.6.0", "aws": "4.4.0", "format": 1}
-            body = checkpoint["body"]
-            if (digest(body) != checkpoint["sha256"] or body["config"] != config
-                    or body["keys"] != keys or body["rule_hash"] != rule_hash
-                    or body["runtime"] != expected_runtime
-                    or body["settings"] != ModelConfig(**config).settings):
-                raise DetectionError("checkpoint_envelope_mismatch")
-        except (KeyError, TypeError) as error:
-            raise DetectionError("checkpoint_corrupt") from error
+            validate_execution_checkpoint(checkpoint, config, keys, rule_hash)
+        except DetectionError as error:
+            if str(error) in {"checkpoint_checksum", "checkpoint_config_mismatch",
+                    "checkpoint_settings_mismatch", "checkpoint_runtime_mismatch"}:
+                raise DetectionError("checkpoint_envelope_mismatch") from error
+            raise
         self.request = {"action": "advance", "checkpoint": checkpoint, "config": config,
                         "keys": keys, "rule_hash": rule_hash}
         self.candidate = None

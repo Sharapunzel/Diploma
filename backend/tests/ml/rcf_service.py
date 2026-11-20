@@ -4,11 +4,15 @@ import copy
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import func, select
+from sqlalchemy.engine import make_url
+
 from app.adapters.detector_lock import DetectorSessionLock
 from app.adapters.model_runtime import ModelRuntime
 from app.aggregate_composition import build_aggregate_service
@@ -31,8 +35,6 @@ from app.models import (
 )
 from app.repositories.sqlalchemy.detectors import SqlAlchemyDetectorRepository
 from app.schemas.aggregates import AggregatePreviewRequest, CreateAggregateRequest
-from sqlalchemy import func, select
-from sqlalchemy.engine import make_url
 
 OWNER = None
 RUNTIME = None
@@ -40,8 +42,9 @@ RUNTIME = None
 
 @pytest.mark.parametrize("accelerated", [False, True])
 def test_formula_output_real_capture_history_working_and_checkpoint(catalog, accelerated):
-    from app.models import SourceInterruption
     from formula_history import create_formula, real_formula_history, wait_until
+
+    from app.models import SourceInterruption
 
     with real_formula_history(catalog) as fixture:
         card, body, start = create_formula(fixture)
@@ -285,6 +288,101 @@ def test_skip_moves_only_consumed_cursor(setup, coverage, value):
         build_detector_service(session, setup.catalog).stop(identity)
         protection = build_aggregate_service(session, setup.catalog).cleanup_preview(setup.card.id, 0)
         assert protection.minimum_keep == 0 and protection.can_cleanup
+
+
+def uncomputed_point(setup, index):
+    """Negative DTO/storage fixture; never a successful manufactured vector."""
+    from uuid import uuid5
+
+    from sqlalchemy import null
+
+    from app.aggregation.event_time import close_deadline
+    from app.aggregation.time_policy import execution_diagnostics, execution_policy
+
+    start = setup.anchor + timedelta(seconds=index * setup.duration)
+    end = start + timedelta(seconds=setup.duration)
+    origin = "online" if index >= setup.card.online_start_index else "initial_history"
+    began = close_deadline(end, setup.duration) if origin == "online" else end
+    hard = execution_policy(setup.duration)["hard_budget_seconds"]
+    completed = began + timedelta(seconds=hard)
+    identity = uuid5(setup.card.schedule_id, "event-time-window:" + str(index))
+    attempt = SimpleNamespace(attempt_id=uuid4(), hard_budget_seconds=hard, origin=origin,
+        window_index=index, start_utc=start, end_utc=end, started_at=began, deadline_at=completed)
+    execution = execution_diagnostics(attempt, completed, hard, "uncomputed", "finalization")
+    with setup.database.session_factory.begin() as session:
+        session.add(AggregateClosure(origin_point_id=identity, aggregate_id=setup.card.id,
+            schedule_id=setup.card.schedule_id, source_identity=setup.source_id, window_index=index,
+            start_utc=start, end_utc=end, time_basis="event_time", origin=origin,
+            snapshot_reference_at=None, closed_at=completed, close_not_before_at=began,
+            payload_state="present", point_kind="working", calculation_status="uncomputed",
+            calculation_reason="execution_budget_exceeded", execution=execution))
+        session.flush()
+        session.add(WorkingWindowPoint(id=identity, schedule_id=setup.card.schedule_id,
+            window_index=index, start_utc=start, end_utc=end, scheduled_at=end,
+            actual_started_at=began, actual_completed_at=completed, event_count=None,
+            event_time_min=None, event_time_max=None, completeness=None, completeness_reason=None,
+            evidence_refs=null(), features=null(), time_basis="event_time",
+            calculation_status="uncomputed", calculation_reason="execution_budget_exceeded"))
+    return identity
+
+
+def test_terminal_uncomputed_skips_without_loading_native_checkpoint(setup):
+    history(setup)
+    identity = prepared(setup)
+    point(setup, 480, 1000)
+    assert advance(setup, identity)["state"] == "evaluated"
+    before = stored(setup, identity)
+    assert before["evaluated_index"] == 480 and before["last_evaluated_projection"] is not None
+    with setup.database.session_factory() as session:
+        public_before = build_detector_service(session, setup.catalog).public_card(identity).last_evaluated.model_dump()
+        findings_before = session.scalar(select(func.count()).select_from(Finding).where(Finding.detector_id == identity))
+    refused = uncomputed_point(setup, 481)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        service.models.restore = lambda *_: pytest.fail("uncomputed restored the native forest")
+        assert service.advance_one(identity) == {"state": "skipped", "reason": "execution_budget_exceeded",
+            "point_id": refused, "finding": None}
+    after = stored(setup, identity)
+    assert after["consumed_index"] == 481
+    assert after["evaluated_index"] == before["evaluated_index"]
+    assert after["last_evaluated_projection"] == before["last_evaluated_projection"]
+    assert after["checkpoint"] == before["checkpoint"]
+    with setup.database.session_factory() as session:
+        outcome = session.scalar(select(DetectorOutcome).where(DetectorOutcome.detector_id == identity,
+            DetectorOutcome.working_point_id == refused))
+        assert outcome.kind == "skipped" and outcome.reason == "execution_budget_exceeded"
+        assert session.scalar(select(func.count()).select_from(Finding).where(Finding.detector_id == identity)) == findings_before
+        public = build_detector_service(session, setup.catalog).public_card(identity)
+        assert public.last_consumed.index == 481 and public.last_consumed.kind == "skipped"
+        assert public.last_consumed.reason.code == "execution_budget_exceeded"
+        declared = session.get(AggregateClosure, refused).execution
+        assert public.last_consumed.aggregation_started_at == datetime.fromisoformat(declared["started_at"])
+        assert public.last_evaluated.model_dump() == public_before
+    # The following native model transition still uses the confirmed forest.
+    point(setup, 482, 1000)
+    assert advance(setup, identity)["state"] == "evaluated"
+    assert stored(setup, identity)["checkpoint"]["body"]["updates"] == before["checkpoint"]["body"]["updates"] + 1
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("accelerated", [False, True])
+def test_both_warmups_reject_terminal_uncomputed_without_raw_reconstruction(setup, accelerated):
+    for index in range(16, 48):
+        if index != 43:
+            point(setup, index, 1 + index % 3)
+    uncomputed_point(setup, 43)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Refused history",
+            config={"sample_size": 16, "output_after": 16, "trees": 20},
+            accelerated=accelerated, step=1 if accelerated else None)
+        freeze_attempt_clock(service, setup.cutoff)
+        result = prepare(service, identity)
+        assert result["state"] == "waiting" and result["reason"] == "warmup_window_uncomputed", result
+        attempt = service.repository.attempt(result["attempt_id"])
+        assert attempt["status"] == "waiting" and attempt["inputs"] == []
+        state = service.state(identity)["detector"]
+        assert state["checkpoint"] is None and state["consumed_index"] is None
 
 
 @pytest.mark.parametrize("fault", ["before_commit", "lost_commit_ack"])
@@ -703,8 +801,9 @@ def test_preparation_locks_schedule_before_detector_without_source_barrier(setup
 def test_schedule_lock_wait_is_bounded_and_does_not_commit_attempt(setup):
     import time
 
-    from app.models import AggregateSchedule
     from sqlalchemy.exc import DBAPIError
+
+    from app.models import AggregateSchedule
     history(setup)
     with setup.database.session_factory() as session:
         service=build_detector_service(session,setup.catalog)
@@ -796,9 +895,10 @@ def test_real_event_time_aggregate_preserves_finding_facts(setup):
             assert writer.store_event(record,event)
     with setup.database.session_factory() as session:
         service=build_aggregate_service(session,setup.catalog)
-        for _ in range(3): result=service.advance(setup.card.id)
-        assert result["state"]=="closed"
+        result=service.advance(setup.card.id)
+        assert (result["state"],result.get("origin"))==("closed","online")
         working=service.point_at(setup.card.id,480)
+        assert result["point_id"]==working.id
         assert working.completeness=="complete"
         assert working.features[0].value==(0 if setup.kind=="empty" else 1000 if setup.kind=="bytes" else 100)
     result=advance(setup,identity)
@@ -853,8 +953,117 @@ def overlapping_history(setup, accelerated=True, fault=None):
     plan = {"cutoff": end.isoformat(), "first_start": first.isoformat(), "count": indices["count"],
         "step": 1 if accelerated else 10, "duration": 10,
         "coverage_seconds": 10+(indices["count"]-1)*(1 if accelerated else 10), "evaluation_start_index":48}
+    with setup.database.session_factory() as session:
+        bases = session.execute(select(AggregateClosure.origin_point_id, AggregateClosure.window_index)
+            .where(AggregateClosure.schedule_id == setup.card.schedule_id,
+                AggregateClosure.window_index >= indices["base_first"], AggregateClosure.window_index <= indices["base_last"],
+                AggregateClosure.payload_state == "present").order_by(AggregateClosure.window_index)).all()
+    assert [row.window_index for row in bases] == list(range(indices["base_first"], indices["base_last"] + 1))
+    plan["base_closures"] = [{"origin_point_id": str(row.origin_point_id), "window_index": row.window_index} for row in bases]
     windows = [(first+timedelta(seconds=i*plan["step"]),first+timedelta(seconds=i*plan["step"]+10)) for i in range(plan["count"])]
     return plan, windows, events, uuid4()
+
+
+@pytest.mark.parametrize("setup", ["overlap"], indirect=True)
+@pytest.mark.parametrize("accelerated", [False, True])
+def test_real_checkpoint_and_saved_inputs_survive_automatic_source_gc_restart(setup, accelerated, monkeypatch):
+    """Core storage/restart proof; elapsed-time worker/load is a separate live gate."""
+    from sqlalchemy.exc import DBAPIError
+
+    from app.aggregation.event_time import OperationBudget
+    from app.detection.protection import checkpoint_boundary
+    from app.models import (
+        AggregateLateEvent,
+        AggregateMembership,
+        AggregateRetentionState,
+        ParsedLog,
+    )
+
+    _plan, _windows, events, _worker = overlapping_history(setup, accelerated)
+    with setup.database.session_factory() as session:
+        service = build_detector_service(session, setup.catalog)
+        identity = service.create(setup.card.id, UUID(int=1), "Real checkpoint GC",
+            config={"sample_size": 16, "output_after": 16, "trees": 20},
+            accelerated=accelerated, step=1 if accelerated else None)
+        freeze_attempt_clock(service, setup.cutoff)
+        ready = prepare(service, identity)
+        assert ready["state"] == "prepared", ready
+        prepared_revision = service.state(identity)["detector"]["revision"]
+        assert service.warmup(identity) == {"state": "ready"}
+        published = service.state(identity)["detector"]
+        assert published["revision"] == prepared_revision + 1
+        assert published["state"] == "ready" and published["checkpoint"] is not None
+        assert service.repository.attempt(published["active_attempt_id"])["status"] == "ready"
+        pre = published["checkpoint"]["body"]["mapper"]["preprocessorStates"][0]
+        print({"checkpoint_preprocessor_shapes": {key:
+            len(pre[key]) if isinstance(pre[key], list) else type(pre[key]).__name__
+            for key in ("weights", "lastShingledPoint", "lastShingledInput", "previousTimeStamps",
+                "deviationStates", "dataQualityStates", "timeStampDeviationStates")},
+            "dimensions": published["config"]["dimensions"], "accelerated": accelerated})
+        validation_started = time.monotonic()
+        assert checkpoint_boundary(published, OperationBudget(.85).check) == 48
+        validation_seconds = time.monotonic() - validation_started
+        print({"checkpoint_validation_seconds": validation_seconds, "accelerated": accelerated})
+        assert validation_seconds < .85
+        service.stop(identity)
+        model = service.state(identity)["detector"]
+        checkpoint = copy.deepcopy(model["checkpoint"])
+        saved = copy.deepcopy(service.repository.attempt(model["active_attempt_id"]))
+        bases = [UUID(row["origin_point_id"]) for row in saved["plan"]["base_closures"]]
+        members = set(session.execute(select(AggregateMembership.closure_id, AggregateMembership.event_id)
+            .where(AggregateMembership.closure_id.in_(bases))).all())
+    # One distant canonical closure is a controlled storage fixture, not a
+    # fabricated run of 600 online evaluations. It makes the saved checkpoint's
+    # unread suffix exceed B and leaves the original batch eligible for GC.
+    unread = point(setup, 1000, 50, completeness="unknown")
+    with setup.database.session_factory() as session:
+        aggregate = build_aggregate_service(session, setup.catalog)
+        commit, first = aggregate.uow.commit, [True]
+        def lose_ack():
+            commit()
+            if first[0]:
+                first[0] = False
+                raise DBAPIError(None, None, RuntimeError("lost acknowledgement"))
+        monkeypatch.setattr(aggregate.uow, "commit", lose_ack)
+        assert aggregate.maintain(setup.card.id)["pending"]
+    for _ in range(len(bases) * 5 + 8):
+        with setup.database.session_factory() as session:
+            result = build_aggregate_service(session, setup.catalog).maintain(setup.card.id)
+            assert result["status"] != "error", result
+            state = session.get(AggregateRetentionState, setup.card.id)
+            if state.auto_cleared_total == len(bases) and state.pending_closure_id is None:
+                break
+    with setup.database.session_factory() as session:
+        aggregate = build_aggregate_service(session, setup.catalog)
+        summary = aggregate.card(setup.card.id).auto_cleanup
+        assert summary.reserve_windows == 512 and summary.protected_from_index == 48
+        assert summary.keep_from_index == 48 and summary.auto_cleared_total == len(bases)
+        assert summary.history_revision == len(bases)
+        assert session.get(WorkingWindowPoint, unread) is not None
+        assert all(session.get(WorkingWindowPoint, origin) is None for origin in bases)
+        assert set(session.execute(select(AggregateMembership.closure_id, AggregateMembership.event_id)
+            .where(AggregateMembership.closure_id.in_(bases))).all()) == members
+        assert session.scalar(select(func.count()).select_from(ParsedLog).where(ParsedLog.source_id == setup.source_id)) == len(events)
+        service = build_detector_service(session, setup.catalog)
+        current = service.state(identity)["detector"]
+        assert current["execution_state"] == "stopped" and current["checkpoint"] == checkpoint
+        assert service.repository.attempt(current["active_attempt_id"]) == saved
+        assert current["consumed_index"] is current["evaluated_index"] is None
+        # A fresh service uses the real mapper/runtime to restore the unchanged
+        # committed model after source payloads and heavy manifests disappeared.
+        service.start(identity)
+        service.begin_start(identity)
+        assert service.resume(identity) == {"state": "running"}
+        assert service.state(identity)["detector"]["checkpoint"] == checkpoint
+        assert service.repository.attempt(saved["id"]) == saved
+    for _ in range(6):
+        with setup.database.session_factory() as session:
+            aggregate = build_aggregate_service(session, setup.catalog)
+            aggregate.repository.now = lambda: setup.cutoff
+            aggregate.advance(setup.card.id)
+    with setup.database.session_factory() as session:
+        assert all(session.get(WorkingWindowPoint, origin) is None for origin in bases)
+        assert session.scalar(select(func.count()).select_from(AggregateLateEvent).where(AggregateLateEvent.closure_id.in_(bases))) == 0
 
 
 
@@ -1052,8 +1261,9 @@ def test_history_saved_quality_is_not_promoted_by_optional_new_reports(setup,fau
 @pytest.mark.parametrize("setup", ["overlap"], indirect=True)
 @pytest.mark.parametrize("mutation", ["delete", "add"])
 def test_overlapping_batch_uses_one_snapshot_and_survives_event_delete(setup, mutation):
-    from app.models import AvailabilityMarker, ParsedLog
     from sqlalchemy import delete
+
+    from app.models import AvailabilityMarker, ParsedLog
     plan, windows, events, _worker = overlapping_history(setup)
     with setup.database.session_factory() as session:
         service = build_detector_service(session, setup.catalog)

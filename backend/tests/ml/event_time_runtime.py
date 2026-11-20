@@ -10,6 +10,9 @@ import sys
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
+from sqlalchemy import func, select
+from sqlalchemy.engine import make_url
+
 from app.config import settings
 from app.core.security import hash_password
 from app.db import Database
@@ -19,6 +22,7 @@ from app.models import (
     AggregateCleanupOperation,
     AggregateClosure,
     AggregateSchedule,
+    AggregateSnapshot,
     AvailabilityMarker,
     Detector,
     Finding,
@@ -27,11 +31,10 @@ from app.models import (
     ProcessedKafkaRecord,
     Source,
     User,
+    WorkingWindowPoint,
 )
 from app.repositories.sqlalchemy.detectors import SqlAlchemyDetectorRepository
 from app.repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
-from sqlalchemy import func, select
-from sqlalchemy.engine import make_url
 
 
 def write(session, source, offset, at, count, kind):
@@ -81,6 +84,81 @@ def setup(database):
     return {"sources": sources, "offsets": offsets, "anchor": anchor.isoformat()}
 
 
+def browser_auto_facts(database, payload):
+    """Read physical payload facts; never advance or alter a point."""
+    from sqlalchemy import text
+
+    identity = UUID(payload["aggregate"])
+    with database.session_factory() as session:
+        session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        session.execute(text("SET LOCAL statement_timeout='3000ms'"))
+        canonical_count = session.scalar(select(func.count()).select_from(AggregateClosure).where(
+            AggregateClosure.aggregate_id == identity, AggregateClosure.window_index.between(0, 519),
+            AggregateClosure.origin == "initial_history", AggregateClosure.time_basis == "event_time"))
+        if payload.get("readiness_only"):
+            return {"canonical_history_count": canonical_count}
+        from app.aggregate_composition import build_aggregate_service
+        from app.core.errors import DomainError
+        from app.ecs import PackagedEcsCatalog
+
+        service = build_aggregate_service(session, PackagedEcsCatalog.load())
+        closure = session.scalar(select(AggregateClosure).where(AggregateClosure.aggregate_id == identity,
+            AggregateClosure.window_index == 0))
+        if closure is None:
+            return {"ready": False, "canonical_history_count": canonical_count}
+        point_id = closure.origin_point_id
+        facts = {"old_point_id": str(point_id), "old_window_index": 0,
+            "canonical_history_count": canonical_count,
+            "payload_state": closure.payload_state,
+            "old_payloads": session.scalar(select(func.count()).select_from(WorkingWindowPoint).where(
+                WorkingWindowPoint.id == point_id)),
+            "old_snapshots": session.scalar(select(func.count()).select_from(AggregateSnapshot).where(
+                AggregateSnapshot.closure_id == point_id))}
+        if payload.get("verify"):
+            assert str(point_id) == payload["old_point_id"]
+            assert facts["payload_state"] == "cleared" and facts["old_payloads"] == facts["old_snapshots"] == 0, facts
+            from app.models import DetectorOutcome, DetectorRecovery, DetectorWarmup
+
+            ordinary_id = session.scalar(select(Detector.id).where(
+                Detector.aggregate_id == identity, Detector.accelerated.is_(False)))
+            recovery = session.execute(select(DetectorRecovery.first_index, DetectorRecovery.last_index).where(
+                DetectorRecovery.detector_id == ordinary_id, DetectorRecovery.reason == "manual_resume"
+                ).order_by(DetectorRecovery.started_at.desc(), DetectorRecovery.id.desc()).limit(1)).one()
+            assert recovery.last_index - recovery.first_index + 1 == 520
+            proofs = []
+            for accelerated in (False, True):
+                model = session.execute(select(Detector.id, Detector.consumed_index, Detector.evaluated_index,
+                    Detector.checkpoint.is_not(None).label("checkpoint_present"), Detector.active_attempt_id,
+                    Detector.accelerated_used, Detector.execution_state).where(Detector.aggregate_id == identity,
+                        Detector.accelerated.is_(accelerated))).one()
+                assert model.checkpoint_present and model.accelerated_used == accelerated and model.execution_state == "running"
+                attempt = session.execute(select(DetectorWarmup.status, DetectorWarmup.inputs_hash,
+                    func.jsonb_array_length(DetectorWarmup.inputs).label("inputs_count")).where(
+                        DetectorWarmup.id == model.active_attempt_id)).one()
+                assert attempt.status == "ready" and attempt.inputs_count == 512 and len(attempt.inputs_hash) == 64
+                proof = {"detector_id": str(model.id), "accelerated": accelerated,
+                    "checkpoint_present": True, "saved_inputs": attempt.inputs_count}
+                outcomes = session.execute(select(func.count(), func.count(func.distinct(DetectorOutcome.window_index)),
+                    func.count().filter(DetectorOutcome.kind == "evaluated"),
+                    func.min(DetectorOutcome.window_index), func.max(DetectorOutcome.window_index)).where(
+                        DetectorOutcome.detector_id == model.id,
+                        DetectorOutcome.window_index.between(recovery.first_index, recovery.last_index))).one()
+                assert tuple(outcomes[:3]) == (520, 520, 520), outcomes
+                assert tuple(outcomes[3:]) == (recovery.first_index, recovery.last_index), outcomes
+                assert model.consumed_index == model.evaluated_index == recovery.last_index
+                proof.update(unread_from=recovery.first_index, unread_to=recovery.last_index,
+                    evaluated_without_gaps=outcomes[0])
+                proofs.append(proof)
+            facts["models"] = proofs
+            return facts
+        try:
+            point = service._saved_point(service.repository.get(identity), closure)
+        except DomainError as error:
+            raise AssertionError("Old auto point was not observed before deletion") from error
+        assert facts["old_payloads"] == facts["old_snapshots"] == 1 and point.payload_state == "present"
+        return {"ready": True, **facts, "old_point": point.model_dump(mode="json")}
+
+
 def main():
     assert make_url(settings.database_url).database == "diploma_test", "Runtime requires the disposable profile DB"
     database = Database(settings.database_url)
@@ -89,6 +167,8 @@ def main():
         payload = json.loads(os.environ.get("EVENT_TIME_PAYLOAD", "{}"))
         if action == "setup":
             result = setup(database)
+        elif action == "browser_auto_facts":
+            result = browser_auto_facts(database, payload)
         elif action == "write":
             with database.session_factory.begin() as session:
                 offsets = []

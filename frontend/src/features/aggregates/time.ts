@@ -31,6 +31,108 @@ export function browserZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
+/** Exact arithmetic for schedule selection; Date is used only for whole calendar seconds. */
+function exactInstant(iso: string, precision: number): bigint {
+  const match =
+    /^(\d{4}-\d\d-\d\dT\d\d:\d\d)(?::(\d\d)(?:\.([0-9]+))?)?(Z|([+-])(\d\d):(\d\d)(?::(\d\d)(?:\.([0-9]+))?)?)$/.exec(
+      iso,
+    );
+  if (!match) throw new Error("Укажите время с явным смещением.");
+  const local = Date.parse(`${match[1]}:${match[2] ?? "00"}Z`);
+  if (!Number.isFinite(local)) throw new Error("Некорректная дата окна.");
+  const unit = 10n ** BigInt(precision);
+  const fraction = (value = "") => BigInt(value.padEnd(precision, "0") || "0");
+  const offsetSeconds = BigInt(
+    Number(match[6] ?? 0) * 3600 +
+      Number(match[7] ?? 0) * 60 +
+      Number(match[8] ?? 0),
+  );
+  const offset = offsetSeconds * unit + fraction(match[9]);
+  return (
+    BigInt(local / 1000) * unit +
+    fraction(match[3]) -
+    (match[5] === "-" ? -offset : offset)
+  );
+}
+function instantPrecision(...values: string[]): number {
+  return Math.max(
+    6,
+    ...values.flatMap((value) =>
+      [...value.matchAll(/\.([0-9]+)/g)].map((match) => match[1].length),
+    ),
+  );
+}
+function exactIso(value: bigint, precision: number): string {
+  const unit = 10n ** BigInt(precision);
+  const remainder = ((value % unit) + unit) % unit;
+  const seconds = (value - remainder) / unit;
+  const date = new Date(Number(seconds) * 1000).toISOString();
+  if (!/^\d{4}-/.test(date))
+    throw new Error("Окно выходит за поддерживаемый диапазон дат.");
+  const fraction = remainder
+    .toString()
+    .padStart(precision, "0")
+    .replace(/0+$/, "");
+  return `${date.slice(0, 19)}${fraction ? `.${fraction}` : ""}Z`;
+}
+export type SelectedWindow = {
+  start: string;
+  end: string;
+  index: string;
+  inProcess: boolean;
+  completed: boolean;
+};
+export function selectedWindow(
+  start: string,
+  anchor: string,
+  duration: number,
+  now = Date.now(),
+): SelectedWindow {
+  if (!Number.isInteger(duration) || duration < 1 || duration > 604800)
+    throw new Error("Проверьте длительность окна.");
+  const precision = instantPrecision(start, anchor);
+  const unit = 10n ** BigInt(precision);
+  const begin = exactInstant(start, precision),
+    base = exactInstant(anchor, precision),
+    step = BigInt(duration) * unit;
+  if ((begin - base) % step !== 0n)
+    throw new Error(
+      "Начало должно быть выровнено относительно начала истории и сетки окон.",
+    );
+  const index = (begin - base) / step;
+  return {
+    start: exactIso(begin, precision),
+    end: exactIso(begin + step, precision),
+    index: String(index),
+    inProcess: index >= 0n,
+    completed: begin + step <= (BigInt(Math.trunc(now)) * unit) / 1000n,
+  };
+}
+export function suggestPreviewWindow(
+  anchor: string,
+  duration: number,
+  now = Date.now(),
+): string {
+  if (!Number.isInteger(duration) || duration < 1 || duration > 604800)
+    return "";
+  try {
+    const precision = instantPrecision(anchor),
+      unit = 10n ** BigInt(precision);
+    const base = exactInstant(anchor, precision),
+      step = BigInt(duration) * unit,
+      current = (BigInt(Math.trunc(now)) * unit) / 1000n;
+    if (base + step <= current) return exactIso(base, precision);
+    const difference = current - base;
+    const floor =
+      difference >= 0n
+        ? difference / step
+        : -((-difference + step - 1n) / step);
+    return exactIso(base + (floor - 1n) * step, precision);
+  } catch {
+    return "";
+  }
+}
+
 /** Exact UTC fraction, including fractional offset seconds, without Date rounding. */
 export function scheduleFraction(iso: string): string {
   const match =

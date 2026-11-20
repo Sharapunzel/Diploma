@@ -1,6 +1,7 @@
 """SQL compiler for the closed aggregate AST; casts never rely on AND order."""
 
 import ipaddress
+import json
 from datetime import UTC
 from decimal import Decimal
 
@@ -23,6 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import INET, INTERVAL, JSONB
 
+from ...aggregation.plan import shared_input_columns, statistic_indices
 from ...aggregation.results import AggregateStatistics, FeatureStatistics
 from ...aggregation.rules import (
     DATE_PATTERN,
@@ -115,18 +117,19 @@ def _literal(value, definition):
     return literal(value)
 
 
-def compile_condition(node: AggregateCondition | None, data, fields):
+def compile_condition(node: AggregateCondition | None, data, fields, prepared=None):
     """Return matches and independent invalidity, including every child."""
     if node is None:
         return true(), false()
     if node.op in {"all", "any", "not"}:
-        pairs = [compile_condition(arg, data, fields) for arg in node.args]
+        pairs = [compile_condition(arg, data, fields, prepared) for arg in node.args]
         invalid = or_(*(p[1] for p in pairs))
         matches = (not_(pairs[0][0]) if node.op == "not" else
                    (and_ if node.op == "all" else or_)(*(p[0] for p in pairs)))
         return (and_(matches, not_(invalid)) if node.op == "not" else matches), invalid
     definition = fields[node.field]
-    raw, present, valid, value = _field(data, node.field, definition)
+    raw, present, valid, value = (prepared[node.field] if prepared is not None
+        else _field(data, node.field, definition))
     invalid = and_(present, not_(valid))
     if node.op == "exists":
         return present, invalid
@@ -164,15 +167,45 @@ def compile_condition(node: AggregateCondition | None, data, fields):
 
 def aggregate_statement(base, compiled: CompiledRule):
     data = base.c.ecs_data
-    matches, invalid = compile_condition(compiled.rule.where, data, compiled.fields)
-    if compiled.extended_input and compiled.rule.where is not None:
-        # Evaluate the shared predicate once per event, not once per statistic
-        # and diagnostic column. MATERIALIZED also prevents planner inlining
-        # from recreating the enormous repeated guarded expression tree.
-        base = select(data, matches.label("rule_matches"), invalid.label("rule_invalid")).select_from(base).cte().prefix_with("MATERIALIZED")
-        data, matches, invalid = base.c.ecs_data, base.c.rule_matches, base.c.rule_invalid
-    # The normalized timestamp is still guarded against malformed stored JSON.
-    _, _, occurred = _scalar(data["@timestamp"], EcsField("@timestamp", "date", "", "", False, "", False, ()))
+    occurred = base.c.get("event_time")
+    if occurred is None:
+        # Membership/reference callers without a projection retain the exact guard.
+        _, _, occurred = _scalar(data["@timestamp"], EcsField("@timestamp", "date", "", "", False, "", False, ()))
+    conditions = {}
+    for node in [compiled.rule.where, *(f.where for f in compiled.calculation_features if f.op != "derive")]:
+        signature = json.dumps(node.model_dump(exclude_none=True) if node else None,
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        conditions.setdefault(signature, node)
+    prepared = None
+    # Do not impose a narrower width on existing large legal plans. Such plans
+    # retain the previous direct expressions when the helper CTE would be wider.
+    if shared_input_columns(compiled) <= 1664:
+        typed = [data, occurred.label("event_time")]
+        for index, (name, definition) in enumerate(compiled.fields.items()):
+            typed.extend(value.label(f"f{index}_{part}") for part, value in
+                enumerate(_field(data, name, definition)))
+        base = select(*typed).select_from(base).cte("aggregate_typed").prefix_with("MATERIALIZED")
+        data, occurred = base.c.ecs_data, base.c.event_time
+        prepared = {name: tuple(base.c[f"f{index}_{part}"] for part in range(4))
+            for index, name in enumerate(compiled.fields)}
+        predicates = list(base.c)
+        for index, node in enumerate(conditions.values()):
+            predicates.extend(value.label(f"p{index}_{part}") for part, value in
+                enumerate(compile_condition(node, data, compiled.fields, prepared)))
+        base = select(*predicates).select_from(base).cte("aggregate_predicates").prefix_with("MATERIALIZED")
+        data, occurred = base.c.ecs_data, base.c.event_time
+        prepared = {name: tuple(base.c[f"f{index}_{part}"] for part in range(4))
+            for index, name in enumerate(compiled.fields)}
+
+    def condition(node):
+        if prepared is None:
+            return compile_condition(node, data, compiled.fields)
+        signature = json.dumps(node.model_dump(exclude_none=True) if node else None,
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        index = list(conditions).index(signature)
+        return base.c[f"p{index}_0"], base.c[f"p{index}_1"]
+
+    matches, invalid = condition(compiled.rule.where)
     columns = [func.count().label("observed_rows"),
                func.max(func.octet_length(data.cast(Text))).label("observed_width"),
                func.count().filter(matches).label("event_count"),
@@ -191,17 +224,21 @@ def aggregate_statement(base, compiled: CompiledRule):
         columns[1] = func.jsonb_build_array(
             func.max(func.octet_length(data.cast(Text))),
             func.max(func.greatest(*array_sizes, literal(0)))).label("observed_metrics")
+    indices = statistic_indices(compiled)
     for i, feature in enumerate(compiled.calculation_features):
         if feature.op == "derive":
             continue
-        local, local_invalid = compile_condition(feature.where, data, compiled.fields)
+        if indices[feature.key] != i:
+            continue
+        local, local_invalid = condition(feature.where)
         selected = and_(matches, local)
         bad = or_(invalid, and_(matches, local_invalid))
         if feature.op == "count":
             value = func.count().filter(selected)
             valid_count = func.count().filter(and_(selected, not_(bad)))
         else:
-            _, present, valid, scalar = _field(data, feature.field, compiled.fields[feature.field])
+            _, present, valid, scalar = (prepared[feature.field] if prepared is not None
+                else _field(data, feature.field, compiled.fields[feature.field]))
             bad = or_(bad, and_(selected, present, not_(valid)))
             eligible = and_(selected, present, valid, not_(bad))
             if feature.op in {"present_count", "missing_count", "true_count", "false_count"}:
@@ -234,11 +271,16 @@ def read_statistics(row, compiled: CompiledRule) -> AggregateStatistics:
         raise RuleError("resource_budget_exceeded", "array_elements",
                         f"Массив превышает {compiled.array_elements} элементов; разделите вход или увеличьте AGGREGATE_ARRAY_ELEMENTS")
     features = {}
+    indices = statistic_indices(compiled)
+    arrays = {}
     for i, feature in enumerate(compiled.calculation_features):
         if feature.op != "derive":
+            i = indices[feature.key]
             value = row[f"v{i}"]
             if feature.op in {"mode_count", "mode_share"} and compiled.fields[feature.field].type == "date" and value is not None:
-                value = [item.replace(tzinfo=UTC) for item in value]
+                if i not in arrays:
+                    arrays[i] = [item.replace(tzinfo=UTC) for item in value]
+                value = arrays[i]
             features[feature.key] = FeatureStatistics(value, row[f"n{i}"], row[f"b{i}"])
     return AggregateStatistics(
         observed_rows=row["observed_rows"], event_count=row["event_count"],

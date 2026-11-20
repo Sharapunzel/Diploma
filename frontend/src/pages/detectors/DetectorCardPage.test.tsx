@@ -4,6 +4,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -21,6 +22,155 @@ afterEach(() => {
     configurable: true,
     value: false,
   });
+});
+
+function sessionStores() {
+  const stores = new AppStores();
+  stores.session.accept(
+    {
+      authenticated: true,
+      user: { id, username: "admin", email: null, display_name: "Admin" },
+      role: "admin",
+      permissions: ["detectors.read", "detectors.write"],
+      authentication_method: "local",
+      csrf_token: "synthetic",
+    },
+    0,
+  );
+  return stores;
+}
+
+function mountCard(stores: AppStores) {
+  return render(
+    <StoresProvider stores={stores}>
+      <MemoryRouter initialEntries={["/detectors/" + id]}>
+        <Routes>
+          <Route path="/detectors/:id" element={<DetectorCardPage />} />
+        </Routes>
+      </MemoryRouter>
+    </StoresProvider>,
+  );
+}
+
+it("keeps a stopped detector stopped during aggregate pause and after unpause", async () => {
+  const stores = sessionStores();
+  let paused = true;
+  const request = vi
+    .spyOn(stores.api, "request")
+    .mockImplementation(async () => ({
+      ...fixture(),
+      execution_state: "stopped",
+      model_state: "ready",
+      aggregate_paused: paused,
+    }));
+  try {
+    mountCard(stores);
+    await screen.findByRole("heading", { name: "RCF" });
+    await waitFor(() =>
+      expect(stores.detectors.card(id).lifecycle.isPending("load")).toBe(false),
+    );
+    expect(screen.queryByRole("button", { name: "Запустить" })).toBeNull();
+    expect(
+      screen.getByText(/после продолжения агрегата сам не запустится/),
+    ).toBeTruthy();
+    paused = false;
+    fireEvent.click(screen.getByRole("button", { name: "Обновить состояние" }));
+    await screen.findByRole("button", { name: "Запустить" });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls.every(([, options]) => !options?.method)).toBe(
+      true,
+    );
+  } finally {
+    cleanup();
+    stores.dispose();
+  }
+});
+
+it("reads legacy history without claiming that its active aggregate was deleted", async () => {
+  const stores = sessionStores();
+  vi.spyOn(stores.api, "request").mockResolvedValue({
+    ...fixture(),
+    aggregate_semantic_basis: "availability_v1",
+    aggregate_execution_mode: "retired",
+    execution_state: "terminated",
+    model_state: "stopped",
+  });
+  try {
+    mountCard(stores);
+    await screen.findByRole("heading", { name: "RCF" });
+    expect(screen.queryByRole("button", { name: "Запустить" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Остановить" })).toBeNull();
+    expect(
+      screen.queryByText("Агрегат удалён: возобновление невозможно."),
+    ).toBeNull();
+    expect(
+      screen.getByText(/Модель и история сохранены для чтения/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/Прежнее основание времени доступности/),
+    ).toBeTruthy();
+  } finally {
+    cleanup();
+    stores.dispose();
+  }
+});
+
+it("separates nominal end, fixed close deadline and aggregate-resume while retaining result projections", async () => {
+  const stores = sessionStores();
+  const end = "2026-11-10T01:00:00Z";
+  const close = "2026-11-10T01:00:02Z";
+  const window = {
+    index: 7,
+    kind: "evaluated",
+    reason: null,
+    start_utc: "2026-11-10T00:59:58Z",
+    end_utc: end,
+    scheduled_at: end,
+    time_basis: "event_time",
+    origin: "online",
+    close_not_before_at: close,
+    aggregation_started_at: close,
+    aggregation_completed_at: "2026-11-10T01:00:02.123456Z",
+    evaluation_started_at: close,
+    evaluation_completed_at: "2026-11-10T01:00:02.654321Z",
+    late: true,
+  };
+  vi.spyOn(stores.api, "request").mockResolvedValue({
+    ...fixture(),
+    execution_state: "stopped",
+    model_state: "ready",
+    next_scheduled_at: end,
+    next_close_not_before_at: close,
+    last_consumed: window,
+    last_evaluated: window,
+    recovery: {
+      reason: "aggregate_resume",
+      first_index: 4,
+      last_index: 7,
+      started_at: close,
+    },
+  });
+  try {
+    mountCard(stores);
+    await screen.findByRole("heading", { name: "RCF" });
+    const nominal = screen.getByText(/Следующий номинальный конец окна/);
+    const deadline = screen.getByText(/Следующее закрытие не раньше/);
+    expect(nominal.querySelector("time")?.dateTime).toBe(end);
+    expect(deadline.querySelector("time")?.dateTime).toBe(close);
+    expect(screen.getByText(/Продолжение агрегата после паузы/)).toBeTruthy();
+    expect(screen.getAllByText("Событийное окно")).toHaveLength(2);
+    expect(screen.getAllByText("ECS @timestamp · Онлайн")).toHaveLength(2);
+    await waitFor(() =>
+      expect(stores.detectors.card(id).lifecycle.isPending("load")).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Обновить состояние" }));
+    await waitFor(() => expect(stores.detectors.card(id).readVersion).toBe(2));
+    expect(screen.getAllByText("ECS @timestamp · Онлайн")).toHaveLength(2);
+    expect(screen.getAllByText(/Запоздалая обработка/)).toHaveLength(2);
+  } finally {
+    cleanup();
+    stores.dispose();
+  }
 });
 
 it("stops polling after a read error, resumes after explicit refresh, and pauses on hidden/unmounted views", async () => {

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { calendarInputValue } from "./aggregates.visual";
 
@@ -26,7 +26,421 @@ async function login(page: Page) {
     page.getByRole("button", { name: "Создать агрегат", exact: true }),
   ).toBeVisible();
 }
+// Capture only normal viewport content. Oversized budget ancestors are never
+// resized, unclipped or stitched; each small target must fit the real scrollport.
+type DiagnosticShots = { count: number; limit: number };
+async function diagnosticVisibility(targets: Locator) {
+  return targets.evaluateAll((elements) => {
+    const rectangle = (box: DOMRect) => ({
+      left: box.left,
+      top: box.top,
+      right: box.right,
+      bottom: box.bottom,
+      width: box.width,
+      height: box.height,
+    });
+    const viewport = { width: innerWidth, height: innerHeight };
+    const targets = elements.map((element, index) => ({
+      index,
+      rect: rectangle(element.getBoundingClientRect()),
+    }));
+    const port = document.querySelector<HTMLElement>(
+      '[data-testid="workspace-content"]',
+    );
+    if (!port || !port.offsetWidth || !port.offsetHeight)
+      return { viewport, scrollport: null, clip: null, targets, visible: [] };
+    const frame = port.getBoundingClientRect();
+    const scaleX = frame.width / port.offsetWidth;
+    const scaleY = frame.height / port.offsetHeight;
+    const clientLeft = frame.left + port.clientLeft * scaleX;
+    const clientTop = frame.top + port.clientTop * scaleY;
+    const left = Math.max(0, clientLeft);
+    const top = Math.max(0, clientTop);
+    const right = Math.min(innerWidth, clientLeft + port.clientWidth * scaleX);
+    const bottom = Math.min(
+      innerHeight,
+      clientTop + port.clientHeight * scaleY,
+    );
+    const visible = targets.flatMap(({ index, rect: box }) => {
+      return box.width > 0 &&
+        box.height > 0 &&
+        box.left >= left &&
+        box.top >= top &&
+        box.right <= right &&
+        box.bottom <= bottom
+        ? [index]
+        : [];
+    });
+    return {
+      viewport,
+      scrollport: {
+        rect: rectangle(frame),
+        clientWidth: port.clientWidth,
+        clientHeight: port.clientHeight,
+        scrollTop: port.scrollTop,
+        scrollLeft: port.scrollLeft,
+        scrollHeight: port.scrollHeight,
+        scrollWidth: port.scrollWidth,
+        scaleX,
+        scaleY,
+      },
+      clip: { left, top, right, bottom },
+      targets,
+      visible,
+    };
+  });
+}
+async function visibleDiagnosticTargets(targets: Locator): Promise<number[]> {
+  return (await diagnosticVisibility(targets)).visible;
+}
+async function scrollDiagnosticTarget(target: Locator) {
+  await target.evaluate((element) => {
+    element.scrollIntoView({
+      block: "start",
+      inline: "nearest",
+      behavior: "instant",
+    });
+    const port = document.querySelector<HTMLElement>(
+      '[data-testid="workspace-content"]',
+    );
+    if (port)
+      port.scrollTop = Math.max(
+        0,
+        Math.min(port.scrollTop - 8, port.scrollHeight - port.clientHeight),
+      );
+  });
+  await expect(target).toBeVisible();
+  await expect
+    .poll(async () => {
+      const state = await diagnosticVisibility(target);
+      return state.visible.length === 1 && state.visible[0] === 0
+        ? null
+        : state;
+    })
+    .toBeNull();
+}
+async function diagnosticViewport(
+  page: Page,
+  target: Locator,
+  name: string,
+  shots: DiagnosticShots,
+) {
+  await scrollDiagnosticTarget(target);
+  expect(++shots.count).toBeLessThanOrEqual(shots.limit);
+  await page.screenshot({
+    path: test.info().outputPath(`${name}.png`),
+    fullPage: false,
+    animations: "disabled",
+  });
+}
+async function diagnosticParts(
+  page: Page,
+  targets: Locator,
+  stem: string,
+  part: string,
+  shots: DiagnosticShots,
+  overview = false,
+) {
+  const count = await targets.count();
+  expect(count).toBeGreaterThan(0);
+  expect(count).toBeLessThanOrEqual(part === "resources" ? 13 : 6);
+  const covered = new Set<number>();
+  for (let chunk = 0; chunk < count && covered.size < count; chunk++) {
+    const index = Array.from({ length: count }, (_, i) => i).find(
+      (i) => !covered.has(i),
+    )!;
+    const target = targets.nth(index);
+    await scrollDiagnosticTarget(target);
+    const visible = await visibleDiagnosticTargets(targets);
+    expect(visible).toContain(index);
+    const last = Array.from({ length: count }, (_, i) => i).every(
+      (i) => covered.has(i) || visible.includes(i),
+    );
+    const suffix =
+      part === "resources"
+        ? chunk === 0
+          ? last
+            ? "resources-first-last"
+            : "resources-first"
+          : last
+            ? "resources-last"
+            : `resources-middle-${chunk}`
+        : `${part}${chunk ? `-${chunk + 1}` : ""}`;
+    expect(++shots.count).toBeLessThanOrEqual(shots.limit);
+    const name = overview && chunk === 0 ? stem : `${stem}-${suffix}`;
+    await page.screenshot({
+      path: test.info().outputPath(`${name}.png`),
+      fullPage: false,
+      animations: "disabled",
+    });
+    for (const i of visible) {
+      await expect(targets.nth(i)).toBeVisible();
+      covered.add(i);
+    }
+  }
+  expect(covered.size).toBe(count);
+}
+
+const MOCK = "00000000-0000-4000-8000-000000000041";
 const rule = { features: [{ key: "events", name: "События", op: "count" }] };
+test("shows measured budget diagnostics and a terminal uncomputed lookup without a zero graph", async ({
+  page,
+}) => {
+  await login(page);
+  const at = (milliseconds: number) =>
+    new Date(Date.parse(config!.anchor) + milliseconds).toISOString();
+  const policy = {
+    policy_version: "window_execution_v1",
+    soft_latency_seconds: 5,
+    hard_budget_seconds: 0.8,
+  };
+  const execution = {
+    ...policy,
+    calculation_status: "uncomputed",
+    calculation_reason: "execution_budget_exceeded",
+    attempt_id: "00000000-0000-4000-8000-000000000049",
+    origin: "online",
+    window_index: 1,
+    start_utc: at(1000),
+    end_utc: at(2000),
+    started_at: at(3000),
+    execution_deadline_at: at(3800),
+    measured_at: at(3900),
+    measured_through: "finalization",
+    elapsed_seconds: 0.9,
+    queue_seconds: null,
+    online_latency_seconds: null,
+    soft_latency_exceeded: null,
+    timings: {},
+  };
+  const successExecution = {
+    ...execution,
+    calculation_status: "computed",
+    calculation_reason: null,
+    attempt_id: "00000000-0000-4000-8000-000000000048",
+    window_index: 2,
+    start_utc: at(2000),
+    end_utc: at(3000),
+    started_at: at(4000),
+    execution_deadline_at: at(4800),
+    measured_at: at(4200),
+    measured_through: "before_commit",
+    elapsed_seconds: 0.2,
+  };
+  const computed = (index: number, value: number) => ({
+    id: `00000000-0000-4000-8000-00000000005${index}`,
+    aggregate_id: MOCK,
+    kind: "working",
+    origin: index ? "online" : "initial_history",
+    window_index: index,
+    calculation_status: "computed",
+    calculation_reason: null,
+    execution: index === 2 ? successExecution : null,
+    start_utc: at(index * 1000),
+    end_utc: at((index + 1) * 1000),
+    scheduled_at: at((index + 1) * 1000),
+    actual_started_at: at((index + 2) * 1000 + 100),
+    actual_completed_at: at((index + 2) * 1000 + 200),
+    close_not_before_at: index ? at((index + 2) * 1000) : null,
+    snapshot_reference_at: at((index + 2) * 1000 + 100),
+    payload_state: "present",
+    snapshot_metadata: { delivery_coverage: "not_attested" },
+    evidence_refs: {},
+    event_count: value,
+    event_time_min: at(index * 1000 + 500),
+    event_time_max: at(index * 1000 + 500),
+    features: [
+      {
+        key: "events",
+        value,
+        reason: null,
+        valid_count: value,
+        invalid_count: 0,
+      },
+    ],
+    completeness: "complete",
+    completeness_reason: "received_event_snapshot",
+    time_basis: "event_time",
+  });
+  const terminal = {
+    ...computed(1, 0),
+    calculation_status: "uncomputed",
+    calculation_reason: "execution_budget_exceeded",
+    execution,
+    actual_started_at: at(3000),
+    actual_completed_at: at(3900),
+    event_count: null,
+    event_time_min: null,
+    event_time_max: null,
+    features: null,
+    completeness: null,
+    completeness_reason: null,
+    snapshot_reference_at: null,
+    snapshot_metadata: null,
+    evidence_refs: null,
+  };
+  const aggregate = {
+    ...card(),
+    created_at: at(1000),
+    bootstrap_at: at(1000),
+    online_start_index: 1,
+    execution_policy: policy,
+    last_execution: successExecution,
+    next_index: 3,
+    next_scheduled_at: at(4000),
+    next_close_not_before_at: at(5000),
+  };
+  let lookups = 0;
+  await page.route(`**/api/v1/aggregates/${MOCK}**`, async (route) => {
+    const url = route.request().url();
+    if (url.endsWith("/historical-points")) {
+      lookups++;
+      return route.fulfill({ json: terminal });
+    }
+    if (url.includes("/points?"))
+      return route.fulfill({
+        json: { items: [computed(2, 3), terminal, computed(0, 1)], total: 3 },
+      });
+    if (route.request().method() !== "GET")
+      throw new Error("Unexpected mutation in diagnostic UI scenario");
+    return route.fulfill({ json: aggregate });
+  });
+  await page.goto(`/aggregates/${MOCK}`);
+  const budget = page
+    .getByRole("region", { name: "Оценка ресурсов", exact: true })
+    .first();
+  await expect(
+    budget.getByRole("heading", { name: "Пороги", exact: true }),
+  ).toBeVisible();
+  await expect(
+    budget.getByRole("heading", {
+      name: "Последний фактический расчёт",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(budget.getByText("Рассчитано", { exact: true })).toBeVisible();
+  await expect(
+    budget.getByText(/Полная online-задержка.*Ещё не измерено/),
+  ).toBeVisible();
+  const graph = page.getByRole("region", {
+    name: "График сохранённых точек",
+    exact: true,
+  });
+  await expect(graph.locator('[data-layer="markers"] circle')).toHaveCount(2);
+  await expect(graph.locator('[data-layer="connections"] line')).toHaveCount(0);
+  await page
+    .getByLabel("Начало сохранённого окна", { exact: true })
+    .fill(calendarInputValue(at(1000)));
+  await page
+    .getByRole("button", { name: "Просмотреть сохранённое окно", exact: true })
+    .click();
+  await expect(
+    page.getByText("Сохранённое окно загружено. Новый расчёт не выполнялся.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(graph.getByRole("img", { name: /^График / })).toHaveCount(0);
+  await expect(graph.locator('[data-layer="markers"] circle')).toHaveCount(0);
+  await expect(graph.locator('[data-layer="connections"] line')).toHaveCount(0);
+  await expect(
+    graph.getByRole("status").filter({
+      hasText: /^Нет числовых значений для графика выбранного признака\./,
+    }),
+  ).toBeVisible();
+  await expect(graph.getByText(/автоматического пересчёта нет/)).toBeVisible();
+  await page
+    .getByRole("button", { name: `Выбрать точку ${terminal.id}`, exact: true })
+    .click();
+  const detail = page.getByRole("region", {
+    name: "Подробности выбранной точки",
+    exact: true,
+  });
+  await expect(
+    detail.getByText("Не рассчитано", { exact: true }).last(),
+  ).toBeVisible();
+  await expect(
+    detail.getByText(
+      /Значения, состав событий и опоздания для него недоступны/,
+    ),
+  ).toBeVisible();
+  await expect(detail.getByText(/Диапазон ECS @timestamp/)).toHaveCount(0);
+  for (const theme of ["light", "dark"]) {
+    await page.getByRole("button", { name: /^Аккаунт:/ }).click();
+    for (
+      let i = 0;
+      i < 3 &&
+      (await page.locator("html").getAttribute("data-theme")) !== theme;
+      i++
+    )
+      await page.getByTestId("theme-toggle").click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await page.keyboard.press("Escape");
+    for (const frame of [
+      { width: 320, height: 720, zoom: "1" },
+      { width: 2560, height: 720, zoom: "1" },
+      { width: 1280, height: 360, zoom: "1" },
+      { width: 800, height: 600, zoom: "2" },
+    ]) {
+      await page.setViewportSize({ width: frame.width, height: frame.height });
+      await page.evaluate((zoom) => {
+        document.documentElement.style.zoom = zoom;
+      }, frame.zoom);
+      const shots = { count: 0, limit: 10 };
+      const stem = `diagnostics-budget-${theme}-${frame.width}-${frame.height}-zoom${frame.zoom}`;
+      await diagnosticViewport(
+        page,
+        budget.getByRole("heading", {
+          name: "Оценка ресурсов",
+          level: 4,
+          exact: true,
+        }),
+        stem,
+        shots,
+      );
+      await diagnosticParts(
+        page,
+        budget
+          .getByRole("region", {
+            name: "Пороги расчёта",
+            exact: true,
+          })
+          .locator(":scope > h5, :scope > p"),
+        stem,
+        "thresholds",
+        shots,
+      );
+      await diagnosticParts(
+        page,
+        budget
+          .getByRole("region", {
+            name: "Последний фактический расчёт",
+            exact: true,
+          })
+          .locator(":scope > h5, :scope > p"),
+        stem,
+        "lastactual",
+        shots,
+      );
+      await diagnosticParts(
+        page,
+        detail.getByRole("status").locator(":scope > p"),
+        `diagnostics-uncomputed-${theme}-${frame.width}-${frame.height}-zoom${frame.zoom}`,
+        "details",
+        shots,
+        true,
+      );
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= innerWidth,
+        ),
+      ).toBe(true);
+    }
+  }
+  await page.evaluate(() => {
+    document.documentElement.style.zoom = "";
+  });
+  expect(lookups).toBe(1);
+});
 test("copy refuses deletion that would invalidate unchanged forward references", async ({
   page,
 }) => {
@@ -125,14 +539,14 @@ test("saved card keeps rule and history readable while operator metadata retries
     });
     await route.continue();
   });
-  await page.route("**/api/v1/aggregates/mock**", (route) =>
+  await page.route(`**/api/v1/aggregates/${MOCK}**`, (route) =>
     route.fulfill({
       json: route.request().url().includes("/points")
         ? { items: [], total: 0 }
         : card(),
     }),
   );
-  await page.goto("/aggregates/mock");
+  await page.goto(`/aggregates/${MOCK}`);
   await expect(
     page.getByText("Не удалось загрузить каталог операций.", { exact: false }),
   ).toBeVisible();
@@ -169,21 +583,63 @@ test("saved card keeps rule and history readable while operator metadata retries
 });
 function card() {
   return {
-    id: "mock",
+    id: MOCK,
     name: "Очень длинное имя агрегата ".repeat(12),
     source_id: config!.sources[0],
     source_name: "Тестовый источник",
     source_type: "kafka",
     aggregate_rule: rule,
     rule_hash: "a".repeat(64),
-    schedule_id: "s",
+    schedule_id: "00000000-0000-4000-8000-000000000042",
     anchor_utc: config!.anchor,
     duration_seconds: 1,
+    execution_policy: {
+      policy_version: "window_execution_v1",
+      soft_latency_seconds: 5,
+      hard_budget_seconds: 0.8,
+    },
+    last_execution: null,
     original_boundary: config!.anchor,
     timezone: "UTC",
     created_at: new Date().toISOString(),
-    created_by: "user",
+    created_by: "00000000-0000-4000-8000-000000000043",
     state: "active",
+    archived_at: null,
+    deleted_at: null,
+    deleted_by: null,
+    semantic_basis: "event_time",
+    execution_mode: "current",
+    execution_reason: null,
+    bootstrap_at: config!.anchor,
+    online_start_index: 0,
+    paused: false,
+    execution_generation: 0,
+    active_cleanup_id: null,
+    auto_cleanup: {
+      policy_version: "model_history_v1",
+      status: "scheduled",
+      reason: null,
+      checked_at: null,
+      next_check_at: new Date().toISOString(),
+      reserve_windows: null,
+      keep_from_index: null,
+      protected_from_index: null,
+      auto_cleared_total: 0,
+      history_revision: 0,
+      last_cleared_at: null,
+      retained_from_index: null,
+      retained_to_index: null,
+      protected_total: null,
+      protected_by: [],
+    },
+    next_close_not_before_at: config!.anchor,
+    diagnostics: {
+      exclusions: {},
+      late_count: 0,
+      late_start: null,
+      late_end: null,
+      late_reason: null,
+    },
     next_scheduled_at: config!.anchor,
     next_index: 1,
     skipped_ranges: [],
@@ -192,22 +648,160 @@ function card() {
     last_error_at: null,
   };
 }
-test("responsive points, mixed kinds, pagination, capture refusal, confirmation cancel and keyboard focus", async ({
+test("retired snapshots retain their original basis and copy into a new event-time draft", async ({
   page,
 }) => {
   await login(page);
-  const a = card();
+  const retired = {
+    ...card(),
+    semantic_basis: "availability_v1",
+    execution_mode: "retired",
+    execution_reason: "aggregate_time_semantics_retired",
+    auto_cleanup: {
+      ...card().auto_cleanup,
+      status: "inactive",
+      reason: "aggregate_time_semantics_retired",
+    },
+    bootstrap_at: null,
+    online_start_index: null,
+    next_close_not_before_at: null,
+  };
+  let mutations = 0;
+  await page.route(`**/api/v1/aggregates/${MOCK}**`, (route) => {
+    if (route.request().method() !== "GET") {
+      mutations++;
+      return route.abort();
+    }
+    if (route.request().url().endsWith("/copy"))
+      return route.fulfill({
+        json: {
+          source_id: retired.source_id,
+          schedule: {
+            boundary: retired.original_boundary,
+            timezone: retired.timezone,
+            duration_seconds: retired.duration_seconds,
+          },
+          aggregate_rule: retired.aggregate_rule,
+        },
+      });
+    if (route.request().url().includes("/points"))
+      return route.fulfill({
+        json: {
+          total: 1,
+          items: [
+            {
+              id: "00000000-0000-4000-8000-000000000044",
+              aggregate_id: MOCK,
+              kind: "working",
+              calculation_status: "computed",
+              calculation_reason: null,
+              execution: null,
+              origin: "legacy",
+              window_index: 0,
+              start_utc: config!.anchor,
+              end_utc: new Date(
+                Date.parse(config!.anchor) + 1000,
+              ).toISOString(),
+              scheduled_at: config!.anchor,
+              actual_started_at: config!.anchor,
+              actual_completed_at: config!.anchor,
+              snapshot_reference_at: null,
+              close_not_before_at: null,
+              payload_state: "present",
+              snapshot_metadata: {},
+              evidence_refs: {},
+              event_count: 1,
+              event_time_min: config!.anchor,
+              event_time_max: config!.anchor,
+              time_basis: "availability_at",
+              completeness: "unknown",
+              completeness_reason: "input_coverage_unavailable",
+              features: [
+                {
+                  key: "events",
+                  value: 1,
+                  reason: null,
+                  valid_count: 1,
+                  invalid_count: 0,
+                },
+              ],
+            },
+          ],
+        },
+      });
+    return route.fulfill({ json: retired });
+  });
+  await page.goto(`/aggregates/${MOCK}`);
+  await expect(
+    page.getByText(/Прежний расчёт остановлен\. Сохранённые результаты/),
+  ).toBeVisible();
+  const points = page.getByRole("region", {
+    name: "Сохранённые точки",
+    exact: true,
+  });
+  await expect(points).toContainText("времени доступности");
+  for (const name of [
+    "Пауза",
+    "Продолжить",
+    "Возобновить",
+    "Архивировать",
+    "Просмотреть сохранённое окно",
+  ])
+    await expect(page.getByRole("button", { name, exact: true })).toHaveCount(
+      0,
+    );
+  await expect(
+    page.getByRole("button", { name: "Копировать JSON", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Копировать", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/aggregates/new\\?copy=${MOCK}$`));
+  await expect(
+    page.getByLabel("Начало истории и сетка окон", { exact: true }),
+  ).not.toHaveValue("");
+  await expect(page.getByLabel("Имя агрегата", { exact: true })).toHaveValue(
+    "",
+  );
+  expect(mutations).toBe(0);
+});
+test("responsive unified initial-history/online points, pagination, not-ready lookup, confirmation cancel and keyboard focus", async ({
+  page,
+}) => {
+  await login(page);
+  const at = (milliseconds: number) =>
+    new Date(Date.parse(config!.anchor) + milliseconds).toISOString();
+  const a = {
+    ...card(),
+    created_at: at(1000),
+    bootstrap_at: at(1000),
+    online_start_index: 1,
+    next_index: 2,
+    next_scheduled_at: at(3000),
+    next_close_not_before_at: at(4000),
+  };
   let mutations = 0;
   const offsets: string[] = [];
-  const point = (kind: string, i: number) => ({
-    id: `${kind}1`,
-    aggregate_id: "mock",
-    kind,
-    start_utc: config!.anchor,
-    end_utc: new Date(Date.parse(config!.anchor) + 1000).toISOString(),
-    scheduled_at: config!.anchor,
-    actual_started_at: config!.anchor,
-    actual_completed_at: config!.anchor,
+  const point = (i: number) => ({
+    id: `00000000-0000-4000-8000-00000000000${i + 1}`,
+    aggregate_id: MOCK,
+    kind: "working",
+    calculation_status: "computed",
+    calculation_reason: null,
+    execution: null,
+    origin: i ? "online" : "initial_history",
+    window_index: i,
+    snapshot_reference_at: at(i ? 3100 : 1100),
+    close_not_before_at: i ? at(3000) : null,
+    payload_state: "present",
+    snapshot_metadata: {
+      quality_basis: "received_event_snapshot",
+      delivery_coverage: "not_attested",
+    },
+    evidence_refs: {},
+    start_utc: at(i * 1000),
+    end_utc: at((i + 1) * 1000),
+    scheduled_at: at((i + 1) * 1000),
+    actual_started_at: at(i ? 3100 : 1100),
+    actual_completed_at: at(i ? 3200 : 1200),
     event_count: 0,
     features: [
       {
@@ -234,11 +828,11 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
     ],
     completeness: i ? "interrupted" : "unknown",
     completeness_reason: "Нет доказанного покрытия",
-    time_basis: "availability_at",
+    time_basis: "event_time",
     event_time_min: null,
     event_time_max: null,
   });
-  await page.route("**/api/v1/aggregates/mock**", async (route) => {
+  await page.route(`**/api/v1/aggregates/${MOCK}**`, async (route) => {
     const url = route.request().url();
     if (url.includes("/points")) {
       expect(new URL(url).searchParams.get("limit")).toBe("3");
@@ -246,18 +840,18 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
       return route.fulfill({
         json: {
           total: 51,
-          items: [point("working", 0), point("historical", 1)],
+          items: [point(1), point(0)],
         },
       });
     }
     if (route.request().method() !== "GET") {
       mutations++;
       if (url.endsWith("/historical-points") && mutations === 2)
-        return route.fulfill({ json: point("historical", 1) });
+        return route.fulfill({ json: point(1) });
       return route.fulfill({
-        status: 422,
+        status: 409,
         json: {
-          code: "historical_time_basis_unknown",
+          code: "canonical_point_not_ready",
           message: "internal",
           request_id: "safe-request",
           details: null,
@@ -266,16 +860,24 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
     }
     return route.fulfill({ json: a });
   });
-  await page.goto("/aggregates/mock");
+  await page.goto(`/aggregates/${MOCK}`);
   await expect(
     page.getByRole("region", { name: "Сохранённые точки" }),
   ).toContainText("Полнота неизвестна");
-  await expect(page.getByRole("img", { name: /^График / })).toHaveCount(0);
-  await page.getByRole("button", { name: "Выбрать точку working1" }).click();
+  await expect(
+    page.getByRole("img", { name: /^График .* загруженной страницы$/ }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Выбрать точку 00000000-0000-4000-8000-000000000001",
+    })
+    .click();
   await expect(
     page.getByRole("region", { name: "Подробности выбранной точки" }),
   ).toBeVisible();
-  await expect(page.getByRole("img", { name: /^График / })).toHaveCount(0);
+  await expect(
+    page.getByRole("img", { name: /^График .* загруженной страницы$/ }),
+  ).toBeVisible();
   await page
     .getByLabel("Пояс отображения", { exact: true })
     .fill("Europe/Berlin");
@@ -300,28 +902,36 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
   expect(mutations).toBe(0);
   await page.getByLabel("Пояс отображения", { exact: true }).fill("UTC");
   await page
-    .getByLabel("Начало окна для дополнительного расчёта", { exact: true })
-    .fill(calendarInputValue(config!.anchor));
+    .getByLabel("Начало сохранённого окна", { exact: true })
+    .fill(
+      calendarInputValue(
+        new Date(Date.parse(config!.anchor) + 1000).toISOString(),
+      ),
+    );
   await page
-    .getByRole("button", { name: "Рассчитать выбранное окно", exact: true })
+    .getByRole("button", { name: "Просмотреть сохранённое окно", exact: true })
     .click();
   await expect(
-    page.getByText(/Основание времени истории не доказано/),
+    page.getByText(
+      "Сохранённый результат окна ещё не готов. Обновите состояние или выберите другое окно.",
+      { exact: true },
+    ),
   ).toBeVisible();
   await page
     .getByLabel("Пояс отображения", { exact: true })
     .fill("Europe/Berlin");
   await page.getByTitle("Вперед", { exact: true }).click();
   expect(offsets).toContain("3");
-  await expect(page.getByRole("img", { name: /^График / })).toHaveCount(0);
+  await expect(
+    page.getByRole("img", { name: /^График .* загруженной страницы$/ }),
+  ).toBeVisible();
   await page
-    .getByRole("button", { name: "Рассчитать выбранное окно", exact: true })
+    .getByRole("button", { name: "Просмотреть сохранённое окно", exact: true })
     .click();
   await expect(
-    page.getByText(
-      "Расчёт выбранного окна сохранён. Автоматическое расписание не изменено.",
-      { exact: true },
-    ),
+    page.getByText("Сохранённое окно загружено. Новый расчёт не выполнялся.", {
+      exact: true,
+    }),
   ).toBeVisible();
   expect(mutations).toBe(2);
   const featurePicker = page.getByRole("combobox", {
@@ -337,15 +947,18 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
   });
   await expect(plot).toHaveAttribute("data-domain-low", "0.2");
   await expect(plot).toHaveAttribute("data-domain-high", "0.2");
-  await expect(plot.locator("rect")).toHaveAttribute("y", "95");
+  await expect(plot.locator('[data-layer="markers"] circle')).toHaveAttribute(
+    "cy",
+    "100",
+  );
   await expect(plot.locator('[data-layer="connections"] line')).toHaveCount(0);
   await expect(plot).toHaveAttribute(
     "data-time-low",
-    String(Date.parse(config!.anchor)),
+    String(Date.parse(config!.anchor) + 1000),
   );
   await expect(plot).toHaveAttribute(
     "data-time-high",
-    String(Date.parse(config!.anchor) + 1000),
+    String(Date.parse(config!.anchor) + 2000),
   );
   await featurePicker.focus();
   await featurePicker.press("ArrowDown");
@@ -376,14 +989,14 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
       await page.getByTestId("theme-toggle").click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
     await page.keyboard.press("Escape");
-    for (const width of [320, 1920]) {
+    for (const width of [320, 1920, 2560]) {
       await page.setViewportSize({ width, height: 650 });
       const graph = page.getByRole("region", {
         name: "График сохранённых точек",
         exact: true,
       });
       await graph.scrollIntoViewIfNeeded();
-      const marker = graph.locator('[data-layer="markers"] rect');
+      const marker = graph.locator('[data-layer="markers"] circle');
       const canvas = graph.locator("svg[data-time-low]");
       await expect
         .poll(async () => {
@@ -467,10 +1080,10 @@ test("responsive points, mixed kinds, pagination, capture refusal, confirmation 
   await page.evaluate(() => {
     document.documentElement.style.zoom = "";
   });
-  await page
-    .getByLabel("Начало окна для дополнительного расчёта", { exact: true })
-    .fill("");
-  await expect(page.getByRole("img", { name: /^График / })).toHaveCount(0);
+  await page.getByLabel("Начало сохранённого окна", { exact: true }).fill("");
+  await expect(
+    page.getByRole("img", { name: /^График .* загруженной страницы$/ }),
+  ).toBeVisible();
   await expect(
     page.getByRole("region", { name: "Подробности выбранной точки" }),
   ).toHaveCount(0);
@@ -583,7 +1196,7 @@ test("resource errors retain JSON, clipboard fallback, invalid JSON stays editab
     "Имя агрегата",
     "Длительность, секунды",
     "Пояс отображения",
-    "Исходная граница",
+    "Начало истории и сетка окон",
   ])
     await expect(page.getByLabel(label, { exact: true })).toHaveAttribute(
       "aria-required",
@@ -604,7 +1217,7 @@ test("resource errors retain JSON, clipboard fallback, invalid JSON stays editab
   await page.getByLabel("Пояс отображения", { exact: true }).fill("UTC");
   await page.getByLabel("Длительность, секунды", { exact: true }).fill("1");
   await page
-    .getByLabel("Исходная граница", { exact: true })
+    .getByLabel("Начало истории и сетка окон", { exact: true })
     .fill(calendarInputValue(config!.anchor));
   await expect(vectorBlock).toBeEnabled();
   await expect(diagnosticsBlock).toBeEnabled();
@@ -652,7 +1265,7 @@ test("resource errors retain JSON, clipboard fallback, invalid JSON stays editab
   await expect(
     page.getByLabel("Полное правило JSON", { exact: true }),
   ).toHaveValue(text);
-  for (const width of [320, 1920]) {
+  for (const width of [320, 1920, 2560]) {
     await page.setViewportSize({ width, height: 650 });
     await expect
       .poll(() =>
@@ -697,6 +1310,98 @@ test("resource errors retain JSON, clipboard fallback, invalid JSON stays editab
   await expect(
     page.getByRole("region", { name: "Предварительный результат" }),
   ).toBeVisible();
+  const resourceBudget = page.getByRole("region", {
+    name: "Оценка ресурсов",
+    exact: true,
+  });
+  const resourceItems = resourceBudget
+    .getByRole("list", { name: "Ресурсы расчёта", exact: true })
+    .getByRole("listitem");
+  await expect(resourceItems).toHaveCount(13);
+  for (const value of await resourceItems.locator("strong").all())
+    await expect(value).not.toBeEmpty();
+  await expect(
+    resourceBudget.getByText(/предварительный расчёт завершён/),
+  ).toBeVisible();
+  const editorViewport = page.viewportSize()!;
+  try {
+    for (const theme of ["light", "dark"]) {
+      await page.getByRole("button", { name: /^Аккаунт:/ }).click();
+      for (
+        let i = 0;
+        i < 3 &&
+        (await page.locator("html").getAttribute("data-theme")) !== theme;
+        i++
+      )
+        await page.getByTestId("theme-toggle").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      await page.keyboard.press("Escape");
+      for (const frame of [
+        { width: 320, height: 720, zoom: "1" },
+        { width: 2560, height: 720, zoom: "1" },
+        { width: 1280, height: 360, zoom: "1" },
+        { width: 800, height: 600, zoom: "2" },
+      ]) {
+        await page.setViewportSize({
+          width: frame.width,
+          height: frame.height,
+        });
+        await page.evaluate((zoom) => {
+          document.documentElement.style.zoom = zoom;
+        }, frame.zoom);
+        const shots = { count: 0, limit: 16 };
+        const stem = `diagnostics-resources-${theme}-${frame.width}-${frame.height}-zoom${frame.zoom}`;
+        await expect(resourceItems).toHaveCount(13);
+        for (const value of await resourceItems.locator("strong").all())
+          await expect(value).not.toBeEmpty();
+        await diagnosticViewport(
+          page,
+          resourceBudget.getByRole("heading", {
+            name: "Оценка ресурсов",
+            level: 4,
+            exact: true,
+          }),
+          stem,
+          shots,
+        );
+        await diagnosticParts(
+          page,
+          resourceBudget
+            .getByRole("region", {
+              name: "Пороги расчёта",
+              exact: true,
+            })
+            .locator(":scope > h5, :scope > p"),
+          stem,
+          "thresholds",
+          shots,
+        );
+        await diagnosticParts(page, resourceItems, stem, "resources", shots);
+        await diagnosticParts(
+          page,
+          resourceBudget
+            .getByRole("region", {
+              name: "Последний фактический расчёт",
+              exact: true,
+            })
+            .locator(":scope > h5, :scope > p"),
+          stem,
+          "lastactual",
+          shots,
+        );
+        expect(
+          await page.evaluate(
+            () => document.documentElement.scrollWidth <= innerWidth,
+          ),
+        ).toBe(true);
+      }
+    }
+  } finally {
+    await page.evaluate(() => {
+      document.documentElement.style.zoom = "";
+    });
+    await page.setViewportSize(editorViewport);
+  }
   const attempts: { body: string | null; key: string | undefined }[] = [];
   let emptyCreate = false;
   await page.route("**/api/v1/aggregates", async (route) => {
@@ -750,7 +1455,7 @@ test("resource errors retain JSON, clipboard fallback, invalid JSON stays editab
   ).toHaveValue(text);
   await expect(page).toHaveURL(/\/aggregates\/new$/);
   expect(attempts[2]).toEqual(attempts[0]);
-  await page.route("**/api/v1/aggregates/mock**", (route) =>
+  await page.route(`**/api/v1/aggregates/${MOCK}**`, (route) =>
     route.fulfill({
       json: route.request().url().includes("/points")
         ? { items: [], total: 0 }
@@ -763,7 +1468,7 @@ test("resource errors retain JSON, clipboard fallback, invalid JSON stays editab
       exact: true,
     })
     .click();
-  await expect(page).toHaveURL(/\/aggregates\/mock$/);
+  await expect(page).toHaveURL(new RegExp(`/aggregates/${MOCK}$`));
   expect(attempts[3]).toEqual(attempts[0]);
   await expect(
     page.getByText("Агрегат создан. Правило и расписание сохранены.", {
@@ -788,7 +1493,11 @@ test("guest direct routes do not request aggregate data", async ({ page }) => {
     requests++;
     return route.abort();
   });
-  for (const path of ["/aggregates", "/aggregates/new", "/aggregates/mock"]) {
+  for (const path of [
+    "/aggregates",
+    "/aggregates/new",
+    `/aggregates/${MOCK}`,
+  ]) {
     await page.goto(path);
     await expect(
       page.getByText("Недостаточно прав для просмотра раздела", {
@@ -810,7 +1519,7 @@ for (const [status, code] of [
     const a = card();
     let mutations = 0,
       reads = 0;
-    await page.route("**/api/v1/aggregates/mock**", async (route) => {
+    await page.route(`**/api/v1/aggregates/${MOCK}**`, async (route) => {
       if (route.request().url().includes("/points"))
         return route.fulfill({ json: { items: [], total: 0 } });
       if (route.request().method() === "DELETE") {
@@ -846,7 +1555,7 @@ for (const [status, code] of [
         json: { ...a, state: reads > 2 ? "deleted" : "active" },
       });
     });
-    await page.goto("/aggregates/mock");
+    await page.goto(`/aggregates/${MOCK}`);
     const remove = page.getByRole("button", {
       name: "Удалить агрегат",
       exact: true,
@@ -871,10 +1580,10 @@ for (const [status, code] of [
     ).toBeDisabled();
     await expect(
       page.getByRole("button", {
-        name: "Рассчитать выбранное окно",
+        name: "Просмотреть сохранённое окно",
         exact: true,
       }),
-    ).toBeDisabled();
+    ).toBeEnabled(); // Canonical lookup is read-only; unknown mutations stay fenced.
     expect(mutations).toBe(1);
     expect(reads).toBe(1);
     const refresh = page.getByRole("button", {
@@ -931,7 +1640,7 @@ test("card refresh cannot cancel deletion and an earlier read cannot restore act
     });
   let reads = 0,
     deletes = 0;
-  await page.route("**/api/v1/aggregates/mock**", async (route) => {
+  await page.route(`**/api/v1/aggregates/${MOCK}**`, async (route) => {
     if (route.request().url().includes("/points"))
       return route.fulfill({ json: { items: [], total: 0 } });
     if (route.request().method() === "DELETE") {
@@ -943,7 +1652,7 @@ test("card refresh cannot cancel deletion and an earlier read cannot restore act
     if (reads > 1) await readGate;
     return route.fulfill({ json: a }).catch(() => {});
   });
-  await page.goto("/aggregates/mock");
+  await page.goto(`/aggregates/${MOCK}`);
   const refresh = page.getByRole("button", {
     name: "Обновить состояние",
     exact: true,

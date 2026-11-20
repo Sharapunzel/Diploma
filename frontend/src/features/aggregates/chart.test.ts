@@ -96,3 +96,30 @@ it("has no invented time axis for empty or malformed timestamps", () => {
   expect(chartTimeScale([])).toBeNull();
   expect(chartTimeScale([point("bad", "unknown", "unknown")])).toBeNull();
 });
+
+it("leaves a terminal uncomputed window as a gap without a zero marker", () => {
+  const minute = (n: number) =>
+    `2026-01-01T00:${String(n).padStart(2, "0")}:00Z`;
+  const terminal = {
+    ...point("budget", minute(1), minute(2)),
+    calculation_status: "uncomputed",
+    calculation_reason: "execution_budget_exceeded",
+    completeness: null,
+    features: null,
+  } as Point;
+  const series = chartSeries(
+    [
+      point("a", minute(0), minute(1)),
+      terminal,
+      point("b", minute(2), minute(3)),
+    ],
+    "n",
+  )[0];
+  expect(
+    series.values.map((item) => [item.point.id, item.value, item.join]),
+  ).toEqual([
+    ["a", 1, false],
+    ["budget", null, false],
+    ["b", 1, false],
+  ]);
+});

@@ -34,10 +34,15 @@ class EventTimeBudgetError(ValueError):
 class OperationBudget:
     seconds: float
     clock: Callable[[], float] | None = None
+    started: float | None = None
 
     def __post_init__(self):
         self.clock = self.clock or time.monotonic
-        self.deadline = self.clock() + self.seconds
+        self.started = self.clock() if self.started is None else self.started
+        self.deadline = self.started + self.seconds
+
+    def remaining(self):
+        return max(0.0, self.deadline - self.clock())
 
     def milliseconds(self):
         remaining = self.deadline - self.clock()

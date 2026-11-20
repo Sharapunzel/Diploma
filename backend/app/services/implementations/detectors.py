@@ -493,6 +493,7 @@ class DetectorService:
         active(owner)
         current = self._lock(context)
         if not reuse:
+            self.history.revalidate_plan(current, plan, deadline)
             self.repository.select_attempt(current, attempt)
         self._commit_candidate()
         context = self.repository.read_context(detector_id)
@@ -569,9 +570,10 @@ class DetectorService:
                 or schedule["active_cleanup_id"] or aggregate["execution_mode"] == "retired"):
             self.uow.rollback()
             return {"state": "waiting", "reason": "inactive_or_not_ready"}
-        point = self.repository.next_working_point(schedule["id"], detector["consumed_index"],
-                                                   detector["evaluation_start_index"])
-        self.uow.rollback()
+        with self.uow.read_snapshot():
+            self.repository.validate_working_context(context)
+            point = self.repository.next_working_point(schedule["id"], detector["consumed_index"],
+                                                       detector["evaluation_start_index"])
         if point is None:
             return {"state": "waiting", "reason": "working_point_pending"}
         if point["end_utc"] > context["now"]:
@@ -586,6 +588,23 @@ class DetectorService:
         reason, result, finding = None, None, None
         checkpoint = detector["checkpoint"]
         model_started = time.monotonic()
+        if point.get("calculation_status", "computed") == "uncomputed":
+            # A terminal computation refusal is still a canonical window.
+            # Consume it without even restoring a model or inventing a vector.
+            reason = "execution_budget_exceeded"
+            current = self._lock(context)
+            lock_completed = time.monotonic()
+            self.repository.save_transition(current, point, checkpoint,
+                {"kind": "skipped", "reason": reason,
+                 "data": {"start": point["start_utc"].isoformat(), "end": point["end_utc"].isoformat(),
+                          "actual_started_at": context["now"].isoformat(),
+                          "actual_completed_at": current["now"].isoformat(),
+                          "features": None, "result": None}}, None)
+            self._commit_candidate()
+            self.transition_timings = {"read_seconds": model_started - started, "model_seconds": 0,
+                "final_lock_seconds": lock_completed - model_started,
+                "commit_seconds": time.monotonic() - lock_completed}
+            return {"state": "skipped", "reason": reason, "point_id": point["id"], "finding": None}
         try:
             model = self.models.restore(checkpoint, detector["config"], detector["feature_keys"], detector["rule_hash"])
         except DetectionError as error:

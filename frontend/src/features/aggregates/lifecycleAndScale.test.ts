@@ -6,6 +6,7 @@ import {
   type Operator,
 } from "../../app/api/aggregates";
 import { ApiError } from "../../app/api/client";
+import { aggregateFixture, aggregateId } from "../../app/api/aggregateTestData";
 import { DraftStore } from "./DraftStore";
 import { CardStore } from "./CardStore";
 import { chartScale } from "./chart";
@@ -95,7 +96,7 @@ it.each(["archive", "delete", "resume"] as const)(
       card: vi.fn().mockReturnValue(oldRead.promise),
       lifecycle: vi.fn().mockReturnValue(mutation.promise),
     } as unknown as AggregatesApi;
-    const store = new CardStore(api, "aggregate");
+    const store = new CardStore(api, aggregateId);
     const reading = store.load();
     const readSignal = vi.mocked(api.card).mock.calls[0][1]!;
     const changing = store.action(action);
@@ -110,9 +111,11 @@ it.each(["archive", "delete", "resume"] as const)(
         : action === "archive"
           ? "archived"
           : "active";
-    mutation.resolve({ id: "aggregate", state } as Aggregate);
+    mutation.resolve(aggregateFixture({ state }));
     await changing;
-    oldRead.resolve({ id: "aggregate", state: "stale" } as Aggregate);
+    oldRead.resolve(
+      aggregateFixture({ state: state === "active" ? "archived" : "active" }),
+    );
     await reading;
     expect(store.card?.state).toBe(state);
     expect(store.lifecycle.pending.size).toBe(0);
@@ -136,10 +139,10 @@ it.each([
         .fn()
         .mockRejectedValueOnce(new ApiError(503, "aggregate_database_error"))
         .mockRejectedValueOnce(new ApiError(200, "invalid_response"))
-        .mockResolvedValue({ state: "deleted" }),
+        .mockResolvedValue(aggregateFixture({ state: "deleted" })),
     } as unknown as AggregatesApi;
-    const store = new CardStore(api, "aggregate");
-    store.card = { state: "active" } as Aggregate;
+    const store = new CardStore(api, aggregateId);
+    store.card = aggregateFixture();
     await store.action("delete");
     expect(store.mutationOutcome).toBe("unknown");
     expect(store.canMutate).toBe(false);
@@ -168,8 +171,8 @@ it("preserves a confirmed refusal and aborts mutation expectation on disposal", 
       .fn()
       .mockRejectedValueOnce(new ApiError(409, "aggregate_inactive")),
   } as unknown as AggregatesApi;
-  const store = new CardStore(api, "aggregate");
-  store.card = { state: "active" } as Aggregate;
+  const store = new CardStore(api, aggregateId);
+  store.card = aggregateFixture();
   await store.action("archive");
   expect(store.mutationOutcome).toBe("refused");
   expect(store.card.state).toBe("active");
@@ -178,7 +181,7 @@ it("preserves a confirmed refusal and aborts mutation expectation on disposal", 
   const changing = store.action("delete");
   const signal = vi.mocked(api.lifecycle).mock.calls[1][2]!;
   store.dispose();
-  result.resolve({ state: "deleted" } as Aggregate);
+  result.resolve(aggregateFixture({ state: "deleted" }));
   await changing;
   expect(signal.aborted).toBe(true);
   expect(store.card).toBeNull();

@@ -14,7 +14,9 @@ import { displayTime, localCalendar } from "../../features/aggregates/time";
 import { reasonText, timeBases } from "../../features/aggregates/labels";
 import { AggregateError } from "./AggregateError";
 import { FieldLabel } from "./AggregateHelp";
-import { FeatureTable, Time, quality } from "./ResultView";
+import { SnapshotSummary } from "./SnapshotSummary";
+import { FeatureTable, Time, quality, UncomputedNotice } from "./ResultView";
+import { BudgetView } from "./BudgetView";
 import styles from "./PointsView.module.css";
 
 const pageSize = 3;
@@ -33,12 +35,16 @@ export const PointsView = observer(
     aggregate,
     zone,
     refresh,
+    clearedVersion = 0,
+    clearVersion = 0,
     historicalPoint = null,
     selectionKey = "",
   }: {
     aggregate: Aggregate;
     zone: string;
     refresh: number;
+    clearedVersion?: number;
+    clearVersion?: number;
     historicalPoint?: Point | null;
     selectionKey?: string;
   }) => {
@@ -65,11 +71,25 @@ export const PointsView = observer(
     } | null>(null);
     const previousHistorical = useRef<Point | null>(null);
     const previousSelectionKey = useRef(selectionKey);
+    const previousCleared = useRef(clearedVersion);
+    const previousClearOnly = useRef(clearVersion);
     useEffect(() => {
-      // Refreshing history does not change the separately calculated window.
+      if (previousClearOnly.current === clearVersion) return;
+      previousClearOnly.current = clearVersion;
       setSelectedPoint(null);
+      setHistoricalContext(null);
+      store.clear({ preserveOffset: true });
+    }, [store, clearVersion]);
+    useEffect(() => {
+      const cleared = previousCleared.current !== clearedVersion;
+      previousCleared.current = clearedVersion;
+      setSelectedPoint(null);
+      if (cleared) {
+        setHistoricalContext(null);
+        store.clear({ preserveOffset: true });
+      }
       void store.load();
-    }, [store, refresh]);
+    }, [store, refresh, clearedVersion]);
     useEffect(() => {
       if (previousSelectionKey.current !== selectionKey) {
         previousSelectionKey.current = selectionKey;
@@ -110,7 +130,7 @@ export const PointsView = observer(
         scope: selectionKey,
         offset: store.offset,
       });
-    const chartPoints = currentHistorical ? [currentHistorical] : [];
+    const chartPoints = currentHistorical ? [currentHistorical] : store.items;
     const keys = [
       ...new Set(
         chartPoints.flatMap((p) => p.features?.map((f) => f.key) || []),
@@ -166,20 +186,26 @@ export const PointsView = observer(
           />
         )}
         <section className={styles.tile} aria-label="График сохранённых точек">
-          <h3>График выбранного исторического окна</h3>
+          <h3>График сохранённого ряда</h3>
           {!chartPoints.length ? (
             <p className={styles.notice} role="status">
-              Выберите дату исторического окна и рассчитайте его, чтобы увидеть
-              график.
+              На загруженной странице пока нет сохранённых точек.
             </p>
           ) : (
             <>
               <p className={styles.notice}>
-                Показана одна историческая точка рассчитанного окна. Данные
-                общей истории не подставляются в график.
+                {currentHistorical
+                  ? "Показано выбранное сохранённое окно."
+                  : "Показаны только точки текущей загруженной страницы, без автоматической загрузки всей истории."}{" "}
+                {aggregate.execution_mode === "retired"
+                  ? "Прежние результаты сохраняют исходное основание времени."
+                  : "Начальная история и online образуют единый событийный ряд."}
               </p>
               <p className={styles.range} aria-label="Границы временной оси">
-                Охваченный технический диапазон:{" "}
+                {aggregate.execution_mode === "retired"
+                  ? "Охваченный технический диапазон"
+                  : "Охваченный событийный диапазон"}
+                :{" "}
                 <Time
                   value={chartPoints.reduce(
                     (a, p) =>
@@ -199,7 +225,7 @@ export const PointsView = observer(
                 />
               </p>
               <div className={styles.field}>
-                <FieldLabel help="Выберите координату вектора рассчитанного исторического окна. Выбор меняет только отображаемый признак.">
+                <FieldLabel help="Выберите координату загруженного ряда. Выбор меняет только отображение; точные значения остаются в таблице.">
                   Признак графика
                 </FieldLabel>
                 <Select
@@ -210,14 +236,19 @@ export const PointsView = observer(
                 />
               </div>
               <p className={styles.notice}>
-                ■ Историческая точка; контур — полнота не подтверждена. Для
-                одного окна соединяющей линии нет. Координата приближённая;
-                точное значение и причина пропуска приведены ниже.
+                ● Событийный ряд (initial_history и online), ■ прежняя история;
+                контур — качество не подтверждено. Разрывы и очищенная история
+                не соединяются. Координата приближённая; точное значение и
+                причина пропуска приведены ниже.
               </p>
               {scale && timeline ? (
                 <figure
                   className={styles.chartFigure}
-                  aria-label="График выбранного окна"
+                  aria-label={
+                    currentHistorical
+                      ? "График выбранного окна"
+                      : "График загруженной страницы"
+                  }
                 >
                   <figcaption className={styles.chartLabels}>
                     <span>
@@ -241,14 +272,14 @@ export const PointsView = observer(
                       className={styles.chart}
                       viewBox={`0 0 ${plotWidth} 220`}
                       role="img"
-                      aria-label={`График ${key} выбранного окна`}
+                      aria-label={`График ${key} ${currentHistorical ? "выбранного окна" : "загруженной страницы"}`}
                       data-domain-low={scale.low}
                       data-domain-high={scale.high}
                       data-time-low={timeline.low}
                       data-time-high={timeline.high}
                     >
                       <title>
-                        Показано одно рассчитанное историческое окно. Точные
+                        Показаны сохранённые точки выбранного диапазона. Точные
                         значения доступны в таблице.
                       </title>
                       <line
@@ -379,14 +410,25 @@ export const PointsView = observer(
                   сведения доступны в таблице.
                 </p>
               )}
-              <FeatureTable features={currentHistorical!.features} />
+              {currentHistorical &&
+                (currentHistorical.calculation_status === "uncomputed" ? (
+                  <UncomputedNotice />
+                ) : (
+                  <FeatureTable features={currentHistorical.features} />
+                ))}
             </>
           )}
         </section>
         {!store.loaded && store.loading ? (
           <Spin />
         ) : !store.items.length ? (
-          <Empty description="Сохранённых точек пока нет" />
+          <Empty
+            description={
+              store.error
+                ? "Список точек недоступен"
+                : "Сохранённых точек пока нет"
+            }
+          />
         ) : (
           <>
             <section
@@ -395,11 +437,11 @@ export const PointsView = observer(
             >
               <h3>История расчётов</h3>
               <p className={styles.notice}>
-                Сохранённые рабочие и исторические точки: позиции{" "}
+                Сохранённые точки единого ряда: позиции{" "}
                 {store.total ? store.offset + 1 : 0}–
-                {store.offset + store.items.length} из {store.total}. Выбор даты
-                расчёта не фильтрует этот список. Строка открывает подробности
-                своей точки отдельно от графика.
+                {store.offset + store.items.length} из {store.total}. Выбор окна
+                не фильтрует этот список. Строка открывает подробности своей
+                точки отдельно от графика.
               </p>
               <div
                 className={styles.scroll}
@@ -411,7 +453,11 @@ export const PointsView = observer(
                   <thead>
                     <tr>
                       <th>Точка</th>
-                      <th>Техническое окно / плановый расчёт</th>
+                      <th>
+                        {aggregate.execution_mode === "retired"
+                          ? "Прежнее техническое окно"
+                          : "Событийное окно / сроки"}
+                      </th>
                       <th>Полнота / основание</th>
                       <th>События</th>
                       <th>Значения</th>
@@ -427,8 +473,12 @@ export const PointsView = observer(
                               onClick={() => selectPoint(p)}
                             >
                               {p.kind === "working"
-                                ? "● Рабочая"
-                                : "■ Историческая"}
+                                ? p.origin === "initial_history"
+                                  ? "● Начальная история"
+                                  : p.origin === "online"
+                                    ? "● Online"
+                                    : "● Прежняя рабочая"
+                                : "■ Прежняя историческая"}
                             </Button>
                             <code>{p.id}</code>
                           </div>
@@ -437,12 +487,23 @@ export const PointsView = observer(
                           [<Time value={p.start_utc} zone={zone} />,{" "}
                           <Time value={p.end_utc} zone={zone} />)
                           <p>
-                            План: <Time value={p.scheduled_at} zone={zone} />
+                            Конец: <Time value={p.scheduled_at} zone={zone} />;
+                            закрытие не ранее:{" "}
+                            <Time value={p.close_not_before_at} zone={zone} />
                           </p>
                         </td>
                         <td>
-                          {quality[p.completeness] || p.completeness}:{" "}
-                          {reasonText(p.completeness_reason)}
+                          {p.calculation_status === "uncomputed" ? (
+                            <>
+                              <strong>Не рассчитано</strong>:{" "}
+                              {reasonText(p.calculation_reason)}
+                            </>
+                          ) : (
+                            <>
+                              {quality[p.completeness] || p.completeness}:{" "}
+                              {reasonText(p.completeness_reason)}
+                            </>
+                          )}
                           <p>{timeBases[p.time_basis] ?? p.time_basis}</p>
                         </td>
                         <td>{exact(p.event_count)}</td>
@@ -508,13 +569,19 @@ export const PointsView = observer(
           >
             <h3>Точка {selected.id}</h3>
             <p>
-              Техническое окно: [<Time value={selected.start_utc} zone={zone} />
+              Окно: [<Time value={selected.start_utc} zone={zone} />
               , <Time value={selected.end_utc} zone={zone} />
               ).
             </p>
             <p>
-              Вид: {selected.kind === "working" ? "Рабочая" : "Историческая"},
-              основание: {timeBases[selected.time_basis] ?? selected.time_basis}
+              Происхождение:{" "}
+              {selected.origin === "initial_history"
+                ? "Начальная история"
+                : selected.origin === "online"
+                  ? "Online"
+                  : "Прежний сохранённый результат"}
+              , основание:{" "}
+              {timeBases[selected.time_basis] ?? selected.time_basis}
             </p>
             <p>
               Начало расчёта:{" "}
@@ -522,12 +589,33 @@ export const PointsView = observer(
               завершение:{" "}
               <Time value={selected.actual_completed_at} zone={zone} />
             </p>
-            <p>
-              Диапазон ECS @timestamp:{" "}
-              <Time value={selected.event_time_min} zone={zone} /> —{" "}
-              <Time value={selected.event_time_max} zone={zone} />
-            </p>
-            <FeatureTable features={selected.features} />
+            {selected.calculation_status === "uncomputed" ? (
+              <UncomputedNotice />
+            ) : (
+              <>
+                <p>
+                  Диапазон ECS @timestamp:{" "}
+                  <Time value={selected.event_time_min} zone={zone} /> —{" "}
+                  <Time value={selected.event_time_max} zone={zone} />
+                </p>
+                <p>
+                  Момент снимка:{" "}
+                  <Time value={selected.snapshot_reference_at} zone={zone} />;
+                  закрытие не ранее{" "}
+                  <Time value={selected.close_not_before_at} zone={zone} />.
+                  Индекс {exact(selected.window_index)}.
+                </p>
+                <SnapshotSummary
+                  metadata={selected.snapshot_metadata ?? {}}
+                  zone={zone}
+                />
+                <FeatureTable features={selected.features} />
+              </>
+            )}
+            <BudgetView
+              duration={aggregate.duration_seconds}
+              execution={selected.execution}
+            />
           </section>
         )}
       </section>

@@ -2,8 +2,11 @@
 
 import hashlib
 import json
-from datetime import UTC, timedelta
+import logging
+from datetime import UTC, datetime, timedelta
 from functools import wraps
+from time import monotonic
+from types import SimpleNamespace
 from uuid import uuid4
 
 from sqlalchemy.exc import DBAPIError
@@ -28,16 +31,19 @@ from ...aggregation.rules import (
     field_support_reason,
     operator_catalog,
 )
+from ...aggregation.time_policy import FINALIZATION_SECONDS, execution_diagnostics, execution_policy
 from ...core.errors import DomainError
+from ...db_deadline import DatabaseDeadlineExceeded, database_deadline
 from ...models import Aggregate, AggregateSchedule, HistoricalAggregatePoint
 from ...repositories.protocols import UnitOfWork
 from ...repositories.protocols.aggregates import AggregateRepository
 from ...schemas.aggregates import (
     AggregateCard,
     AggregatePreviewRequest,
-    PointCard,
+    ComputedPointCard,
     PreviewResult,
     ScheduleInput,
+    UncomputedPointCard,
     ValidateRequest,
     ValidationResult,
 )
@@ -45,6 +51,8 @@ from .aggregate_execution import AggregateExecutionService
 from .aggregate_field_catalog import AggregateFieldCatalogService
 from .aggregate_snapshot import AggregateSnapshotService
 from .window_schedule import WindowSchedule
+
+LOGGER = logging.getLogger(__name__)
 
 
 def guarded(method):
@@ -63,6 +71,9 @@ def guarded(method):
             self.uow.rollback()
             raise DomainError("resource_budget_exceeded", "Уменьшите окно или сложность правила", 422,
                 {"factor": error.factor, "hint": "Уменьшите объём событий или сложность конфигурации"}) from error
+        except DatabaseDeadlineExceeded as error:
+            self.uow.rollback()
+            raise DomainError("aggregate_retry_required", "Не удалось получить доступ к расчёту до срока", 503) from error
         except DBAPIError as error:
             self.uow.rollback()
             code = getattr(error.orig, "sqlstate", None)
@@ -92,6 +103,10 @@ class AggregateService:
         self.capture, self.uow, self.catalog, self.budget_limits = capture, uow, catalog, limits
         self.detectors = detectors
         self.field_catalog_limits = field_catalog_limits
+        self.current_operation_budget = None
+        self.current_execution_generation = None
+        self.current_window = None
+        self.current_database_deadline = False
 
     def _source(self, source_id):
         source = self.repository.source(source_id)
@@ -147,29 +162,81 @@ class AggregateService:
         return self._validate(body)
 
     def _preview(self, body):
+        self._preview_finalization_budget = None
+        with database_deadline(lambda: self.current_operation_budget, on_deadline=self._preview_finalization_budget_once):
+            try:
+                return self._preview_calculate(body)
+            except Exception:
+                self._preview_finalization()
+                self.uow.rollback()
+                raise
+
+    def _preview_finalization_budget_once(self):
+        if self._preview_finalization_budget is None:
+            self._preview_finalization_budget = OperationBudget(FINALIZATION_SECONDS)
+        return self._preview_finalization_budget
+
+    def _preview_finalization(self):
+        self.current_operation_budget = self._preview_finalization_budget_once()
+        return self.current_operation_budget
+
+    def _preview_calculate(self, body):
         if body.time_basis != "event_time":
             raise DomainError("legacy_calculation_removed", "Укажите time_basis=event_time для нового расчёта", 422)
-        budget = OperationBudget(10)
-        self.repository.read_budget(budget.milliseconds())
-        self._source(body.source_id)
+        started = monotonic()
+        policy = execution_policy(body.schedule.duration_seconds)
+        budget = OperationBudget(policy["hard_budget_seconds"], started=started)
+        self.current_operation_budget = budget
         schedule = WindowSchedule(body.schedule.anchor_utc, body.schedule.duration_seconds)
         start = body.window_start_utc.astimezone(UTC)
         index = index_at(schedule.anchor_utc, schedule.duration_seconds, start)
         expected = schedule.anchor_utc + timedelta(seconds=index * schedule.duration_seconds)
         end = start + timedelta(seconds=schedule.duration_seconds)
-        if start != expected:
-            raise DomainError("window_not_aligned", "Начало окна должно совпадать с границей расписания", 422)
-        if end > self.repository.now():
-            raise DomainError("window_not_completed", "Доступно только завершённое окно", 422)
-        candidate = AggregateSnapshotService(self.repository, self.uow, self.catalog, self.budget_limits).build(
-            body.source_id, body.aggregate_rule.model_dump(exclude_none=True), start, end,
-            schedule.duration_seconds, "preview", None, budget, True)
-        return PreviewResult(rule_hash=candidate["rule_hash"], start_utc=start, end_utc=end,
+        wall_started = datetime.now(UTC)
+        context = SimpleNamespace(attempt_id=uuid4(), origin="preview", window_index=index,
+            start_utc=start, end_utc=end, hard_budget_seconds=policy["hard_budget_seconds"],
+            started_at=wall_started, deadline_at=wall_started + timedelta(seconds=policy["hard_budget_seconds"]))
+        try:
+            self.repository.read_budget(budget.milliseconds())
+            self._source(body.source_id)
+            if start != expected:
+                raise DomainError("window_not_aligned", "Начало окна должно совпадать с границей расписания", 422)
+            self.repository.read_budget(budget.milliseconds())
+            reference = self.repository.now()
+            if end > reference:
+                raise DomainError("window_not_completed", "Доступно только завершённое окно", 422)
+            candidate = AggregateSnapshotService(self.repository, self.uow, self.catalog, self.budget_limits).build(
+                body.source_id, body.aggregate_rule.model_dump(exclude_none=True), start, end,
+                schedule.duration_seconds, "preview", None, budget, True)
+            budget.check()
+            elapsed = monotonic() - started
+            diagnostic = execution_diagnostics(context, context.started_at + timedelta(seconds=elapsed),
+                elapsed, "computed", "preview_complete", candidate["timings"])
+            result = PreviewResult(rule_hash=candidate["rule_hash"], start_utc=start, end_utc=end,
             scheduled_at=end, **candidate["values"], completeness=candidate["completeness"],
             completeness_reason=candidate["completeness_reason"], time_basis="event_time",
             budget=candidate["budget"], snapshot_reference_at=candidate["reference"],
             close_not_before_at=close_deadline(end, schedule.duration_seconds),
-            in_process=index >= 0, snapshot_metadata=candidate["metadata"])
+            in_process=index >= 0, snapshot_metadata=candidate["metadata"], execution=diagnostic)
+            result.model_dump(mode="json")
+            budget.check()
+            return result
+        except (EventTimeBudgetError, DBAPIError, DatabaseDeadlineExceeded) as error:
+            self._preview_finalization()
+            self.uow.rollback()
+            timed_out = (isinstance(error, DatabaseDeadlineExceeded)
+                or isinstance(getattr(error, "orig", None), DatabaseDeadlineExceeded)
+                or (getattr(error.orig, "sqlstate", None) in {"57014", "55P03"}
+                    if isinstance(error, DBAPIError) else getattr(error, "factor", None) == "operation_seconds"))
+            if budget.remaining() <= 0 and timed_out:
+                elapsed = monotonic() - started
+                diagnostic = execution_diagnostics(context, context.started_at + timedelta(seconds=elapsed),
+                    elapsed, "uncomputed", "finalization")
+                raise DomainError("execution_budget_exceeded", "Окно не рассчитано: исчерпан бюджет времени", 422,
+                    {"execution": diagnostic}) from error
+            if isinstance(error, EventTimeBudgetError) and error.factor == "operation_seconds":
+                raise DomainError("aggregate_retry_required", "Ранний отказ бюджета требует повторного чтения", 503) from error
+            raise
 
     @guarded
     def preview(self, body: AggregatePreviewRequest):
@@ -242,6 +309,7 @@ class AggregateService:
         _, next_at = bounds(schedule.anchor_utc, schedule.duration_seconds, schedule.next_index)
         deadline = close_deadline(next_at, schedule.duration_seconds) if aggregate.execution_mode == "current" else None
         return AggregateCard(id=aggregate.id, name=aggregate.name, source_id=aggregate.source_identity,
+            execution_policy=execution_policy(schedule.duration_seconds), last_execution=schedule.last_execution,
             source_name=aggregate.source_name, source_type=aggregate.source_type,
             aggregate_rule=aggregate.rule, rule_hash=aggregate.rule_hash,
             schedule_id=schedule.id, anchor_utc=schedule.anchor_utc, duration_seconds=schedule.duration_seconds,
@@ -256,7 +324,8 @@ class AggregateService:
             bootstrap_at=schedule.bootstrap_at, online_start_index=schedule.online_start_index,
             paused=schedule.paused, execution_generation=schedule.execution_generation,
             active_cleanup_id=schedule.active_cleanup_id, next_close_not_before_at=deadline,
-            diagnostics=self.repository.diagnostics(aggregate.id))
+            diagnostics=self.repository.diagnostics(aggregate.id),
+            auto_cleanup=self.repository.retention_summary(aggregate.id))
 
     @guarded
     def card(self, aggregate_id):
@@ -271,7 +340,12 @@ class AggregateService:
     def _point(self, aggregate, point):
         historical = isinstance(point, HistoricalAggregatePoint)
         closure = self.repository.closure_by_id(point.id)
-        return PointCard(id=point.id, aggregate_id=aggregate.id, kind="historical" if historical else "working",
+        uncomputed = closure is not None and closure.calculation_status == "uncomputed"
+        card = UncomputedPointCard if uncomputed else ComputedPointCard
+        return card(id=point.id, aggregate_id=aggregate.id, kind="historical" if historical else "working",
+            calculation_status="uncomputed" if uncomputed else "computed",
+            calculation_reason=closure.calculation_reason if closure else None,
+            execution=closure.execution if closure else None,
             start_utc=point.start_utc, end_utc=point.end_utc, scheduled_at=point.end_utc,
             actual_started_at=point.actual_started_at, actual_completed_at=point.actual_completed_at,
             event_count=point.event_count, event_time_min=point.event_time_min, event_time_max=point.event_time_max,
@@ -280,7 +354,7 @@ class AggregateService:
             origin=closure.origin if closure else "legacy", window_index=closure.window_index if closure else None,
             snapshot_reference_at=closure.snapshot_reference_at if closure else None,
             close_not_before_at=closure.close_not_before_at if closure else None,
-            snapshot_metadata=self.repository.snapshot_metadata(point.id))
+            snapshot_metadata=None if uncomputed else self.repository.snapshot_metadata(point.id))
 
     @guarded
     def points(self, aggregate_id, limit, offset):
@@ -311,6 +385,7 @@ class AggregateService:
                 return self._card(aggregate, schedule)
             raise DomainError("aggregate_deleted", "Агрегат удалён", 409)
         schedule.execution_generation += 1
+        self.repository.revoke_window_attempt(schedule.id)
         if action == "archive" and aggregate.state == "active":
             aggregate.state, aggregate.archived_at = "archived", now
         elif action == "resume" and aggregate.state == "archived":
@@ -363,18 +438,66 @@ class AggregateService:
         return AggregateCleanupService(self.repository, self.uow).operation(aggregate_id, operation_id)
 
     @guarded
-    def due(self, limit: int = 1000):
-        return self.repository.due(limit)
+    def due(self, limit: int = 1000, exclude_ids=()):
+        return self.repository.due(limit, exclude_ids)
 
-    @guarded
+    def maintenance_due(self, limit=100, exclude_ids=()):
+        from .aggregate_retention import AggregateRetentionService
+        return AggregateRetentionService(self.repository, self.uow).due(limit, exclude_ids)
+
+    def maintain(self, aggregate_id):
+        from .aggregate_retention import AggregateRetentionService
+        return AggregateRetentionService(self.repository, self.uow).maintain(aggregate_id)
+
     def record_worker_error(self, aggregate_id, code: str | None) -> None:
-        self.uow.rollback()
-        self.repository.record_error(aggregate_id, code)
-        self.uow.commit()
+        # A standalone legacy caller has no prior operation. A worker always
+        # reuses its actual compute/scan/finalization remainder, even after error.
+        budget = self.current_operation_budget or OperationBudget(self.budget_limits.working_timeout_ms / 1000)
+        with database_deadline(lambda: budget if self.current_database_deadline else None,
+                on_deadline=lambda: budget):
+            return self._record_worker_error(aggregate_id, code, budget)
+
+    def _record_worker_error(self, aggregate_id, code, budget):
+        try:
+            self.uow.rollback()
+            budget.check()
+            execution = self._execution_service()
+            aggregate, schedule = execution._locked(aggregate_id, budget)
+            if (self.current_execution_generation is not None
+                    and schedule.execution_generation != self.current_execution_generation):
+                self.uow.rollback()
+                return
+            if self.current_window is not None:
+                self.repository.read_budget(budget.milliseconds())
+                if self.repository.closure_at(*self.current_window) is not None:
+                    self.uow.rollback()
+                    return
+            self.repository.read_budget(budget.milliseconds())
+            aggregate.last_error, aggregate.last_error_at = code, self.repository.execution_now()
+            self.repository.read_budget(budget.milliseconds())
+            budget.check()
+            self.uow.commit()
+        except (EventTimeBudgetError, DBAPIError, DomainError, DatabaseDeadlineExceeded):
+            self.uow.rollback()
+            LOGGER.warning("aggregate_worker_metadata_not_recorded", extra={"aggregate_id": str(aggregate_id)})
+        except Exception:
+            self.uow.rollback()
+            LOGGER.exception("aggregate_worker_metadata_unconfirmed", extra={"aggregate_id": str(aggregate_id)})
 
     @guarded
-    def advance(self, aggregate_id):
-        return self._execution_service().advance(aggregate_id)
+    def advance(self, aggregate_id, *, execution_started=None):
+        execution = self._execution_service()
+        try:
+            return execution.advance(aggregate_id, execution_started=execution_started)
+        except EventTimeBudgetError as error:
+            if error.factor == "operation_seconds":
+                raise DomainError("aggregate_retry_required", "Служебное завершение требует повторного чтения", 503) from error
+            raise
+        finally:
+            self.current_operation_budget = execution.current_operation_budget
+            self.current_execution_generation = execution.current_execution_generation
+            self.current_window = execution.current_window
+            self.current_database_deadline = execution.database_deadline_enabled
 
     @guarded
     def historical(self, aggregate_id, body):
@@ -386,23 +509,29 @@ class AggregateService:
 
     @guarded
     def point_at(self, aggregate_id, index):
-        aggregate, schedule = self._get(aggregate_id)
-        closure = self.repository.closure_at(schedule.id, index)
-        if closure is None:
-            raise DomainError("canonical_point_not_ready", "Окно ещё не рассчитано", 409)
-        return self._saved_point(aggregate, closure)
+        # Materialize closure, payload, metadata and the complete DTO from one
+        # snapshot while automatic GC may commit in another transaction.
+        with self.uow.read_snapshot():
+            aggregate, schedule = self._get(aggregate_id)
+            closure = self.repository.closure_at(schedule.id, index)
+            if closure is None:
+                raise DomainError("canonical_point_not_ready", "Окно ещё не рассчитано", 409)
+            return self._saved_point(aggregate, closure)
 
     @guarded
     def point_by_id(self, aggregate_id, point_id):
-        aggregate, _ = self._get(aggregate_id)
-        closure = self.repository.closure_by_id(point_id)
-        if closure is None or closure.aggregate_id != aggregate.id:
-            raise DomainError("aggregate_point_not_found", "Точка не найдена", 404)
-        return self._saved_point(aggregate, closure)
+        with self.uow.read_snapshot():
+            aggregate, _ = self._get(aggregate_id)
+            closure = self.repository.closure_by_id(point_id)
+            if closure is None or closure.aggregate_id != aggregate.id:
+                raise DomainError("aggregate_point_not_found", "Точка не найдена", 404)
+            return self._saved_point(aggregate, closure)
 
     def _saved_point(self, aggregate, closure):
         if closure.payload_state == "cleared":
             raise DomainError("aggregate_point_cleared", "Данные точки очищены", 410,
                 {"origin_point_id": str(closure.origin_point_id), "window_index": closure.window_index,
-                 "time_basis": closure.time_basis, "origin": closure.origin})
+                 "time_basis": closure.time_basis, "origin": closure.origin,
+                 "cleared_at": closure.cleared_at.isoformat() if closure.cleared_at else None,
+                 "clear_reason": closure.clear_reason, "clear_policy_version": closure.clear_policy_version})
         return self._point(aggregate, self.repository.payload(closure))

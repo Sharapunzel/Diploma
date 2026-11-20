@@ -3,7 +3,16 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +23,12 @@ class AggregateClosure(Base):
     __tablename__ = "aggregate_closures"
     __table_args__ = (
         UniqueConstraint("schedule_id", "window_index", name="uq_closure_canonical"),
+        CheckConstraint("(calculation_status='computed' AND calculation_reason IS NULL) OR "
+            "(calculation_status='uncomputed' AND calculation_reason IS NOT NULL AND calculation_reason='execution_budget_exceeded')", name="calculation_valid"),
+        CheckConstraint("(calculation_status='computed' AND snapshot_reference_at IS NOT NULL) OR "
+            "(calculation_status='uncomputed' AND snapshot_reference_at IS NULL AND execution IS NOT NULL AND jsonb_typeof(execution)='object')", name="calculation_snapshot_valid"),
+        Index("ix_closure_retention_present", "aggregate_id", "window_index", "origin_point_id",
+            postgresql_where=text("payload_state = 'present' AND time_basis = 'event_time'")),
         {"schema": "logs"},
     )
     origin_point_id: Mapped[UUID] = mapped_column(primary_key=True)
@@ -25,16 +40,26 @@ class AggregateClosure(Base):
     end_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     time_basis: Mapped[str] = mapped_column(Text)
     origin: Mapped[str] = mapped_column(Text)
-    snapshot_reference_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    snapshot_reference_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     close_not_before_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payload_state: Mapped[str] = mapped_column(Text)
     point_kind: Mapped[str] = mapped_column(Text)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    clear_reason: Mapped[str | None] = mapped_column(Text)
+    clear_policy_version: Mapped[str | None] = mapped_column(Text)
+    calculation_status: Mapped[str] = mapped_column(Text, default="computed", server_default="computed")
+    calculation_reason: Mapped[str | None] = mapped_column(Text)
+    execution: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class AggregateMembership(Base):
     __tablename__ = "aggregate_memberships"
-    __table_args__ = ({"schema": "logs"},)
+    __table_args__ = (
+        Index("ix_membership_retention_remaining", "closure_id", "event_id",
+            postgresql_where=text("fingerprint IS NOT NULL OR event_time IS NOT NULL")),
+        {"schema": "logs"},
+    )
     closure_id: Mapped[UUID] = mapped_column(ForeignKey("logs.aggregate_closures.origin_point_id", ondelete="RESTRICT"), primary_key=True)
     event_id: Mapped[UUID] = mapped_column(primary_key=True)
     event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

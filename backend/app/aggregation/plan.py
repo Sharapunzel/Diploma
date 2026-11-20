@@ -13,6 +13,34 @@ class CalculationPlan:
     outputs: tuple[str, ...]
 
 
+def statistic_signature(feature):
+    """A value array is shared by all exact operations on the same inputs."""
+    definition = feature.model_dump(exclude_none=True)
+    definition.pop("key", None)
+    definition.pop("name", None)
+    if feature.op in {"median", "percentile", "mode_count", "mode_share"}:
+        definition["op"] = "exact_values"
+        definition.pop("percentile", None)
+    return json.dumps(definition, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def statistic_indices(compiled):
+    seen, indices = {}, {}
+    for index, feature in enumerate(compiled.calculation_features):
+        if feature.op != "derive":
+            signature = statistic_signature(feature)
+            indices[feature.key] = seen.setdefault(signature, index)
+    return indices
+
+
+def shared_input_columns(compiled):
+    signatures = {json.dumps(node.model_dump(exclude_none=True) if node else None,
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        for node in [compiled.rule.where,
+            *(feature.where for feature in compiled.calculation_features if feature.op != "derive")]}
+    return 2 + 4 * len(compiled.fields) + 2 * len(signatures)
+
+
 def plan_metrics(plan: CalculationPlan, where, fields):
     """Charge the lowered operations; input shape/depth was already validated.
 

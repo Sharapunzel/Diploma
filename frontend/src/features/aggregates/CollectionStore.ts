@@ -46,6 +46,16 @@ export class CollectionStore<T> {
       }
     });
   }
+  /** A confirmed cleanup makes the previously cached payload unsafe to display. */
+  clear({ preserveOffset = false }: { preserveOffset?: boolean } = {}) {
+    this.lifecycle.cancel("load");
+    this.lifecycle.cancel("page");
+    this.items = [];
+    this.total = 0;
+    if (!preserveOffset) this.offset = 0;
+    this.loaded = false;
+    this.error = null;
+  }
   dispose() {
     this.lifecycle.dispose();
     this.items = [];

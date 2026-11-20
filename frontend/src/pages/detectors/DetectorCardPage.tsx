@@ -60,6 +60,8 @@ export const DetectorCardPage = observer(() => {
   const canStart =
     c &&
     c.aggregate_state === "active" &&
+    c.aggregate_execution_mode === "current" &&
+    !c.aggregate_paused &&
     ["created", "stopped", "failed"].includes(c.execution_state);
   const canStop =
     c && ["requested", "starting", "running"].includes(c.execution_state);
@@ -142,9 +144,21 @@ export const DetectorCardPage = observer(() => {
                   )}
                 </div>
               )}
-              {c.execution_state === "terminated" && (
+              {c.aggregate_execution_mode === "retired" ? (
+                <p>
+                  Прежний расчёт остановлен. Модель и история сохранены для
+                  чтения. Для новой работы создайте копию агрегата с событийным
+                  временем и отдельный детектор.
+                </p>
+              ) : c.execution_state === "terminated" ? (
                 <p>Агрегат удалён: возобновление невозможно.</p>
-              )}
+              ) : c.aggregate_paused ? (
+                <p>
+                  Агрегат на паузе: сначала продолжите его в разделе агрегатов.
+                  Модель и позиция сохранены. Остановленный вручную детектор
+                  после продолжения агрегата сам не запустится.
+                </p>
+              ) : null}
               {!canStart && !canStop && c.aggregate_state !== "active" && (
                 <p>Для нового запуска нужен активный агрегат.</p>
               )}
@@ -156,6 +170,16 @@ export const DetectorCardPage = observer(() => {
               </Link>
               <p>
                 {aggregateStates[c.aggregate_state]} · {c.source_name}
+              </p>
+              <p>
+                {c.aggregate_semantic_basis === "event_time"
+                  ? "Событийное время ECS @timestamp"
+                  : "Прежнее основание времени доступности"}
+                {c.aggregate_execution_mode === "retired"
+                  ? " · Прежний расчёт остановлен"
+                  : c.aggregate_paused
+                    ? " · Пауза"
+                    : ""}
               </p>
               <p>
                 Окно: {exact(c.duration_seconds)} с. UTC-основание:{" "}
@@ -262,7 +286,21 @@ export const DetectorCardPage = observer(() => {
               {c.lag_seconds !== null && " с"}.
             </p>
             <p>
-              Следующий срок: <Time value={c.next_scheduled_at} zone={zone} />.
+              Следующий номинальный конец окна:{" "}
+              <Time value={c.next_scheduled_at} zone={zone} />.
+            </p>
+            <p>
+              Следующее закрытие не раньше:{" "}
+              <Time value={c.next_close_not_before_at} zone={zone} />.
+            </p>
+            <p>
+              Для событийного онлайн-окна срок равен концу окна плюс меньшему из
+              длительности окна и 300 секунд. Штатное ожидание до срока не
+              является вычислительным отставанием; пауза и перезапуск не
+              начинают ожидание заново. Очередь и задержка показаны по серверным
+              данным после этого срока.
+            </p>
+            <p>
               Ожидание точки:{" "}
               {c.waiting_for_point === null
                 ? "Нет значения"
@@ -273,9 +311,13 @@ export const DetectorCardPage = observer(() => {
             </p>
             {c.recovery ? (
               <p>
-                {c.recovery.reason === "crash_recovery"
-                  ? "Аварийное восстановление"
-                  : "Ручное возобновление"}
+                {
+                  {
+                    crash_recovery: "Аварийное восстановление",
+                    manual_resume: "Ручное возобновление детектора",
+                    aggregate_resume: "Продолжение агрегата после паузы",
+                  }[c.recovery.reason]
+                }
                 : индексы {exact(c.recovery.first_index)} —{" "}
                 {exact(c.recovery.last_index)};{" "}
                 <Time value={c.recovery.started_at} zone={zone} />.

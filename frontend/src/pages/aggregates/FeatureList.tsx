@@ -188,8 +188,10 @@ export function FeatureList({
                 </div>
               </div>
               <p className={styles.featureDetail}>
-                {refs(f.expr ?? null).length ? "Производный" : "Первичный"} ·{" "}
-                {String(f.key)} ·{" "}
+                {group === "auxiliary" && "Вспомогательный признак · "}
+                {refs(f.expr ?? null).length
+                  ? "Производный"
+                  : "Первичный"} · {String(f.key)} ·{" "}
                 <span className={styles.formula}>{formula(f)}</span>
               </p>
               {dependencies.length > 0 && !readOnly && (

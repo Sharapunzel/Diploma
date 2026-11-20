@@ -83,7 +83,7 @@ export const DetectorCreatePage = observer(() => {
         <label className={styles.field}>
           <FieldLabel
             label="Активный агрегат"
-            help="Сохранённое правило собственного источника задаёт длительность окна и порядок признаков. Показаны первые 10 активных агрегатов; введите часть имени для поиска по всему каталогу."
+            help="Сохранённое правило собственного источника задаёт длительность окна и порядок признаков. Показаны первые 10 активных агрегатов; введите часть имени для поиска по всему каталогу. Прежний остановленный расчёт недоступен; паузу или очистку нужно завершить в карточке агрегата."
           />
           <Select
             aria-label="Активный агрегат"
@@ -114,6 +114,18 @@ export const DetectorCreatePage = observer(() => {
                 title: a.name,
                 label: `${a.name} — ${a.source_name}`,
                 sourceName: a.source_name,
+                disabled:
+                  a.execution_mode !== "current" ||
+                  a.paused ||
+                  !!a.active_cleanup_id,
+                unavailable:
+                  a.execution_mode === "retired"
+                    ? "Прежний расчёт остановлен — создайте копию"
+                    : a.paused
+                      ? "Агрегат на паузе"
+                      : a.active_cleanup_id
+                        ? "Идёт очистка истории"
+                        : "",
               }))}
             labelRender={(option) =>
               s.selected?.id === option.value ? s.selected.name : option.label
@@ -122,6 +134,9 @@ export const DetectorCreatePage = observer(() => {
               <div className={styles.cell}>
                 <span>{option.data.title}</span>
                 <small>Источник: {option.data.sourceName}</small>
+                {option.data.unavailable && (
+                  <small>{option.data.unavailable}</small>
+                )}
               </div>
             )}
             onChange={(v) => {
@@ -156,8 +171,9 @@ export const DetectorCreatePage = observer(() => {
           </p>
         )}
         <p>
-          Поиск охватывает весь каталог; архивные и удалённые агрегаты
-          недоступны для выбора. Если активных нет,{" "}
+          Поиск охватывает весь каталог активных агрегатов. Архивные и удалённые
+          недоступны; прежний расчёт, пауза и очистка отмечаются отдельно. Если
+          подходящих нет,{" "}
           <Link to="/aggregates">создайте или возобновите агрегат</Link>.
         </p>
         {s.selected && (
@@ -165,6 +181,11 @@ export const DetectorCreatePage = observer(() => {
             <p>Агрегат: {s.selected.name}</p>
             <p>Источник: {s.selected.source_name}</p>
             <p>Длительность: {s.selected.duration_seconds} с</p>
+            <p>
+              {s.selected.semantic_basis === "event_time"
+                ? "Окна по ECS @timestamp"
+                : "Прежнее основание времени доступности"}
+            </p>
             <p>Закреплённые признаки:</p>
             <ol>
               {Array.isArray(s.selected.aggregate_rule.features) &&

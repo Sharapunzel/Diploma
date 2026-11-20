@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from functools import wraps
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, text
+from sqlalchemy import DateTime, case, func, select, text
 from sqlalchemy.orm import defer
 
 from ...detection.contracts import DetectionError, StaleCandidate, digest
@@ -154,10 +154,15 @@ class SqlAlchemyDetectorRepository:
     def public_result(self, detector_id, index):
         if index is None:
             return None
+        # A refused attempt has no snapshot reference. Its independently
+        # recorded attempt start is available without inventing such a boundary.
+        aggregation_started = case((AggregateClosure.calculation_status == "uncomputed",
+            AggregateClosure.execution["started_at"].astext.cast(DateTime(timezone=True))),
+            else_=AggregateClosure.snapshot_reference_at)
         row = self.session.execute(select(DetectorOutcome.window_index.label("index"),
             DetectorOutcome.kind, DetectorOutcome.reason, AggregateClosure.start_utc,
             AggregateClosure.end_utc, AggregateClosure.end_utc.label("scheduled_at"),
-            AggregateClosure.snapshot_reference_at.label("aggregation_started_at"),
+            aggregation_started.label("aggregation_started_at"),
             AggregateClosure.closed_at.label("aggregation_completed_at"),
             AggregateClosure.time_basis, AggregateClosure.origin, AggregateClosure.close_not_before_at,
             DetectorOutcome.data["actual_started_at"].astext.label("evaluation_started_at"),
@@ -346,6 +351,15 @@ class SqlAlchemyDetectorRepository:
             query = query.where(WorkingWindowPoint.window_index > after_index)
         rows = self._points(query.order_by(WorkingWindowPoint.window_index).limit(1))
         return rows[0] if rows else None
+
+    def validate_working_context(self, context):
+        """Reject an already-stale cursor before loading its removable payload."""
+        old = context["detector"]
+        row = self.session.execute(select(Detector.revision, Detector.consumed_index,
+            Detector.evaluation_start_index, Detector.execution_generation, Detector.execution_state)
+            .where(Detector.id == old["id"])).mappings().first()
+        if row is None or any(row[key] != old[key] for key in row):
+            raise StaleCandidate("stale_detector_candidate")
 
     def working_inputs(self, schedule_id, starts, before_read=None):
         query = select(WorkingWindowPoint).where(

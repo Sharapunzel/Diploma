@@ -20,6 +20,7 @@ import { chartSeries } from "./chart";
 import { displayTime } from "./time";
 import { CollectionStore } from "./CollectionStore";
 import { CardStore } from "./CardStore";
+import { aggregateFixture } from "../../app/api/aggregateTestData";
 
 const operators = [
   { name: "count", kind: "feature", parameters: [] },
@@ -165,19 +166,13 @@ describe("aggregate transport and draft", () => {
   });
   it("decodes responses losslessly and sends numeric wire values through the existing CSRF client", async () => {
     const card = {
-      id: "id",
+      ...aggregateFixture(),
       name: "N",
-      source_id: "s",
       source_name: "S",
       source_type: "kafka",
       rule_hash: "a",
-      anchor_utc: "t",
-      original_boundary: "t",
       timezone: "UTC",
-      created_at: "t",
-      created_by: "u",
       state: "active",
-      next_scheduled_at: "t",
       duration_seconds: 300,
       skipped_ranges: [],
       aggregate_rule: parseAggregate(

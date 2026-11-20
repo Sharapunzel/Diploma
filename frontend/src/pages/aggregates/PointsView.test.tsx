@@ -13,6 +13,7 @@ import { parseAggregate } from "../../app/api/aggregateJson";
 import { AppStores } from "../../app/stores/AppStores";
 import { StoresProvider } from "../../app/providers/StoresProvider";
 import { PointsView } from "./PointsView";
+import { uncomputedPointFixture } from "../../app/api/aggregateTestData";
 
 const owned: AppStores[] = [];
 afterEach(() => {
@@ -24,7 +25,12 @@ function point(id: string, start: number, value = "1"): Point {
   const minute = (n: number) =>
     `2026-01-01T00:${String(n).padStart(2, "0")}:00Z`;
   return {
+    calculation_status: "computed",
+    calculation_reason: null,
+    execution: null,
     id,
+    aggregate_id: "aggregate",
+    evidence_refs: {},
     kind: "working",
     start_utc: minute(start),
     end_utc: minute(start + 1),
@@ -33,7 +39,13 @@ function point(id: string, start: number, value = "1"): Point {
     actual_completed_at: minute(start + 1),
     completeness: "complete",
     completeness_reason: "confirmed",
-    time_basis: "availability_at",
+    time_basis: "event_time",
+    origin: "online",
+    window_index: start,
+    payload_state: "present",
+    snapshot_reference_at: minute(start + 1),
+    close_not_before_at: minute(start + 1),
+    snapshot_metadata: { delivery_coverage: "not_attested" },
     event_count: 1,
     event_time_min: null,
     event_time_max: null,
@@ -55,6 +67,8 @@ function setup(
     historicalPoint?: Point | null;
     selectionKey?: string;
     refresh?: number;
+    clearedVersion?: number;
+    clearVersion?: number;
   } = {},
 ) {
   const stores = new AppStores();
@@ -94,6 +108,76 @@ function setup(
   };
 }
 
+it("keeps a terminal budget window visible without values, a false zero or snapshot", async () => {
+  const terminal = uncomputedPointFixture({ id: "budget" });
+  setup([terminal]);
+  await screen.findByRole("button", { name: "Выбрать точку budget" });
+  expect(screen.getByRole("cell", { name: /Не рассчитано/ })).toBeTruthy();
+  expect(screen.queryByRole("img", { name: /^График/ })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Выбрать точку budget" }));
+  const details = within(
+    screen.getByRole("region", { name: "Подробности выбранной точки" }),
+  );
+  expect(details.getByText(/автоматического пересчёта нет/)).toBeTruthy();
+  expect(details.queryByText(/Диапазон ECS @timestamp/)).toBeNull();
+  expect(details.queryByText(/Момент снимка/)).toBeNull();
+  expect(details.queryByRole("table")).toBeNull();
+});
+
+it("discards confirmed-cleaned cached payload even when refreshing the remaining points fails", async () => {
+  const { request, rerender } = setup([
+    point("cleared", 0, "9007199254740993"),
+  ]);
+  await screen.findByRole("button", { name: "Выбрать точку cleared" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Выбрать точку cleared" }),
+  );
+  request.mockRejectedValueOnce(new Error("synthetic read failure"));
+  rerender({ clearedVersion: 1 });
+  await screen.findByText("Список точек недоступен");
+  expect(
+    screen.queryByRole("button", { name: "Выбрать точку cleared" }),
+  ).toBeNull();
+  expect(screen.queryByText("9007199254740993", { exact: true })).toBeNull();
+  expect(
+    screen.queryByRole("region", { name: "Подробности выбранной точки" }),
+  ).toBeNull();
+  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(screen.getByText("Список точек недоступен")).toBeTruthy();
+});
+
+it("clears stale payload before reading refreshed history and keeps the current server page", async () => {
+  const { request, rerender } = setup([
+    point("a", 0),
+    point("b", 1),
+    point("c", 2),
+    point("d", 3),
+    point("e", 4),
+  ]);
+  await screen.findByRole("button", { name: "Выбрать точку a" });
+  fireEvent.click(screen.getByTitle("2"));
+  await screen.findByRole("button", { name: "Выбрать точку d" });
+  fireEvent.click(screen.getByRole("button", { name: "Выбрать точку d" }));
+  const reads = request.mock.calls.length;
+  request.mockResolvedValueOnce({ items: [point("remaining", 5)], total: 4 });
+  rerender({ clearVersion: 1 });
+  await screen.findByText(
+    "На загруженной странице пока нет сохранённых точек.",
+  );
+  expect(screen.queryByRole("button", { name: "Выбрать точку d" })).toBeNull();
+  expect(
+    screen.queryByRole("region", { name: "Подробности выбранной точки" }),
+  ).toBeNull();
+  expect(request).toHaveBeenCalledTimes(reads);
+  rerender({ clearVersion: 1, clearedVersion: 1 });
+  await screen.findByRole("button", { name: "Выбрать точку remaining" });
+  expect(request).toHaveBeenCalledTimes(reads + 1);
+  expect(request).toHaveBeenLastCalledWith(
+    "/aggregates/aggregate/points?limit=3&offset=3",
+    expect.anything(),
+  );
+});
+
 it("requests three history rows per server page and keeps exact values in the table", async () => {
   const { request } = setup([
     point("a", 0, "9007199254740993"),
@@ -111,7 +195,9 @@ it("requests three history rows per server page and keeps exact values in the ta
     expect.anything(),
   );
   expect(screen.getByText("9007199254740993", { exact: true })).toBeTruthy();
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   expect(
     screen.queryByRole("button", { name: "Показать окна текущей страницы" }),
   ).toBeNull();
@@ -125,14 +211,18 @@ it("requests three history rows per server page and keeps exact values in the ta
     "/aggregates/aggregate/points?limit=3&offset=3",
     expect.anything(),
   );
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Выбрать точку d" }));
   const details = await screen.findByRole("region", {
     name: "Подробности выбранной точки",
   });
   expect(details.textContent).toContain("2026-01-01T00:03:00Z");
   expect(details.textContent).toContain("2026-01-01T00:04:00Z");
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
 });
 
 it("summarizes three outputs and opens all exact values, reasons and counts through the remaining-features action", async () => {
@@ -195,7 +285,9 @@ it("summarizes three outputs and opens all exact values, reasons and counts thro
   ).toBeTruthy();
   const precise = within(details.getByRole("row", { name: /^precise / }));
   expect(precise.getByRole("cell", { name: "2" })).toBeTruthy();
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График zero загруженной страницы" }),
+  ).toBeTruthy();
 });
 
 it("uses the calculated window's real time axis and never invents a connecting line for one point", async () => {
@@ -334,7 +426,9 @@ it("shows the returned historical window and clears it when its date or result i
     { selectionKey: historical.start_utc },
   );
   await screen.findByRole("button", { name: "Выбрать точку a" });
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   rerender({ selectionKey: historical.start_utc, historicalPoint: historical });
   await screen.findByRole("img", { name: "График n выбранного окна" });
   expect(screen.getByLabelText("Границы временной оси").textContent).toContain(
@@ -364,17 +458,25 @@ it("shows the returned historical window and clears it when its date or result i
     selectionKey: "2026-01-01T00:12:00Z",
     historicalPoint: historical,
   });
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   rerender({ selectionKey: "", historicalPoint: historical });
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   expect(
     screen.queryByRole("region", { name: "Подробности выбранной точки" }),
   ).toBeNull();
   rerender({ selectionKey: "", historicalPoint: { ...historical } });
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   const next = { ...point("next", 12, "7"), kind: "historical" };
   rerender({ selectionKey: next.start_utc, historicalPoint: null });
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
   rerender({ selectionKey: next.start_utc, historicalPoint: next });
   await screen.findByRole("img", { name: "График n выбранного окна" });
   expect(screen.getByLabelText("Границы временной оси").textContent).toContain(
@@ -384,5 +486,7 @@ it("shows the returned historical window and clears it when its date or result i
     screen.getByLabelText("Границы временной оси").textContent,
   ).not.toContain(historical.start_utc);
   rerender({ selectionKey: next.start_utc, historicalPoint: null });
-  expect(screen.queryByRole("img", { name: /^График n / })).toBeNull();
+  expect(
+    screen.getByRole("img", { name: "График n загруженной страницы" }),
+  ).toBeTruthy();
 });

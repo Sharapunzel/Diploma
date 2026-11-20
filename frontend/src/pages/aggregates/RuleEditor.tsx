@@ -27,7 +27,12 @@ import {
 import styles from "./Aggregates.module.css";
 import { FeatureList } from "./FeatureList";
 import { ExpressionInputs } from "./ExpressionInputs";
-import { FieldLabel, OperationSelect, operationLabel } from "./AggregateHelp";
+import {
+  FieldLabel,
+  Help,
+  OperationSelect,
+  operationLabel,
+} from "./AggregateHelp";
 
 type Props = {
   rule: JsonObject;
@@ -57,6 +62,9 @@ export function RuleEditor({
   } | null>(null);
   const [invalid, setInvalid] = useState(new Set<string>());
   const [error, setError] = useState("");
+  const [operationDrafts, setOperationDrafts] = useState<
+    Record<string, JsonObject>
+  >({});
   const modalInvalid = useCallback(
     (id: string, bad: boolean) =>
       setInvalid((old) => {
@@ -68,6 +76,7 @@ export function RuleEditor({
     [],
   );
   const context = { api, source, operators };
+  const [previousEdit, setPreviousEdit] = useState<JsonObject | null>(null);
   const all = definitions(rule);
   const changeRule = (next: JsonObject) => {
     assertVisualReferences(rule, next);
@@ -83,6 +92,8 @@ export function RuleEditor({
   ) => {
     setInvalid(new Set());
     setError("");
+    setPreviousEdit(null);
+    setOperationDrafts({});
     setEdit({
       group,
       index,
@@ -92,8 +103,10 @@ export function RuleEditor({
       alternate: null,
     });
   };
-  const update = (value: JsonObject) =>
+  const update = (value: JsonObject) => {
+    if (edit) setPreviousEdit(clone(edit.value));
     setEdit((e) => (e ? { ...e, value } : e));
+  };
   const add = (derived: boolean) => {
     let n = 1;
     while (all.some((f) => f.key === `feature_${n}`)) n++;
@@ -189,7 +202,7 @@ export function RuleEditor({
       )}
       {readOnly && rule.where != null && (
         <section className={styles.node}>
-          <h4>Общий отбор событий</h4>
+          <h4>Отбор событий для всего агрегата</h4>
           <pre className={styles.code}>{printAggregate(rule.where, true)}</pre>
         </section>
       )}
@@ -236,7 +249,13 @@ export function RuleEditor({
                 </dl>
               </section>
               <section className={styles.modalTile}>
-                <h3>2. Входы</h3>
+                <h3 aria-label="2. Входные данные">
+                  2. Входные данные{" "}
+                  <Help
+                    name="Входные данные"
+                    text="Из чего вычисляется признак: поля своего источника, а для производного — готовые выходные и вспомогательные признаки. Count не требует поля. Разным агрегирующим листьям можно назначить разные поля."
+                  />
+                </h3>
                 <p>
                   {edit.derived
                     ? `Именованные входы: ${refs(edit.value.expr ?? null).join(", ")}`
@@ -244,7 +263,13 @@ export function RuleEditor({
                 </p>
               </section>
               <section className={styles.modalTile}>
-                <h3>3. Операции и условия</h3>
+                <h3 aria-label="3. Операции и отбор">
+                  3. Операции и отбор{" "}
+                  <Help
+                    name="Операции и отбор"
+                    text="Как вычислять итог: операции и параметры каждого входа, арифметическое дерево и условия. Например sum(source.bytes)/sum(destination.bytes) — отношение сумм окна, без построчной арифметики. Общий where, условие признака и листа сочетаются через И; ссылка берёт готовое значение со своими условиями."
+                  />
+                </h3>
                 <pre className={styles.code}>
                   {printAggregate(edit.value, true)}
                 </pre>
@@ -313,15 +338,20 @@ export function RuleEditor({
                   </div>
                 </section>
                 <section className={styles.modalTile}>
-                  <h3>2. Входы</h3>
+                  <h3 aria-label="2. Входные данные">
+                    2. Входные данные{" "}
+                    <Help
+                      name="Входные данные"
+                      text="Из чего вычисляется признак: поля своего источника, а для производного — готовые выходные и вспомогательные признаки. Count не требует поля. Разным агрегирующим листьям можно назначить разные поля."
+                    />
+                  </h3>
                   <p className={styles.notice}>
-                    Входы заменяют формулу черновика либо добавляются к ней с
-                    операцией «+». Арифметика выполняется над итогами одного
-                    окна.
+                    Выберите поля для листьев вычисления. Операции и состав
+                    дерева задаются ниже; оба блока редактируют один черновик.
                   </p>
                   <ExpressionInputs
-                    key={String(edit.derived)}
                     context={context}
+                    value={edit.value}
                     references={
                       edit.derived
                         ? all
@@ -329,46 +359,23 @@ export function RuleEditor({
                             .map((f) => String(f.key))
                         : []
                     }
-                    onUse={(expr) =>
-                      update({
-                        key: edit.value.key,
-                        name: edit.value.name,
-                        op: "formula",
-                        expr,
-                        ...(edit.value.where != null
-                          ? { where: edit.value.where }
-                          : {}),
-                      })
-                    }
-                    onAppend={(input) => {
-                      const { key, name } = edit.value;
-                      const aggregate = Object.fromEntries(
-                        Object.entries(edit.value).filter(([k]) =>
-                          ["op", "field", "percentile"].includes(k),
-                        ),
-                      );
-                      const previous = object(edit.value.expr)
-                        ? edit.value.expr
-                        : { aggregate };
-                      update({
-                        key,
-                        name,
-                        op: "formula",
-                        expr: { op: "add", args: [previous, input] },
-                        ...(edit.value.where != null
-                          ? { where: edit.value.where }
-                          : {}),
-                      });
-                    }}
+                    onChange={update}
                   />
                 </section>
                 <section className={styles.modalTile}>
-                  <h3>3. Операции и условия</h3>
+                  <h3 aria-label="3. Операции и отбор">
+                    3. Операции и отбор{" "}
+                    <Help
+                      name="Операции и отбор"
+                      text="Как вычислять итог: операции и параметры каждого входа, арифметическое дерево и условия. Например sum(source.bytes)/sum(destination.bytes) — отношение сумм окна, без построчной арифметики. Общий where, условие признака и листа сочетаются через И; ссылка берёт готовое значение со своими условиями."
+                    />
+                  </h3>
                   <p className={styles.notice}>
                     Настройте операции, их параметры и порядок вычислений.
                   </p>
                   <OperationSelect
                     label="Способ вычисления"
+                    name="Операция входа"
                     value={String(edit.value.op)}
                     options={operators
                       .filter(
@@ -381,21 +388,34 @@ export function RuleEditor({
                         name: o.name,
                         label: operationLabel(o.name),
                       }))}
-                    onChange={(op) =>
+                    onChange={(op) => {
+                      setOperationDrafts((drafts) => ({
+                        ...drafts,
+                        [String(edit.value.op)]: clone(edit.value),
+                      }));
                       update({
-                        ...defaultNode(
-                          operators.find(
-                            (o) => o.kind === "feature" && o.name === op,
-                          )!,
-                        ),
+                        ...(operationDrafts[op] ??
+                          defaultNode(
+                            operators.find(
+                              (o) => o.kind === "feature" && o.name === op,
+                            )!,
+                          )),
                         key: edit.value.key,
                         name: edit.value.name,
                         ...(edit.value.where != null
                           ? { where: edit.value.where }
                           : {}),
-                      })
-                    }
+                      });
+                    }}
                   />
+                  {Object.keys(operationDrafts).length > 0 && (
+                    <p role="status">
+                      Предыдущие способы вычисления сохранены в этом черновике.
+                      Выберите прежний способ, чтобы вернуть его дерево, или
+                      отмените изменение. Применение признака заменит основное
+                      правило.
+                    </p>
+                  )}
                   {["formula", "derive"].includes(String(edit.value.op)) &&
                   object(edit.value.expr) ? (
                     <>
@@ -405,6 +425,7 @@ export function RuleEditor({
                         context={{
                           ...context,
                           aggregateLeaves: edit.value.op === "formula",
+                          inputsSeparate: true,
                         }}
                         previous={
                           edit.derived
@@ -444,7 +465,8 @@ export function RuleEditor({
                   ) : (
                     <AggregateLeaf
                       value={edit.value}
-                      context={context}
+                      context={{ ...context, inputsSeparate: true }}
+                      hideOperation
                       path="feature"
                       onChange={(v) =>
                         update({
@@ -466,6 +488,16 @@ export function RuleEditor({
                     после предварительного расчёта на сервере.
                   </p>
                 </section>
+                {previousEdit && (
+                  <Button
+                    onClick={() => {
+                      update(previousEdit);
+                      setPreviousEdit(null);
+                    }}
+                  >
+                    Отменить последнее изменение признака
+                  </Button>
+                )}
                 {error && (
                   <Alert
                     type="error"

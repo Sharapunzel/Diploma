@@ -7,14 +7,14 @@ import {
 import { parse, stringify } from "lossless-json";
 
 const configPath = process.env.AGGREGATE_BROWSER_CONFIG;
+type SourceFixture = { sources: string[]; anchor: string };
 type Config = {
   username: string;
   password: string;
-  sources: string[];
   empty_source: string;
-  anchor: string;
   result: string;
-};
+  saved_window?: SourceFixture;
+} & SourceFixture;
 export const config: Config | null = configPath
   ? JSON.parse(readFileSync(configPath, "utf8"))
   : null;
@@ -71,7 +71,9 @@ test.afterEach(async ({ page }) => {
     for (const aggregate of pageData.items) {
       if (
         aggregate.created_by === session.user.id &&
-        config.sources.includes(aggregate.source_id) &&
+        [...config.sources, ...(config.saved_window?.sources ?? [])].includes(
+          aggregate.source_id,
+        ) &&
         aggregate.state === "active"
       ) {
         const archived = await page.request.post(
@@ -98,24 +100,29 @@ export async function login(page: Page) {
     page.getByRole("button", { name: "Создать агрегат", exact: true }),
   ).toBeVisible();
 }
-export async function fillBase(page: Page, name: string, sourceIndex = 0) {
+export async function fillBase(
+  page: Page,
+  name: string,
+  sourceIndex = 0,
+  fixture: SourceFixture = config!,
+) {
   await page.getByLabel("Имя агрегата", { exact: true }).fill(name);
   await page
     .getByRole("combobox", { name: "Собственный источник", exact: true })
     .click();
   const response = await page.request.get("/api/v1/sources?limit=50&offset=0");
   const source = (await response.json()).items.find(
-    (s: { id: string }) => s.id === config!.sources[sourceIndex],
+    (s: { id: string }) => s.id === fixture.sources[sourceIndex],
   );
   await page.getByTitle(source.name, { exact: true }).click();
   await page.getByLabel("Пояс отображения", { exact: true }).fill("UTC");
   await page.getByLabel("Длительность, секунды", { exact: true }).fill("1");
   await page
-    .getByLabel("Исходная граница", { exact: true })
-    .fill(calendarInputValue(config!.anchor));
+    .getByLabel("Начало истории и сетка окон", { exact: true })
+    .fill(calendarInputValue(fixture.anchor));
   await page
     .getByLabel("Начало окна для расчёта", { exact: true })
-    .fill(calendarInputValue(config!.anchor));
+    .fill(calendarInputValue(fixture.anchor));
 }
 export async function checkPreview(page: Page) {
   await page
@@ -138,6 +145,11 @@ test("real UI creates on two sources, previews, preserves exact values and origi
   page,
 }) => {
   test.setTimeout(120_000);
+  const fixture = config!.saved_window;
+  if (!fixture || fixture.sources.length !== 2) {
+    throw new Error("The saved-window fixture requires two prepared sources");
+  }
+  const expectedStart = new Date(fixture.anchor).toISOString();
   const owned: string[] = existsSync(config!.result)
     ? JSON.parse(readFileSync(config!.result, "utf8"))
     : [];
@@ -146,7 +158,7 @@ test("real UI creates on two sources, previews, preserves exact values and origi
     await page
       .getByRole("button", { name: "Создать агрегат", exact: true })
       .click();
-    await fillBase(page, `UI ${index}`, index);
+    await fillBase(page, `UI ${index}`, index, fixture);
     // The modal keeps the exact numeric draft isolated until Apply.
     if (!index) {
       await page
@@ -157,7 +169,7 @@ test("real UI creates on two sources, previews, preserves exact values and origi
         .click();
       const modal = page.getByRole("dialog");
       const method = modal.getByRole("combobox", {
-        name: "Способ вычисления",
+        name: "Операция входа",
         exact: true,
       });
       await method.focus();
@@ -210,7 +222,17 @@ test("real UI creates on two sources, previews, preserves exact values and origi
     const response = await created;
     expect(response.status()).toBe(201);
     expect(response.request().postData()).toContain("9007199254740993");
+    expect(JSON.parse(response.request().postData()!).time_basis).toBe(
+      "event_time",
+    );
     const original = await response.json();
+    expect(original.semantic_basis).toBe("event_time");
+    expect(original.execution_mode).toBe("current");
+    expect(original.source_id).toBe(fixture.sources[index]);
+    expect(original.duration_seconds).toBe(1);
+    // All possible remaining one-second windows in this test fit the
+    // 512-index reserve measured from the last closure.
+    expect(Number(original.online_start_index) + 120).toBeLessThan(512);
     const originalRule = stringify(
       (parse(await response.text()) as { aggregate_rule: unknown })
         .aggregate_rule,
@@ -221,16 +243,33 @@ test("real UI creates on two sources, previews, preserves exact values and origi
     await page
       .getByRole("button", { name: "Обновить точки", exact: true })
       .click();
+    const aggregatePath = `/api/v1/aggregates/${original.id}`;
+    let pointId = "";
     await expect
-      .poll(
-        async () =>
-          (
-            await (
-              await page.request.get(`/api/v1/aggregates/${original.id}/points`)
-            ).json()
-          ).total,
-      )
-      .toBeGreaterThan(0);
+      .poll(async () => {
+        const point = await page.request.get(
+          `${aggregatePath}/points/by-index/0`,
+          {
+            timeout: 5_000,
+          },
+        );
+        const body = await point.json();
+        if (point.status() === 409 && body.code === "canonical_point_not_ready")
+          return "";
+        expect(point.status(), "Exact archived window must have payload").toBe(
+          200,
+        );
+        expect(body).toMatchObject({
+          aggregate_id: original.id,
+          window_index: 0,
+          origin: "initial_history",
+          calculation_status: "computed",
+        });
+        expect(new Date(body.start_utc).toISOString()).toBe(expectedStart);
+        pointId = body.id;
+        return pointId;
+      })
+      .toMatch(/^[a-f\d-]{36}$/i);
     await page
       .getByRole("button", { name: "Обновить точки", exact: true })
       .click();
@@ -241,41 +280,91 @@ test("real UI creates on two sources, previews, preserves exact values and origi
     await expect(
       page.getByRole("region", { name: "Подробности выбранной точки" }),
     ).toContainText("9007199254740993");
-    await expect(page.getByRole("img", { name: /^График / })).toHaveCount(0);
+    await expect(
+      page.getByRole("img", { name: /^График .* загруженной страницы$/ }),
+    ).toBeVisible();
     await page.screenshot({
       path: test.info().outputPath(`card-${index}.png`),
       fullPage: true,
     });
     await page.getByLabel("Пояс отображения", { exact: true }).fill("UTC");
     await page
-      .getByLabel("Начало окна для дополнительного расчёта", { exact: true })
-      .fill(calendarInputValue(config!.anchor));
-    await page
-      .getByRole("button", {
-        name: "Рассчитать выбранное окно",
-        exact: true,
-      })
-      .click();
-    await expect(
-      page.getByText(
-        "Расчёт выбранного окна сохранён. Автоматическое расписание не изменено.",
-        { exact: true },
-      ),
-    ).toBeVisible();
+      .getByLabel("Начало сохранённого окна", { exact: true })
+      .fill(calendarInputValue(fixture.anchor));
+    const historicalResponse = page.waitForResponse(
+      (result) =>
+        new URL(result.url()).pathname ===
+          `${aggregatePath}/historical-points` &&
+        result.request().method() === "POST",
+      { timeout: 5_000 },
+    );
+    const notice = page.getByText(
+      "Сохранённое окно загружено. Новый расчёт не выполнялся.",
+      { exact: true },
+    );
+    await Promise.all([
+      (async () => {
+        await page
+          .getByRole("button", {
+            name: "Просмотреть сохранённое окно",
+            exact: true,
+          })
+          .click();
+        await expect(notice).toBeVisible();
+      })(),
+      (async () => {
+        const result = await historicalResponse;
+        const body = await result.json();
+        console.log(
+          "Saved aggregate window: " +
+            JSON.stringify({
+              aggregate: original.id,
+              index: 0,
+              start: expectedStart,
+              status: result.status(),
+              expectedPoint: pointId,
+              ...(result.ok()
+                ? { returnedPoint: body.id }
+                : {
+                    code: [
+                      "canonical_point_not_ready",
+                      "aggregate_point_cleared",
+                    ].includes(body.code)
+                      ? body.code
+                      : "other",
+                  }),
+            }),
+        );
+        expect(result.status()).toBe(200);
+        expect(
+          new Date(
+            result.request().postDataJSON().window_start_utc,
+          ).toISOString(),
+        ).toBe(expectedStart);
+        expect(body).toMatchObject({
+          id: pointId,
+          aggregate_id: original.id,
+          window_index: 0,
+          origin: "initial_history",
+          calculation_status: "computed",
+        });
+        expect(new Date(body.start_utc).toISOString()).toBe(expectedStart);
+      })(),
+    ]);
     await expect(
       page.getByRole("img", { name: /^График .* выбранного окна$/ }),
-    ).toHaveAttribute("data-time-low", String(Date.parse(config!.anchor)));
-    await page
-      .getByLabel("Начало окна для дополнительного расчёта", { exact: true })
-      .fill("");
-    await expect(page.getByRole("img", { name: /^График / })).toHaveCount(0);
+    ).toHaveAttribute("data-time-low", String(Date.parse(expectedStart)));
+    await page.getByLabel("Начало сохранённого окна", { exact: true }).fill("");
+    await expect(
+      page.getByRole("img", { name: /^График .* загруженной страницы$/ }),
+    ).toBeVisible();
     await page.getByRole("button", { name: "Копировать", exact: true }).click();
     await expect(page).toHaveURL(/\/aggregates\/new\?copy=/);
     await page.getByLabel("Имя агрегата", { exact: true }).fill("Копия");
     await page.getByLabel("Пояс отображения", { exact: true }).fill("UTC");
     await page
       .getByLabel("Начало окна для расчёта", { exact: true })
-      .fill(calendarInputValue(config!.anchor));
+      .fill(calendarInputValue(fixture.anchor));
     await checkPreview(page);
     const copied = page.waitForResponse(
       (r) =>
@@ -586,6 +675,15 @@ test("extended vector, separate catalog/prompt, lossless file exchange and produ
     page.getByRole("dialog").getByLabel("Формула признака"),
   ).toContainText("sum(source.bytes)");
   await inspectAggregateScreen(page, "primary-modal");
+  // The new editor binds the operation directly to its AST. Exercise keyboard
+  // selection on a separate new count draft so the imported ratio stays intact.
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Отмена", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Добавить признак", exact: true })
+    .click();
   // A searchable ECS input must keep usable width, and options explain their meaning.
   const primary = page.getByRole("dialog", { name: "Признак", exact: true });
   const operationInput = primary.getByRole("combobox", {
@@ -594,6 +692,25 @@ test("extended vector, separate catalog/prompt, lossless file exchange and produ
   });
   await operationInput.focus();
   await operationInput.press("ArrowDown");
+  const selectedCount = page.getByRole("option", {
+    name: /^Количество событий/,
+  });
+  await expect(selectedCount).toHaveAttribute("aria-selected", "true");
+  // rc-select restores the active selected option in a deferred effect on open.
+  // Wait for that browser frame before navigating; otherwise a later reset can
+  // replace sum with count between the active assertion and Enter (R39-7-1).
+  await operationInput.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
+  const selectedCountId = await selectedCount.getAttribute("id");
+  expect(selectedCountId).toBeTruthy();
+  await expect(operationInput).toHaveAttribute(
+    "aria-activedescendant",
+    selectedCountId!,
+  );
   await expect(page.getByRole("option", { name: /^Сумма / })).toContainText(
     "Сумма значений числового поля",
   );
@@ -724,10 +841,19 @@ test("extended vector, separate catalog/prompt, lossless file exchange and produ
     .getByLabel("Пояс отображения", { exact: true })
     .fill("Asia/Yekaterinburg");
   await page
-    .getByLabel("Исходная граница", { exact: true })
+    .getByLabel("Начало истории и сетка окон", { exact: true })
     .fill(
       calendarInputValue(
         new Date(Date.parse(config!.anchor) + 4 * 3600000).toISOString(),
+      ),
+    );
+  // Changing the process may propose its new first completed window. Choose
+  // explicitly the seeded event interval on the new grid, in this display zone.
+  await page
+    .getByLabel("Начало окна для расчёта", { exact: true })
+    .fill(
+      calendarInputValue(
+        new Date(Date.parse(config!.anchor) + 5 * 3600000).toISOString(),
       ),
     );
   const previewResponse = page.waitForResponse(
@@ -772,6 +898,7 @@ test("extended vector, separate catalog/prompt, lossless file exchange and produ
   expect(response.status()).toBe(201);
   const original = await response.json();
   const submitted = JSON.parse(response.request().postData()!);
+  expect(submitted.time_basis).toBe("event_time");
   expect(submitted.schedule.timezone).toBe("Asia/Yekaterinburg");
   expect(submitted.schedule.boundary).toMatch(/\+05:00$/);
   const owned = existsSync(config!.result)

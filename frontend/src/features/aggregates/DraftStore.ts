@@ -8,6 +8,8 @@ import {
   type Operator,
   type Preview,
   type Validation,
+  type ExecutionDiagnostics,
+  previewExecutionFailure,
 } from "../../app/api/aggregates";
 import { printAggregate, type JsonObject } from "../../app/api/aggregateJson";
 import { RequestLifecycle } from "../resources/RequestLifecycle";
@@ -21,6 +23,13 @@ import {
   resetDefinitionOrder,
 } from "./rule";
 import { processIssues, validInstant } from "./processValidation";
+import { selectedWindow, suggestPreviewWindow } from "./time";
+
+type CreateIntent = { body: CreateInput; key: string; signature: string };
+const createScopes = new WeakMap<
+  object,
+  { actor: string; intents: Map<string, CreateIntent> }
+>();
 
 export class DraftStore {
   name = "";
@@ -29,13 +38,14 @@ export class DraftStore {
   timezone = "UTC";
   duration = "300";
   window = "";
-  timeBasis = "availability_at";
+  timeBasis = "event_time";
   text = printAggregate(initialRule(), true);
   mode: "visual" | "json" = "visual";
   rule: JsonObject = initialRule();
   operators: Operator[] = [];
   validation: Validation | null = null;
   preview: Preview | null = null;
+  lastExecution: ExecutionDiagnostics | null = null;
   error: unknown = null;
   localError = "";
   success = "";
@@ -45,8 +55,8 @@ export class DraftStore {
   lifecycle = new RequestLifecycle();
   copyState: "none" | "loading" | "error" | "ready";
   copyError: unknown = null;
-  private retry: { body: CreateInput; key: string; signature: string } | null =
-    null;
+  private retry: CreateIntent | null = null;
+  private createIntents: Map<string, CreateIntent> | null = null;
   constructor(
     private api: AggregatesApi,
     private copyId = "",
@@ -59,10 +69,39 @@ export class DraftStore {
         rule: observable.ref,
         validation: observable.ref,
         preview: observable.ref,
+        lastExecution: observable.ref,
         retry: false,
+        createIntents: false,
       } as never,
       { autoBind: true },
     );
+  }
+  bindScope(owner: object, actor: string) {
+    let scope = createScopes.get(owner);
+    if (!scope || scope.actor !== actor) {
+      scope = { actor, intents: new Map() };
+      createScopes.set(owner, scope);
+    }
+    this.createIntents = scope.intents;
+    const intent = scope.intents.get("create");
+    if (!intent) return;
+    this.retry = intent;
+    this.unknownCreate = true;
+    this.copyState = this.copyId ? "ready" : "none";
+    this.name = intent.body.name;
+    this.source = intent.body.source_id;
+    this.boundary = intent.body.schedule.boundary;
+    this.timezone = intent.body.schedule.timezone;
+    this.duration = String(intent.body.schedule.duration_seconds);
+    this.window = intent.body.window_start_utc;
+    this.rule = clone(intent.body.aggregate_rule);
+    this.text = printAggregate(this.rule, true);
+    this.dirty = true;
+  }
+  private saveCreateIntent(inFlight = false) {
+    if (this.retry && (this.unknownCreate || inFlight))
+      this.createIntents?.set("create", this.retry);
+    else this.createIntents?.delete("create");
   }
   get busy() {
     return this.lifecycle.pending.size > 0;
@@ -130,6 +169,7 @@ export class DraftStore {
     this.dirty = true;
     this.validation = null;
     this.preview = null;
+    this.lastExecution = null;
     this.error = null;
     this.success = "";
     this.lifecycle.cancel("check");
@@ -147,8 +187,13 @@ export class DraftStore {
   ) {
     if (!this.editable || this.lifecycle.isPending("create")) return;
     if (this[key] === value) return;
+    if (key === "timeBasis" && value !== "event_time") return;
     this.invalidate();
     this[key] = value;
+    if (key === "boundary" || key === "duration")
+      this.window = validInstant(this.boundary)
+        ? suggestPreviewWindow(this.boundary, Number(this.duration))
+        : "";
     try {
       ruleDocument(this.text, this.operators);
       this.localError = "";
@@ -235,6 +280,11 @@ export class DraftStore {
     this.boundary = input.schedule.boundary;
     this.timezone = input.schedule.timezone;
     this.duration = String(input.schedule.duration_seconds);
+    this.timeBasis = "event_time";
+    this.window = suggestPreviewWindow(
+      this.boundary,
+      input.schedule.duration_seconds,
+    );
     this.rule = clone(input.aggregate_rule);
     this.setRule(clone(input.aggregate_rule));
   }
@@ -261,6 +311,7 @@ export class DraftStore {
     if (!this.editable || this.busy || this.invalidNodes.size) return;
     this.validation = null;
     this.preview = null;
+    this.lastExecution = null;
     this.error = null;
     let body: AggregateInput;
     try {
@@ -294,15 +345,31 @@ export class DraftStore {
         "Выберите начало завершённого окна для предварительного расчёта.";
       return;
     }
+    try {
+      const window = selectedWindow(
+        this.window,
+        this.validation.anchor_utc || this.boundary,
+        Number(this.duration),
+      );
+      if (!window.completed)
+        throw new Error(
+          "Выбранное окно ещё не завершено. Выберите завершённый интервал сетки.",
+        );
+    } catch (error) {
+      this.localError =
+        error instanceof Error ? error.message : "Проверьте выбранное окно.";
+      return;
+    }
     const context = this.context;
     const body = {
       ...this.input(),
       window_start_utc: this.window,
-      time_basis: this.timeBasis,
+      time_basis: "event_time",
     };
     const hash = this.validation.rule_hash;
     this.error = null;
     this.preview = null;
+    this.lastExecution = null;
     return this.lifecycle.once("preview", async () => {
       const r = this.lifecycle.begin("check");
       try {
@@ -314,13 +381,15 @@ export class DraftStore {
         )
           runInAction(() => {
             this.preview = result;
+            this.lastExecution = result.execution;
             this.success =
               "Предварительный расчёт завершён. Данные не сохранены.";
           });
       } catch (e) {
-        if (r.current())
+        if (r.current() && this.context === context)
           runInAction(() => {
             this.error = e;
+            this.lastExecution = previewExecutionFailure(e);
           });
       }
     });
@@ -335,7 +404,7 @@ export class DraftStore {
             ...this.input(),
             name: this.name,
             window_start_utc: this.window,
-            time_basis: this.timeBasis,
+            time_basis: "event_time",
             rule_hash: this.validation!.rule_hash,
           };
     const signature = printAggregate(body);
@@ -347,6 +416,7 @@ export class DraftStore {
     this.error = null;
     return this.lifecycle.once("create", async () => {
       const r = this.lifecycle.begin("mutation");
+      this.saveCreateIntent(true);
       try {
         const result = await this.api.create(retry.body, retry.key, r.signal);
         if (!r.current()) return;
@@ -358,7 +428,7 @@ export class DraftStore {
                 ...this.input(),
                 name: this.name,
                 window_start_utc: this.window,
-                time_basis: this.timeBasis,
+                time_basis: "event_time",
                 rule_hash: this.validation?.rule_hash ?? retry.body.rule_hash,
               });
             } catch {
@@ -368,6 +438,7 @@ export class DraftStore {
           this.dirty = currentBody !== retry.signature;
           this.unknownCreate = false;
           this.retry = null;
+          this.saveCreateIntent();
           if (this.dirty)
             this.success = `Прежний запрос подтверждён: ${result.id}. Изменённый черновик сохранён на экране.`;
         });
@@ -383,15 +454,17 @@ export class DraftStore {
           runInAction(() => {
             this.error = e;
             this.unknownCreate =
-              e instanceof ApiError &&
-              (e.status === 0 ||
-                e.status >= 500 ||
-                e.code === "invalid_response");
+              !(e instanceof ApiError) ||
+              e.status === 0 ||
+              e.status >= 500 ||
+              e.code === "invalid_response";
+            this.saveCreateIntent();
           });
       }
     });
   }
   dispose() {
+    this.saveCreateIntent(this.lifecycle.isPending("create"));
     this.lifecycle.dispose();
     this.copyError = null;
     this.copyState = "none";
@@ -408,7 +481,9 @@ export class DraftStore {
     this.text = "";
     this.rule = initialRule();
     this.retry = null;
+    this.createIntents = null;
     this.validation = null;
     this.preview = null;
+    this.lastExecution = null;
   }
 }

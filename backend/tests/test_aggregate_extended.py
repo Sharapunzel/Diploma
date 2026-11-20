@@ -575,4 +575,5 @@ def test_legacy_array_rule_keeps_maximum_sql_width(catalog):
     rule['features'] = [{'key': 'n'+str(i), 'name': 'N', 'op': 'count'} for i in range(553)]
     compiled = compile_rule(AggregateRule.model_validate(rule), catalog)
     assert estimate(compiled, 1, 1, 300, Limits(), False)['statement_columns'] == 1664
-    assert len(aggregate_statement(select(column('ecs_data', JSONB)).subquery(), compiled).selected_columns) == 1664
+    assert len(compiled.rule.features) == 553
+    assert len(aggregate_statement(select(column('ecs_data', JSONB)).subquery(), compiled).selected_columns) == 8

@@ -2,12 +2,12 @@
 
 import json
 import secrets
-import time
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 
-def aggregate_runtime_smoke(compose, env, production, command, browser=None, lifecycle=None, prepare_only=False):
+def aggregate_runtime_smoke(compose, env, production, command, browser=None, lifecycle=None, prepare_only=False,
+                            saved_window=False):
     """Retained preparation for the TASK-41 browser fixture, without calculation."""
     if not prepare_only:
         raise ValueError("Use event_time_test_scenarios.aggregate_event_time_smoke")
@@ -28,7 +28,10 @@ with db.session_factory.begin() as s:
  connection=KafkaConnection(id=uuid4(),name=str(uuid4()),bootstrap_servers=['kafka:9092'],cluster_identity='aggregate-smoke')
  s.add(connection);s.flush()
  sources=[]
- for name in ['authentication','web']:
+ names=['authentication','web']
+ if os.environ.get('SMOKE_SAVED_WINDOW')=='1':
+  names+=['saved window authentication','saved window web']
+ for name in names:
   source=Source(id=uuid4(),name=name+' '+str(uuid4()),connection_id=connection.id,topic_name=str(uuid4()),is_enabled=False)
   s.add(source);sources.append(str(source.id))
  empty_source=None
@@ -46,13 +49,38 @@ with db.session_factory.begin() as s:
   empty=Source(id=uuid4(),name='No events '+str(uuid4()),connection_id=connection.id,topic_name=str(uuid4()),is_enabled=False,normalizer_id=normalizer.id)
   s.add(empty);empty_source=str(empty.id)
  progress=s.get(ReplicationProgress,1)
- print(json.dumps({'sources':sources,'empty_source':empty_source,'normalizer':normalizer_id,'connection':str(connection.id),'verified_from':progress.availability_verified_from_at.isoformat()}))
+ print(json.dumps({'sources':sources[:2],'saved_window_sources':sources[2:],'empty_source':empty_source,'normalizer':normalizer_id,'connection':str(connection.id),'verified_from':progress.availability_verified_from_at.isoformat()}))
 db.dispose()
 """
     # argv contains only synthetic credentials for this disposable profile.
     output = command([*compose, "exec", "-T", "-e", f"SMOKE_USER={username}", "-e", f"SMOKE_CATALOG={int(prepare_only or browser is not None)}",
-        "-e", f"SMOKE_PASSWORD={password}", "api", "python", "-c", setup], env=env, capture=True)
+        "-e", f"SMOKE_PASSWORD={password}", "-e", f"SMOKE_SAVED_WINDOW={int(saved_window)}", "api", "python", "-c", setup], env=env, capture=True)
     data = json.loads(output.strip().splitlines()[-1])
+    verified = datetime.fromisoformat(data["verified_from"])
+    # The event was created in 2000 and loaded by this run. Its event-time
+    # window must stay in 2000 regardless of the WAL commit date below.
+    anchor = datetime(2000, 1, 1, tzinfo=UTC)
+    committed = seed_events(compose, env, command, data["sources"], anchor)
+    assert committed >= verified, "Seed commit precedes verified capture history"
+    fixture = {"username": username, "password": password, "sources": data["sources"],
+               "empty_source": data["empty_source"], "anchor": anchor.isoformat()}
+    if saved_window:
+        fixture["saved_window_sources"] = data["saved_window_sources"]
+    return fixture
+
+
+def prepare_saved_window_fixture(compose, env, command, path):
+    fixture = json.loads(path.read_text(encoding="utf-8"))
+    sources = fixture.pop("saved_window_sources")
+    # A one-second grid with a fresh archive stays within the 512-index
+    # reserve throughout the 120-second test, including on cold containers.
+    anchor = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=10)
+    seed_events(compose, env, command, sources, anchor)
+    fixture["saved_window"] = {"sources": sources, "anchor": anchor.isoformat()}
+    path.write_text(json.dumps(fixture), encoding="utf-8")
+
+
+def seed_events(compose, env, command, sources, anchor):
     seed = """
 import json,os
 from datetime import UTC,datetime
@@ -78,7 +106,7 @@ with db.session_factory.begin() as s:
   source=s.scalar(select(Source).where(Source.id==UUID(source_id)).with_for_update(read=True))
   now=datetime.now(UTC);rid=uuid4()
   record=ProcessedKafkaRecord(id=rid,connection_id=source.connection_id,connection_identity=source.connection_id,kafka_topic_identity=source_id,source_id=source.id,kafka_topic=source.topic_name,kafka_partition=0,kafka_offset=offset,result_status='complete',backend_received_at=now,backend_processed_at=now)
-  ecs={'@timestamp':'2000-01-01T00:00:00Z','source':{'ip':'192.0.2.1','bytes':120},'destination':{'bytes':60},'cloud':{'entity':{'attributes':{'managed':True}}}}
+  ecs={'@timestamp':os.environ['SMOKE_EVENT_AT'],'source':{'ip':'192.0.2.1','bytes':120},'destination':{'bytes':60},'cloud':{'entity':{'attributes':{'managed':True}}}}
   ecs.update({'event':{'category':['authentication'],'outcome':'failure'},'user':{'id':'synthetic-user'}} if index==0 else {'event':{'category':['web']},'http':{'request':{'method':'GET'}},'network':{'bytes':100}})
   ecs['event'].update({'created':created,'dataset':'synthetic_'+str(index),'action':'logon' if index==0 else 'request'})
   ecs.setdefault('user',{})['name']='Andrew'
@@ -88,15 +116,11 @@ with db.session_factory.begin() as s:
   assert SqlAlchemyProcessingRepository(s).store_event(record,event)
 db.dispose()
 """
-    verified = datetime.fromisoformat(data["verified_from"])
-    anchor = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=4)
-    assert anchor > verified
-    command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
-             "-e", "SMOKE_START=" + anchor.isoformat(), "-e", "SMOKE_OFFSET=0",
+    command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(sources),
+             "-e", "SMOKE_EVENT_AT=" + anchor.isoformat(), "-e", "SMOKE_OFFSET=0",
              "api", "python", "-c", seed], env=env)
-    # The fixture is one transaction, so both sources have the same real commit
-    # timestamp. Wait for durable WAL materialization before choosing its one-second
-    # preview window; process startup/SQL flush time is not a commit-time oracle.
+    # Keep the real WAL materialization gate. Commit proves delivery of this
+    # fixture; it does not choose the event-time anchor or preview interval.
     materialized = """
 import json,os,time
 from uuid import UUID
@@ -116,15 +140,9 @@ while True:
  time.sleep(.05)
 db.dispose()
 """
-    committed = command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(data["sources"]),
+    committed = command([*compose, "exec", "-T", "-e", "SMOKE_SOURCES=" + json.dumps(sources),
                          "api", "python", "-c", materialized], env=env, capture=True)
     commit_time = datetime.fromisoformat(committed.strip().splitlines()[-1])
     print(f"Synthetic seed: requested_start={anchor.isoformat()}, materialized_commit={commit_time.isoformat()}", flush=True)
-    anchor = commit_time.replace(microsecond=0)
-    assert anchor >= verified, "Seed window precedes verified capture history"
-    deadline = time.monotonic() + 20
-    while datetime.now(UTC) < anchor + timedelta(seconds=1):
-        assert time.monotonic() < deadline
-        time.sleep(.05)
-    if prepare_only:
-        return {"username": username, "password": password, "sources": data["sources"], "empty_source":data["empty_source"], "anchor": anchor.isoformat()}
+    assert anchor + timedelta(seconds=1) < commit_time
+    return commit_time
