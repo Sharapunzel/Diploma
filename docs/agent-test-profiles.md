@@ -31,7 +31,7 @@ python -B scripts/agent_test_profiles.py smoke-production --browser-only
 python -B scripts/agent_test_profiles.py smoke-production --browser-only --browser-spec detectors.live.spec.ts
 ```
 
-Development содержит **17 specs**: полный `auth.spec.ts`, `events.spec.ts`, `resources.spec.ts`, `resources.confirm.spec.ts`, `resources.policy.spec.ts`, `resources.targets.spec.ts`, `normalizers.spec.ts`, `normalizers.ai.spec.ts`, `normalizers.blocks.spec.ts`, `normalizers.feedback.spec.ts`, `normalizers.fix.spec.ts`, `normalizers.source_debug.spec.ts`, `normalizers.tree.spec.ts`, `aggregates.live.spec.ts`, `aggregates.ui.spec.ts`, `detectors.ui.spec.ts`, `detectors.live.spec.ts`. Семейства `resources.*` и `normalizers.*` включаются автоматически. Production содержит **3 specs**: `detectors.live.spec.ts`, `aggregates.live.spec.ts` и `proxy.session.spec.ts`. Другие специальные live-пути не включаются discovery всего каталога.
+Development содержит **19 specs**: полный `auth.spec.ts`, `events.spec.ts`, `resources.spec.ts`, `resources.confirm.spec.ts`, `resources.policy.spec.ts`, `resources.targets.spec.ts`, `normalizers.spec.ts`, `normalizers.ai.spec.ts`, `normalizers.blocks.spec.ts`, `normalizers.feedback.spec.ts`, `normalizers.fix.spec.ts`, `normalizers.source_debug.spec.ts`, `normalizers.tree.spec.ts`, `aggregates.live.spec.ts`, `aggregates.ui.spec.ts`, `detectors.ui.spec.ts`, `detectors.live.spec.ts`, `findings.ui.spec.ts` и `findings.live.spec.ts`. Семейства `resources.*` и `normalizers.*` включаются автоматически. Production содержит **4 specs**: `detectors.live.spec.ts`, `aggregates.live.spec.ts`, `findings.live.spec.ts` и `proxy.session.spec.ts`. Другие специальные live-пути не включаются discovery всего каталога.
 
 `--browser-spec` принимает одно или несколько точных имён только своего набора и только вместе с `--browser-only`. Другой профиль, неизвестное имя, дубликаты и сочетания с `--detector-only`, `--aggregate-only`, `--rcf`, `--wal`, `--pytest` отклоняются до создания каталога и Docker-ресурсов. Обычные smoke-команды сохраняют прежние проверки. Браузерная ветка не выполняет общий aggregate/detector runtime smoke, WAL gate, lifecycle up/down/up, TLS-агента или внешний E2E.
 
@@ -90,6 +90,15 @@ python -B scripts/agent_test_profiles.py smoke-production --browser-only --brows
 ```
 
 Live-сценарии проверяют расширенный вектор, validate/preview/create/copy/history, точные числа, импорт/экспорт, отдельные prompt/catalog и прямые production URL. Репрезентативные непустые экраны и модалки снимаются в light/dark на 320/2560 px и при масштабе 200%; mock UI сохраняет проверки отказов, guest/scope и подтверждений.
+
+Профили находок запускаются отдельно:
+
+```powershell
+python -B scripts/agent_test_profiles.py smoke-development --browser-only --browser-spec findings.ui.spec.ts findings.live.spec.ts
+python -B scripts/agent_test_profiles.py smoke-production --browser-only --browser-spec findings.live.spec.ts proxy.session.spec.ts
+```
+
+`findings.live.spec.ts` использует подготовленные снимки находок, в том числе с очищенным payload окна, и синтетические ECS-события в изолированной PostgreSQL. Сценарий проверяет обе роли через реальную сессию, прямой маршрут и перезагрузку, фильтры, переходы между окном на таймлайне и строкой таблицы, поиск по точному полуоткрытому диапазону. При отдельном выборе сценариев находок профиль запускает API с его штатными зависимостями и готовит фикстуру одной командой внутри API-контейнера. Подготовка и браузерные проверки входят в общий бюджет 1200 с. Профиль удаляет фикстуры вместе с изолированным стендом.
 Helper `aggregates.visual.ts` дополнительно снимает каждую такую форму/модалку
 в обеих темах при высоте360px и отдельно при масштабе200%, проверяя доступность
 footer и отсутствие горизонтального переполнения. Непустые тестовые ряды проверяются на

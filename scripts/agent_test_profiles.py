@@ -717,7 +717,7 @@ def smoke_http(env: dict[str, str], production: bool) -> None:
         if status != 200 or "text/html" not in headers.get("Content-Type", "") or b"/assets/" not in html:
             raise RuntimeError("Production login route did not serve React HTML")
         for path in ("/", "/agents", "/events", "/administration", "/normalizers/new",
-                     "/detectors", "/detectors/new", "/detectors/00000000-0000-4000-8000-000000000001"):
+                     "/findings", "/detectors", "/detectors/new", "/detectors/00000000-0000-4000-8000-000000000001"):
             route_status, route_headers, _ = response(path)
             if route_status != 200 or "text/html" not in route_headers.get("Content-Type", ""):
                 raise RuntimeError(f"Production UI route failed: {path}")

@@ -1,0 +1,20 @@
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-raised);
+}
+
+.tile > h3,
+.tile > p {
+  margin: 0;
+}
+
+.tile > h3 {
+  font-size: 1rem;
+  line-height: 1.5;
+}

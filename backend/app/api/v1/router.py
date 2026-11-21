@@ -10,6 +10,7 @@ from .endpoints.diagnostics import router as diagnostics_router
 from .endpoints.ecs import router as ecs_router
 from .endpoints.events import router as events_router
 from .endpoints.external import router as external_router
+from .endpoints.findings import router as findings_router
 from .endpoints.health import router as health_router
 from .endpoints.home import router as home_router
 from .endpoints.oidc_administration import router as oidc_administration_router
@@ -30,3 +31,4 @@ router.include_router(parsed_logs_router)
 router.include_router(diagnostics_router)
 router.include_router(aggregates_router)
 router.include_router(detectors_router)
+router.include_router(findings_router)

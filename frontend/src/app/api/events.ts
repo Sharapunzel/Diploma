@@ -57,6 +57,10 @@ export class EventsApi {
     );
   }
 
+  localSource(id: string, signal?: AbortSignal) {
+    return this.api.request<KafkaSource>(`/sources/${id}`, { signal });
+  }
+
   fields(id: string, offset: number, q = "", signal?: AbortSignal) {
     return this.api.request<Page<EventField>>(
       `/events/sources/${id}/fields?limit=100&offset=${offset}&q=${encodeURIComponent(q)}`,

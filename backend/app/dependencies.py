@@ -31,6 +31,7 @@ from .repositories.sqlalchemy.connections import (
 )
 from .repositories.sqlalchemy.diagnostics import SqlAlchemyDiagnosticsRepository
 from .repositories.sqlalchemy.external import SqlAlchemyExternalRepository
+from .repositories.sqlalchemy.findings import SqlAlchemyFindingRepository
 from .repositories.sqlalchemy.processing import SqlAlchemyProcessingRepository
 from .services.implementations.administration import (
     MappingAdministration,
@@ -47,6 +48,7 @@ from .services.implementations.debug_snapshot import SourceSnapshotServiceImpl
 from .services.implementations.diagnostics import DiagnosticsServiceImpl
 from .services.implementations.events import EventQueryServiceImpl, PostgreSqlEventQueryProvider
 from .services.implementations.external import ExternalServiceImpl
+from .services.implementations.findings import FindingServiceImpl
 from .services.implementations.normalization import NormalizerPreviewServiceImpl
 from .services.implementations.opensearch_events import OpenSearchEventQueryProvider
 from .services.implementations.parsed_logs import EcsCatalogServiceImpl, ParsedLogServiceImpl
@@ -68,6 +70,7 @@ from .services.protocols.diagnostics import DiagnosticsService
 from .services.protocols.event_deletion import EventDeletionService
 from .services.protocols.events import EventQueryService
 from .services.protocols.external import ExternalService
+from .services.protocols.findings import FindingService
 from .services.protocols.normalization import NormalizerPreviewService
 from .services.protocols.parsed_logs import CursorCodec, EcsCatalogService, ParsedLogService
 from .services.protocols.processing import DurableProcessingService
@@ -84,6 +87,10 @@ def get_aggregate_service(request: Request, session: Session = Depends(get_sessi
 def get_detector_service(request: Request, session: Session = Depends(get_session)):
     from .detector_composition import build_detector_service
     return build_detector_service(session, request.app.state.ecs_catalog)
+
+
+def get_finding_service(session: Session = Depends(get_session)) -> FindingService:
+    return FindingServiceImpl(SqlAlchemyFindingRepository(session))
 
 
 def build_auth_service(session: Session, app_settings: Settings) -> AuthService:

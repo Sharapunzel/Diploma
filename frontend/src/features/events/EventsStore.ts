@@ -1,4 +1,5 @@
 import { makeAutoObservable, runInAction } from "mobx";
+import { ApiError } from "../../app/api/client";
 import {
   EventsApi,
   type EventCard,
@@ -8,6 +9,7 @@ import {
   type EventSearch,
   type EventSource,
 } from "../../app/api/events";
+import type { FindingLink } from "./findingLink";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -35,11 +37,14 @@ export class EventsStore {
   error: unknown = null;
   cardError: unknown = null;
   sourceError: unknown = null;
+  linkedSourceError: unknown = null;
+  loadingLinkedSource = false;
   loadingSources = false;
   private generation = 0;
   private controller: AbortController | null = null;
   private cardController: AbortController | null = null;
   private sourceController: AbortController | null = null;
+  private linkedSourceController: AbortController | null = null;
   private disposed = false;
 
   constructor(private api: EventsApi) {
@@ -61,11 +66,7 @@ export class EventsStore {
           const page = await this.api.sources(kind, 0, controller.signal);
           if (this.disposed || this.sourceController !== controller) return;
           runInAction(() => {
-            this.sources.push(
-              ...page.items.filter(
-                (item) => item.source_type === "kafka" || item.is_enabled,
-              ),
-            );
+            this.appendSources(page.items);
             this.sourceOffsets[kind] = page.items.length;
             this.sourceTotals[kind] = page.total;
           });
@@ -101,11 +102,7 @@ export class EventsStore {
       runInAction(() => {
         this.sourceOffsets[kind] += page.items.length;
         this.sourceTotals[kind] = page.total;
-        this.sources.push(
-          ...page.items.filter(
-            (item) => item.source_type === "kafka" || item.is_enabled,
-          ),
-        );
+        this.appendSources(page.items);
       });
     } catch (error) {
       if (!this.disposed && this.sourceController === controller)
@@ -120,7 +117,50 @@ export class EventsStore {
     }
   }
 
-  async select(id: string | null) {
+  private appendSources(items: EventSource[]) {
+    const known = new Set(this.sources.map((item) => item.id));
+    this.sources.push(
+      ...items.filter(
+        (item) =>
+          !known.has(item.id) &&
+          (item.source_type === "kafka" || item.is_enabled),
+      ),
+    );
+  }
+
+  async openFinding(link: FindingLink) {
+    this.linkedSourceController?.abort();
+    const controller = new AbortController();
+    this.linkedSourceController = controller;
+    this.linkedSourceError = null;
+    this.loadingLinkedSource = true;
+    try {
+      const source = await this.api.localSource(
+        link.sourceId,
+        controller.signal,
+      );
+      if (this.disposed || controller.signal.aborted) return;
+      if (
+        source.id.toLowerCase() !== link.sourceId.toLowerCase() ||
+        source.source_type !== "kafka"
+      )
+        throw new ApiError(200, "invalid_response");
+      runInAction(() => this.appendSources([source]));
+      await this.select(source.id, link);
+    } catch (error) {
+      if (!controller.signal.aborted)
+        runInAction(() => {
+          this.linkedSourceError = error;
+        });
+    } finally {
+      if (!controller.signal.aborted)
+        runInAction(() => {
+          this.loadingLinkedSource = false;
+        });
+    }
+  }
+
+  async select(id: string | null, range?: Pick<FindingLink, "from" | "to">) {
     if (this.disposed) return;
     this.generation++;
     this.controller?.abort();
@@ -144,9 +184,9 @@ export class EventsStore {
     if (!this.source) return;
     this.loading = true;
     const now = Date.now();
-    this.defaultWindow = true;
-    this.from = new Date(now - WEEK_MS).toISOString();
-    this.to = new Date(now).toISOString();
+    this.defaultWindow = range === undefined;
+    this.from = range?.from ?? new Date(now - WEEK_MS).toISOString();
+    this.to = range?.to ?? new Date(now).toISOString();
     await this.loadCatalog(generation);
   }
 
@@ -375,6 +415,7 @@ export class EventsStore {
     this.disposed = true;
     this.generation++;
     this.sourceController?.abort();
+    this.linkedSourceController?.abort();
     this.controller?.abort();
     this.cardController?.abort();
     this.sourceController = null;

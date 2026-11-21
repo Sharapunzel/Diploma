@@ -152,5 +152,5 @@ def test_populated_retirement_replay_and_old_writer_fences(legacy_database, basi
     refused = migrate("downgrade", "0020_detector_commands", check=False)
     assert refused.returncode != 0 and "explicit data-preserving migration" in refused.stderr
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0024_aggregate_execution_budget"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0025_findings_read"
         assert connection.scalar(text("SELECT checkpoint FROM logs.detectors WHERE id=:id"), {"id": detector}) == checkpoint

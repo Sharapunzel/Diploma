@@ -1,42 +1,9 @@
-import { InfoCircleOutlined } from "@ant-design/icons";
-import { Button, Popover, Select } from "antd";
-import { useState, type ReactNode } from "react";
+import { Select } from "antd";
+import type { ReactNode } from "react";
+import { FieldHelp as Help } from "../../shared/ui/FieldHelp";
 import styles from "./Aggregates.module.css";
 
-export function Help({
-  text,
-  name = "Описание",
-}: {
-  text: string;
-  name?: string;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <Popover
-      open={open}
-      onOpenChange={setOpen}
-      title={name}
-      content={<div className={styles.helpContent}>{text}</div>}
-      trigger="click"
-    >
-      <Button
-        type="text"
-        size="small"
-        className={styles.help}
-        aria-label={`Справка: ${name}`}
-        aria-expanded={open}
-        icon={<InfoCircleOutlined />}
-        onKeyDownCapture={(event) => {
-          if (open && event.key === "Escape") {
-            event.preventDefault();
-            event.stopPropagation();
-            setOpen(false);
-          }
-        }}
-      />
-    </Popover>
-  );
-}
+export { Help };
 
 export function FieldLabel({
   children,

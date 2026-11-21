@@ -51,8 +51,8 @@ const NormalizerEditor = lazy(() =>
   ),
 );
 const EventsPage = lazy(() =>
-  import("../../pages/events/EventsPage").then(({ EventsPage }) => ({
-    default: EventsPage,
+  import("../../pages/events/EventsPage").then(({ EventsRoute }) => ({
+    default: EventsRoute,
   })),
 );
 const AgentsPage = lazy(() =>
@@ -88,6 +88,11 @@ const AggregateCardPage = lazy(() =>
 const DetectorsPage = lazy(() =>
   import("../../pages/detectors/DetectorsPage").then((m) => ({
     default: m.DetectorsPage,
+  })),
+);
+const FindingsPage = lazy(() =>
+  import("../../pages/findings/FindingsPage").then(({ FindingsPage }) => ({
+    default: FindingsPage,
   })),
 );
 const DetectorCreatePage = lazy(() =>
@@ -232,6 +237,8 @@ export function AppRoutes() {
                     <AggregatesPage />
                   ) : page.path === "/detectors" ? (
                     <DetectorsPage />
+                  ) : page.path === "/findings" ? (
+                    <FindingsPage />
                   ) : page.path === "/administration" ? (
                     <AdministrationPage />
                   ) : (

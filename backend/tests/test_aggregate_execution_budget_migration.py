@@ -139,7 +139,6 @@ def test_0023_facts_survive_budget_upgrade_and_refused_nonempty_downgrade(legacy
     assert before["detector_warmups"][0]["inputs_hash"] == fingerprint(before["detector_warmups"][0]["inputs"])
     assert before["aggregate_snapshots"][0]["metadata_json"]["exact_integer"] == 2**60 + 1
     migrate("upgrade", CURRENT)
-    migrate("check")
     assert stored_facts(engine, remove_new=True) == before
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == CURRENT
@@ -154,6 +153,7 @@ def test_0023_facts_survive_budget_upgrade_and_refused_nonempty_downgrade(legacy
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == CURRENT
         assert connection.scalar(text("SELECT count(*) FROM logs.aggregate_window_attempts")) == 0
+    migrate("upgrade", "head")
     migrate("check")
 
 
@@ -164,7 +164,6 @@ def test_empty_0023_0024_schema_roundtrip_restores_columns_and_guards(legacy_dat
     with engine.connect() as connection:
         previous_guard = connection.scalar(text("SELECT prosrc FROM pg_proc WHERE oid='logs.guard_aggregate_closure()'::regprocedure"))
     migrate("upgrade", CURRENT)
-    migrate("check")
     upgraded = column_contract(engine)
     assert upgraded["aggregate_closures"]["calculation_status"]["nullable"] is False
     assert upgraded["working_window_points"]["calculation_status"]["nullable"] is False
@@ -187,6 +186,7 @@ def test_empty_0023_0024_schema_roundtrip_restores_columns_and_guards(legacy_dat
         assert "authorization_txid" in previous_guard
         assert " ".join(restored_guard.split()) == " ".join(previous_guard.split())
     migrate("upgrade", CURRENT)
+    migrate("upgrade", "head")
     migrate("check")
     assert column_contract(engine) == upgraded
     with engine.connect() as connection:

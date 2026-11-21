@@ -33,6 +33,7 @@ ADMIN_PERMISSIONS = [
     "aggregates.write",
     "detectors.read",
     "detectors.write",
+    "findings.read",
 ]
 GUEST_PERMISSIONS = [
     "connections.read",
@@ -40,6 +41,7 @@ GUEST_PERMISSIONS = [
     "normalizers.read",
     "events.read",
     "agents.read",
+    "findings.read",
 ]
 
 
@@ -148,7 +150,9 @@ def test_guest_read_revocation_migrates_existing_role_without_other_changes(db, 
         "SELECT name, permissions FROM app.roles WHERE id = %s", (GUEST_ID,)
     ).fetchone()
     assert role[0] == "Renamed guest"
-    assert role[1] == [permission for permission in permissions if permission not in {"users.read", "settings.read"}]
+    assert role[1] == [
+        permission for permission in permissions if permission not in {"users.read", "settings.read"}
+    ] + ["findings.read"]
     assert "users.read" in db.execute(
         "SELECT permissions FROM app.roles WHERE id = %s", (ADMIN_ID,)
     ).fetchone()[0]

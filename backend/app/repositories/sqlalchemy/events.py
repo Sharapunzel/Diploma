@@ -38,7 +38,10 @@ def _timestamp_expression():
         text_value.op("~")(r"(Z|[+-][0-9]{2}:?[0-9]{2})$"),
         func.pg_input_is_valid(text_value, "timestamp with time zone"),
     )
-    return case((valid, cast(text_value, DateTime(timezone=True))), else_=None)
+    return func.coalesce(
+        func.timezone("UTC", ParsedLog.event_time_utc, type_=DateTime(timezone=True)),
+        case((valid, cast(text_value, DateTime(timezone=True))), else_=None),
+    )
 
 
 def _nested(name: str, value):

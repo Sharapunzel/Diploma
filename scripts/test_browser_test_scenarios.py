@@ -24,6 +24,9 @@ def test_mode_selection_is_explicit_and_includes_all_standard_families():
         assert {p.name for p in (browser.ROOT / "frontend/browser").glob(f"{family}.*.spec.ts")} <= set(dev)
     assert browser.validate_browser_arguments(arguments(profile="smoke-production")) == list(browser.PRODUCTION)
     assert "aggregates.live.spec.ts" in browser.PRODUCTION
+    assert {"findings.ui.spec.ts", "findings.live.spec.ts"} <= set(dev)
+    assert browser.validate_browser_arguments(arguments(
+        profile="smoke-production", browser_spec=["findings.live.spec.ts"])) == ["findings.live.spec.ts"]
     assert "external.live.spec.ts" not in dev
     assert "deadline.spec.ts" not in dev
     assert "agents.tls.spec.ts" not in dev
@@ -45,6 +48,18 @@ def test_required_fixture_is_error_not_skip(tmp_path):
     path.write_text('{"aggregate":null}',encoding="utf-8")
     with pytest.raises(RuntimeError):
         browser.require_fixture(path,["aggregate"])
+
+
+def test_findings_prepare_only_for_live_without_workers_and_rejects_missing_fixture():
+    command = Mock(return_value="{}")
+    assert browser.prepare_findings(["compose"], {}, command, ["findings.ui.spec.ts"], "admin", "secret") is None
+    command.assert_not_called()
+    with pytest.raises(RuntimeError, match="findings browser fixture"):
+        browser.prepare_findings(["compose"], {}, command, ["findings.live.spec.ts"], "admin", "secret")
+    args = command.call_args.args[0]
+    assert args[0:3] == ["compose", "exec", "-T"]
+    assert "api" in args and "detector-worker" not in args and "aggregate-worker" not in args
+    assert command.call_args.kwargs["timeout"] == 30
 
 
 def test_history_readiness_requires_recent_complete_working_windows():
@@ -536,6 +551,11 @@ def test_production_browser_container_removed_after_failed_run(tmp_path):
         assert "PLAYWRIGHT_BASE_URL=https://localhost:55443" in browser_command
         assert "NODE_EXTRA_CA_CERTS=/tmp/proxy-ca.pem" in browser_command
         assert not any("NODE_TLS_REJECT_UNAUTHORIZED" in arg for arg in browser_command)
+        prepare_script = command.call_args_list[2].args[0][-1]
+        assert "Components: main" in prepare_script
+        assert prepare_script.count("Dir::Etc::sourcelist=/tmp/browser-ubuntu.sources") == 2
+        assert "libnss3-tools socat" in prepare_script
+        assert "certutil" in prepare_script and "update-ca-certificates" in prepare_script
         test_script = command.call_args.args[0][-1]
         assert "TCP-LISTEN:55443" in test_script
         assert "TCP:127.0.0.1:443" in test_script

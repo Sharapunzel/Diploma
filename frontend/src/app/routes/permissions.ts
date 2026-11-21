@@ -41,6 +41,7 @@ export const navigationGroups = [
     pages: [
       { path: "/aggregates", label: "Агрегаты", permission: "aggregates.read" },
       { path: "/detectors", label: "Детекторы", permission: "detectors.read" },
+      { path: "/findings", label: "Находки", permission: "findings.read" },
     ],
   },
   {

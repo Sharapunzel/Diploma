@@ -32,7 +32,7 @@ def test_detector_upgrade_check_downgrade_upgrade():
             assert connection.execute(text("SELECT (SELECT count(*) FROM logs.detector_warmups),(SELECT count(*) FROM logs.detector_outcomes),(SELECT count(*) FROM logs.findings)")).one()==counts
             assert connection.execute(text("SELECT aggregate_id,policy_version,status,history_revision,auto_cleared_total,pending_closure_id,pending_phase,pending_cursor,last_cleared_at FROM logs.aggregate_retention_state ORDER BY aggregate_id")).all()==retention
             assert connection.scalar(text("SELECT count(*) FROM pg_statistic_ext WHERE stxnamespace='logs'::regnamespace AND stxname='st_outcome_retention_compacted'")) == 1
-            assert connection.scalar(text("SELECT version_num FROM alembic_version"))=="0024_aggregate_execution_budget"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version"))=="0025_findings_read"
     finally:
         engine.dispose()
     subprocess.run([sys.executable,"-B","-m","alembic","check"],env=env,check=True)

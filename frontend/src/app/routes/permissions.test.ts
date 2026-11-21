@@ -17,7 +17,7 @@ describe("navigation groups", () => {
       ["Главная"],
       ["Подключения", "Источники", "Агенты", "Нормализаторы", "Диагностика"],
       ["События"],
-      ["Агрегаты", "Детекторы"],
+      ["Агрегаты", "Детекторы", "Находки"],
       ["Администрирование"],
     ]);
     expect(homePage.path).toBe("/");
@@ -33,6 +33,11 @@ describe("navigation groups", () => {
     expect(pages.find((page) => page.path === "/agents")?.permission).toBe(
       "agents.read",
     );
+    expect(
+      availableNavigationGroups((permission) => permission === "findings.read")
+        .find((group) => group.label === "Аномалии")
+        ?.pages.map(({ path }) => path),
+    ).toEqual(["/findings"]);
   });
 
   it("filters pages before dropping empty groups", () => {

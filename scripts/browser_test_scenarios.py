@@ -32,7 +32,7 @@ else:
     )
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCTION = ("detectors.live.spec.ts", "aggregates.live.spec.ts", "proxy.session.spec.ts")
+PRODUCTION = ("detectors.live.spec.ts", "aggregates.live.spec.ts", "findings.live.spec.ts", "proxy.session.spec.ts")
 
 WORKER_DIAGNOSTIC_SCRIPT = AUTO_WORKER_JOB_CAPTURE + '''
 import json, math, os, sys, time
@@ -261,7 +261,8 @@ def capture_worker_diagnostics(compose, env, command, config):
 def browser_specs(production, requested=None):
     directory = ROOT / "frontend/browser"
     development = ["auth.spec.ts", "events.spec.ts", "resources.spec.ts", "normalizers.spec.ts",
-                   "aggregates.live.spec.ts", "aggregates.ui.spec.ts", "detectors.ui.spec.ts", "detectors.live.spec.ts"]
+                   "aggregates.live.spec.ts", "aggregates.ui.spec.ts", "detectors.ui.spec.ts",
+                   "detectors.live.spec.ts", "findings.ui.spec.ts", "findings.live.spec.ts"]
     development += sorted(p.name for p in directory.glob("resources.*.spec.ts"))
     development += sorted(p.name for p in directory.glob("normalizers.*.spec.ts"))
     allowed = list(PRODUCTION) if production else development
@@ -291,6 +292,22 @@ def require_fixture(path, fields):
     if not isinstance(data, dict) or any(not data.get(field) for field in fields):
         raise RuntimeError(f"Required browser fixture fields missing: {fields}")
     return data
+
+
+def prepare_findings(compose, env, command, selected, username, password):
+    if "findings.live.spec.ts" not in selected:
+        return None
+    fixture = (ROOT / "backend/tests/findings_fixture.py").read_text(encoding="utf-8")
+    result = json.loads(command([
+        *compose, "exec", "-T", "-e", f"BROWSER_USERNAME={username}",
+        "-e", f"BROWSER_PASSWORD={password}", "api", "python", "-B", "-c", fixture,
+    ], env=env, capture=True, timeout=30))
+    if not isinstance(result, dict) or any(not result.get(key) for key in (
+        "guest", "source", "source_name", "detectors", "detector_name", "findings",
+        "start", "stop", "from", "to",
+    )):
+        raise RuntimeError("Required findings browser fixture is unavailable")
+    return result
 
 
 def ready_history(items, *, not_before=None):
@@ -601,6 +618,9 @@ def run_browsers(compose, env, project, run, production, selected, command, oidc
                 raise
         else:
             command(worker_up, env=env)
+    findings_config = prepare_findings(compose, env, command, selected, username, password)
+    if findings_config:
+        config["findings"] = findings_config
     fixture = run / "detector-browser.json"
     fixture.write_text(json.dumps(config), encoding="utf-8")
     if need_detectors:
@@ -724,7 +744,21 @@ def production_browsers(compose, env, project, run, selected, command, *, check=
         raise RuntimeError("Production browser proxy is unavailable")
     container = project + "-detector-browser"
     public_port = env["HTTPS_BIND"].split(":")[1]
-    prepare = "set -e; apt-get update >/dev/null; apt-get install -y --no-install-recommends libnss3-tools socat >/dev/null; npm ci --ignore-scripts --no-audit --no-fund; mkdir -p /root/.pki/nssdb; certutil -d sql:/root/.pki/nssdb -N --empty-password; certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n proxy-test -i /tmp/proxy-ca.pem; cp /tmp/proxy-ca.pem /usr/local/share/ca-certificates/proxy-test.crt; update-ca-certificates >/dev/null"
+    # Keep the signed Noble release, updates and security repositories for both packages.
+    apt = "apt-get -o Dir::Etc::sourcelist=/tmp/browser-ubuntu.sources -o Dir::Etc::sourceparts=-"
+    prepare = (
+        "set -e; "
+        "sed 's/^Components:.*/Components: main/' /etc/apt/sources.list.d/ubuntu.sources "
+        "> /tmp/browser-ubuntu.sources; "
+        f"{apt} -o Acquire::Languages=none update >/dev/null; "
+        f"{apt} install -y --no-install-recommends libnss3-tools socat >/dev/null; "
+        "npm ci --ignore-scripts --no-audit --no-fund; "
+        "mkdir -p /root/.pki/nssdb; "
+        "certutil -d sql:/root/.pki/nssdb -N --empty-password; "
+        "certutil -d sql:/root/.pki/nssdb -A -t 'C,,' -n proxy-test -i /tmp/proxy-ca.pem; "
+        "cp /tmp/proxy-ca.pem /usr/local/share/ca-certificates/proxy-test.crt; "
+        "update-ca-certificates >/dev/null"
+    )
     script = f"socat TCP-LISTEN:{public_port},bind=127.0.0.1,reuseaddr,fork TCP:127.0.0.1:443 & npx playwright test " + " ".join("browser/"+name for name in selected) + " --workers=1 --output /results"
     try:
         command(["docker","run","-d","--rm","--name",container,"--user","0:0","--memory","2g","--cpus","2","--network",f"container:{proxy}","--label",f"com.docker.compose.project={project}","-w","/test","-v",f"{context.resolve()}:/test","-v",f"{results.resolve()}:/results",*clock_mounts,"-v",f"{Path(env['KAFKA_CA_FILE']).resolve()}:/tmp/proxy-ca.pem:ro","-e","NODE_EXTRA_CA_CERTS=/tmp/proxy-ca.pem","-e","DETECTOR_BROWSER_CONFIG=/test/fixture.json",*aggregate_args,"-e","BROWSER_FIXTURES_REQUIRED=1","-e",f"PLAYWRIGHT_BASE_URL={env['PUBLIC_ORIGIN']}","-e","TASK21_SECURE_COOKIE=true","-e",f"TASK21_ADMIN_PASSWORD={env['TASK21_ADMIN_PASSWORD']}","mcr.microsoft.com/playwright:v1.63.0-noble","sleep","1800"], env=env, timeout=30)

@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Input, Modal, Select, Spin, Table, Tag } from "antd";
 import { observer } from "mobx-react-lite";
+import { Link, useLocation } from "react-router-dom";
 import { ApiError, errorText } from "../../app/api/client";
 import {
   EventsApi,
@@ -12,7 +13,12 @@ import {
 import { useStores } from "../../app/providers/StoresProvider";
 import { AppRequestError } from "../../app/ui/AppRequestError";
 import { EventsStore } from "../../features/events/EventsStore";
+import {
+  parseFindingLink,
+  type FindingLink,
+} from "../../features/events/findingLink";
 import { ConfirmationDialog } from "../../shared/ui/ConfirmationDialog";
+import { exactLocalTime, utcSortKey } from "../../shared/time/utc";
 import styles from "./EventsPage.module.css";
 
 const operators: Record<string, string> = {
@@ -218,7 +224,16 @@ function ExpandableText({
   );
 }
 
-export const EventsPage = observer(() => {
+export function EventsRoute() {
+  const { search } = useLocation();
+  const finding = useMemo(() => parseFindingLink(search), [search]);
+  return <EventsPage key={search} finding={finding} />;
+}
+
+type EventsPageProps = { finding?: FindingLink | "invalid" | null };
+
+export const EventsPage = observer((props: EventsPageProps) => {
+  const { finding = null } = props;
   const { api, session } = useStores();
   const [store] = useState(() => new EventsStore(new EventsApi(api)));
   const eventsApi = new EventsApi(api);
@@ -246,9 +261,10 @@ export const EventsPage = observer(() => {
   const canDelete =
     session.has("events.delete") && store.source?.source_type === "kafka";
   useEffect(() => {
-    void store.loadSources();
+    if (!finding) void store.loadSources();
+    else if (finding !== "invalid") void store.openFinding(finding);
     return () => store.dispose();
-  }, [store]);
+  }, [store, finding]);
 
   function selectSource(id: string | null) {
     setFiltersOpen(false);
@@ -280,13 +296,9 @@ export const EventsPage = observer(() => {
     const sourceId = store.source?.id;
     setFilterError("");
     setFilterErrorIndex(null);
-    const lower = new Date(draftFrom);
-    const upper = new Date(draftTo);
-    if (
-      Number.isNaN(lower.getTime()) ||
-      Number.isNaN(upper.getTime()) ||
-      lower >= upper
-    ) {
+    const lower = utcSortKey(draftFrom);
+    const upper = utcSortKey(draftTo);
+    if (!lower || !upper || lower >= upper) {
       setFilterError("Укажите корректный период: начало раньше конца.");
       return;
     }
@@ -332,8 +344,8 @@ export const EventsPage = observer(() => {
       }
     }
     const applied = await store.applySearch(
-      lower.toISOString(),
-      upper.toISOString(),
+      draftFrom,
+      draftTo,
       draftSort,
       filters,
       draftColumns,
@@ -448,52 +460,81 @@ export const EventsPage = observer(() => {
           onRetry={() => void store.loadSources()}
         />
       )}
-      <div className={styles.toolbar}>
-        <label className={`${styles.field} ${styles.source}`}>
-          Источник
-          <Select
-            aria-label="Источник"
-            disabled={deleting || unknownResult}
-            showSearch={false}
-            optionFilterProp="label"
-            onPopupScroll={(event) => {
-              const target = event.currentTarget;
-              if (
-                target.scrollTop + target.clientHeight >=
-                target.scrollHeight - 32
-              )
-                void store.loadMoreSources();
-            }}
-            loading={store.loadingSources}
-            value={store.source?.id ?? undefined}
-            placeholder="Выберите источник"
-            onChange={selectSource}
-            options={store.sources.map((source) => ({
-              value: source.id,
-              label: `${source.name} · ${source.source_type === "kafka" ? "Kafka" : "OpenSearch"}${source.is_enabled ? "" : " · выключен"}`,
-            }))}
-          />
-          <Button
-            disabled={
-              store.loadingSources ||
-              store.sourceOffsets.kafka >= store.sourceTotals.kafka
-            }
-            onClick={() => void store.loadMoreSources("kafka")}
-          >
-            Ещё источники Kafka
-          </Button>
-          <Button
-            disabled={
-              store.loadingSources ||
-              store.sourceOffsets.external >= store.sourceTotals.external
-            }
-            onClick={() => void store.loadMoreSources("external")}
-          >
-            Ещё внешние источники
-          </Button>
-        </label>
-      </div>
-      {!store.source && (
+      {finding && (
+        <Alert
+          type={finding === "invalid" ? "error" : "info"}
+          message={
+            finding === "invalid"
+              ? "Некорректная ссылка на события находки."
+              : "События в диапазоне находки"
+          }
+          description={store.source ? store.source.name : undefined}
+          action={<Link to="/events">Обычный поиск</Link>}
+        />
+      )}
+      {store.loadingLinkedSource && !store.source && (
+        <Spin aria-label="Загрузка источника" />
+      )}
+      {!!store.linkedSourceError && finding && finding !== "invalid" && (
+        <AppRequestError
+          error={store.linkedSourceError}
+          message={
+            store.linkedSourceError instanceof ApiError &&
+            store.linkedSourceError.status === 404
+              ? "Исходный локальный источник недоступен."
+              : undefined
+          }
+          onRetry={() => void store.openFinding(finding)}
+        />
+      )}
+      {!finding && (
+        <div className={styles.toolbar}>
+          <label className={`${styles.field} ${styles.source}`}>
+            Источник
+            <Select
+              aria-label="Источник"
+              disabled={deleting || unknownResult}
+              showSearch={false}
+              optionFilterProp="label"
+              onPopupScroll={(event) => {
+                const target = event.currentTarget;
+                if (
+                  target.scrollTop + target.clientHeight >=
+                  target.scrollHeight - 32
+                )
+                  void store.loadMoreSources();
+              }}
+              loading={store.loadingSources}
+              value={store.source?.id ?? undefined}
+              placeholder="Выберите источник"
+              onChange={selectSource}
+              options={store.sources.map((source) => ({
+                value: source.id,
+                label: `${source.name} · ${source.source_type === "kafka" ? "Kafka" : "OpenSearch"}${source.is_enabled ? "" : " · выключен"}`,
+              }))}
+            />
+            <Button
+              disabled={
+                store.loadingSources ||
+                store.sourceOffsets.kafka >= store.sourceTotals.kafka
+              }
+              onClick={() => void store.loadMoreSources("kafka")}
+            >
+              Ещё источники Kafka
+            </Button>
+            <Button
+              disabled={
+                store.loadingSources ||
+                store.sourceOffsets.external >= store.sourceTotals.external
+              }
+              onClick={() => void store.loadMoreSources("external")}
+            >
+              Ещё внешние источники
+            </Button>
+          </label>
+        </div>
+      )}
+      {!finding && !store.source && (
         <Alert type="info" message="Выберите источник для просмотра событий." />
       )}
       {store.source && (
@@ -507,7 +548,9 @@ export const EventsPage = observer(() => {
           <div className={styles.searchBar}>
             <div className={styles.applied}>
               <span>
-                Период: {displayTime(store.from)} — {displayTime(store.to)}
+                Период:{" "}
+                {finding ? exactLocalTime(store.from) : displayTime(store.from)}{" "}
+                — {finding ? exactLocalTime(store.to) : displayTime(store.to)}
               </span>
               <span>
                 Порядок:{" "}
@@ -542,6 +585,8 @@ export const EventsPage = observer(() => {
             <div className={styles.actions}>
               <Button
                 onClick={() => {
+                  setDraftFrom(store.from);
+                  setDraftTo(store.to);
                   setDraftColumns(store.columns);
                   setFiltersOpen(true);
                 }}
@@ -884,7 +929,9 @@ export const EventsPage = observer(() => {
                   ? "Загрузка"
                   : store.error
                     ? "Не удалось загрузить события"
-                    : "Событий нет",
+                    : finding
+                      ? "В этом диапазоне событий нет"
+                      : "Событий нет",
               }}
               columns={[
                 {

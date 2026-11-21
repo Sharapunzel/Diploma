@@ -174,28 +174,12 @@
   width: 100%;
 }
 
-.connectionsTable :global(.ant-table table),
-.sourcesTable :global(.ant-table table) {
-  width: 100%;
-  table-layout: auto;
+.connectionsTable {
+  composes: table from "../../shared/ui/WorkspaceTable.module.css";
 }
 
-.connectionsTable :global(.ant-table-cell),
-.sourcesTable :global(.ant-table-cell) {
-  position: relative;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.connectionsTable :global(.ant-table-cell:not(:last-child)::after),
-.sourcesTable :global(.ant-table-cell:not(:last-child)::after) {
-  position: absolute;
-  top: 8px;
-  right: 0;
-  bottom: 8px;
-  border-right: 1px solid var(--color-border);
-  content: "";
-  pointer-events: none;
+.sourcesTable {
+  composes: table from "../../shared/ui/WorkspaceTable.module.css";
 }
 
 .connectionsTable :global(.ant-table-cell:last-child),

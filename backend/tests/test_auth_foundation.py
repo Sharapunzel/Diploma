@@ -3640,6 +3640,7 @@ def test_0008_permission_migration_round_trip_preserves_role_configuration(auth_
                 "processing_errors.raw.read", "agents.read", "agents.write",
                 "aggregates.read", "aggregates.write",
                 "detectors.read", "detectors.write",
+                "findings.read",
             }
             if role_id == GUEST_ID:
                 expected.add("users.read")  # Rolling back 0013 restores the former permission.
@@ -5514,7 +5515,11 @@ def test_source_scoped_event_query_api(client, auth_database):
     )
     assert filtered.status_code == 200, filtered.text
     assert len(filtered.json()["items"]) == 1
-    tampered = result["next_cursor"][:8] + "A" + result["next_cursor"][9:]
+    cursor = result["next_cursor"]
+    index = 8
+    replacement = "B" if cursor[index] == "A" else "A"
+    tampered = cursor[:index] + replacement + cursor[index + 1 :]
+    assert tampered != cursor
     rejected = client.post(
         f"/api/v1/events/sources/{source_id}/search",
         json={"limit": 1, "cursor": tampered},

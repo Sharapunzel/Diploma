@@ -1,0 +1,20 @@
+.table :global(.ant-table table) {
+  width: 100%;
+  table-layout: auto;
+}
+
+.table :global(.ant-table-cell) {
+  position: relative;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.table :global(.ant-table-cell:not(:last-child)::after) {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  border-right: 1px solid var(--color-border);
+  content: "";
+  pointer-events: none;
+}

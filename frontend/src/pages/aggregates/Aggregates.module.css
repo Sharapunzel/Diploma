@@ -296,23 +296,10 @@
   overflow-wrap: anywhere;
 }
 .modalTile {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-width: 0;
-  padding: 16px;
-  border: 1px solid var(--color-border);
-  border-radius: 10px;
-  background: var(--color-surface-raised);
+  composes: tile from "../../shared/ui/ModalTile.module.css";
 }
-.modalTile > h3,
-.modalTile > p,
 .modalTile dl {
   margin: 0;
-}
-.modalTile > h3 {
-  font-size: 1rem;
-  line-height: 1.5;
 }
 .modalTile dl {
   display: grid;
@@ -410,13 +397,6 @@
   right: 0;
   z-index: 1;
 }
-.helpContent {
-  display: block;
-  width: min(310px, 80vw);
-  line-height: 1.5;
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-}
 /* rc-dialog's focus container sits between the dialog and its content. */
 .featureModal > div:first-child {
   height: 100%;
@@ -469,13 +449,6 @@
   font-size: 13px;
   line-height: 1.5;
   color: var(--color-text-secondary);
-}
-.help {
-  color: var(--color-text-secondary);
-  flex: none;
-}
-.help:focus-visible {
-  outline: 2px solid var(--color-accent);
 }
 .toolbar :global(.ant-btn:not(.ant-btn-text)),
 .node :global(.ant-btn:not(.ant-btn-text)) {
